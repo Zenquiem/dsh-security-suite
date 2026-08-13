@@ -73,6 +73,8 @@ test('deep discovery creates six native DSH workers per round and only saturates
     assert.equal(result.lifecycle, 'saturated')
     assert.deepEqual(result.rounds.map(round => round.status), ['complete', 'complete'])
     assert.deepEqual(result.rounds.map(round => round.novelty), [1, 0])
+    assert.deepEqual(new Set(result.workers.slice(0, 6).map(worker => worker.lens)).size, 6)
+    assert.equal(result.canonicalThreatModel?.workerIds.length, 12)
     const persisted = await loadScan(state, scan.id)
     assert.equal(persisted.findings.some(finding => finding.ruleId === 'custom.delegated-sink'), true)
     assert.equal(persisted.tasks.some(task => task.focus.includes('Delegated sink')), true)
@@ -81,6 +83,24 @@ test('deep discovery creates six native DSH workers per round and only saturates
     assert.equal(result.rounds[0]?.artifactRefs?.some(path => path.endsWith('merge.json')), true)
     assert.match(await readFile(join(persisted.artifacts.directory, 'artifacts', '03_coverage', 'repository_coverage_ledger.md'), 'utf8'), /app\.ts/)
     assert.match(await readFile(join(persisted.artifacts.directory, 'artifacts', '04_reconciliation', 'dedupe_report.md'), 'utf8'), /absorbed workers/)
+    assert.match(await readFile(join(persisted.artifacts.directory, 'artifacts', '01_context', 'deep_canonical_threat_model.md'), 'utf8'), /Canonical Deep Validation Threat Model/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('deep worklists freeze risk-prioritized source evidence and fail closed if a receipt changes before job creation', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'plain.ts'), 'export const value = 1\n')
+    await writeFile(join(root, 'api.ts'), 'export function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    const job = await createDeepDiscoveryJob(config, scan.id)
+    assert.equal(job.worklist[0]?.path, 'api.ts')
+    assert.equal(job.worklist[0]?.priority > job.worklist[1]!.priority, true)
+    assert.equal(job.worklist[0]?.riskSignals.includes('execution or query sink'), true)
+    await writeFile(join(root, 'api.ts'), 'export const changed = true\n')
+    await assert.rejects(() => createDeepDiscoveryJob(config, scan.id), /changed after scan receipt/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
@@ -152,6 +172,7 @@ test('centralized deep closure uses six restricted DSH workers and closes persis
     const validationJob = await createDeepClosureJob(config, scan.id, 'validation'); const validation = deepClosureContext(config, 'validation'); const validationResult = await runDeepClosure(validation.ctx as never, config, validationJob.id)
     assert.equal(validation.count(), 6)
     assert.equal(validationResult.lifecycle, 'completed')
+    assert.equal(validationResult.threatModel.source, 'scan_preflight')
     assert.deepEqual(validation.restrictions[0], ['security_claim_audit_task', 'security_get_scan', 'security_read_scan_source', 'security_record_validation'])
     const attackJob = await createDeepClosureJob(config, scan.id, 'attack_path'); const attack = deepClosureContext(config, 'attack_path'); const attackResult = await runDeepClosure(attack.ctx as never, config, attackJob.id)
     assert.equal(attack.count(), 6)
@@ -160,6 +181,35 @@ test('centralized deep closure uses six restricted DSH workers and closes persis
     const closed = await loadScan(state, scan.id)
     assert.equal(closed.findings.every(finding => finding.ledger.some(row => row.phase === 'validation') && (finding.disposition !== 'reportable' || finding.ledger.some(row => row.phase === 'attack_path'))), true)
     assert.match(await readFile(join(closed.artifacts.directory, 'artifacts', '04_reconciliation', `deep-validation-closure-${validationJob.id}.json`), 'utf8'), /completed/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('deep closure binds the canonical model synthesized from complete delegated discovery', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    const discovery = await createDeepDiscoveryJob(config, scan.id, 1)
+    const result = await runDeepDiscovery(deepWorkerContext(config, true).ctx as never, config, discovery.id)
+    assert.equal(result.canonicalThreatModel?.artifactRef, 'artifacts/01_context/deep_canonical_threat_model.md')
+    const closure = await createDeepClosureJob(config, scan.id, 'validation')
+    assert.equal(closure.threatModel.source, 'canonical_deep_discovery')
+    assert.equal(closure.threatModel.digest, result.canonicalThreatModel?.digest)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('deep closure fails closed when its bound threat model drifts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    const job = await createDeepClosureJob(config, scan.id, 'validation')
+    const changed = await loadScan(state, scan.id); changed.threatModel = 'changed after closure creation'; await saveScan(state, changed)
+    await assert.rejects(() => runDeepClosure(deepClosureContext(config, 'validation').ctx as never, config, job.id), /threat model changed/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

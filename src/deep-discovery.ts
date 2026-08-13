@@ -16,10 +16,12 @@ const jobWrites = new Map<string, Promise<void>>()
 export interface DeepCandidateInput { ruleId: string; title: string; severity: Severity; cwe: string; file: string; line: number; rootCause: string }
 export interface DeepCandidate extends DeepCandidateInput { id: string; workerId: string; workerIds: string[]; reportIds: string[]; excerpt: string; fingerprint: string; reportedAt: string }
 export interface DeepWorkerReport { threatModel: string; reviewedPaths: string[]; deferred: Array<{ path: string; reason: string }>; coverageSummary: string; reportedAt: string }
-export interface DeepWorker { id: string; round: number; status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed'; token: string; sessionId?: string; transcript?: string; error?: string; candidateIds: string[]; report?: DeepWorkerReport }
+export type DeepReviewLens = 'entrypoints_and_authorization' | 'injection_and_execution' | 'data_and_serialization' | 'network_and_trust_boundaries' | 'secrets_and_cryptography' | 'build_and_supply_chain'
+export interface DeepWorker { id: string; round: number; lens?: DeepReviewLens; status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed'; token: string; sessionId?: string; transcript?: string; error?: string; candidateIds: string[]; report?: DeepWorkerReport }
 export interface DeepRound { number: number; workerIds: string[]; candidateCount: number; novelty: number; status: 'running' | 'complete' | 'incomplete'; artifactRefs?: string[] }
-export interface DeepWorkItem { path: string; sha256: string; language: string }
-export interface DeepDiscoveryJob { id: string; scanId: string; target: string; createdAt: string; updatedAt: string; lifecycle: 'queued' | 'running' | 'saturated' | 'capped' | 'incomplete' | 'cancelled' | 'failed'; maxRounds: number; worklist: DeepWorkItem[]; worklistDigest: string; rounds: DeepRound[]; workers: DeepWorker[]; candidates: DeepCandidate[] }
+export interface DeepWorkItem { path: string; sha256: string; language: string; priority: number; riskSignals: string[] }
+export interface CanonicalThreatModel { artifactRef: string; digest: string; workerIds: string[]; createdAt: string }
+export interface DeepDiscoveryJob { id: string; scanId: string; target: string; createdAt: string; updatedAt: string; lifecycle: 'queued' | 'running' | 'saturated' | 'capped' | 'incomplete' | 'cancelled' | 'failed'; maxRounds: number; worklist: DeepWorkItem[]; worklistDigest: string; rounds: DeepRound[]; workers: DeepWorker[]; candidates: DeepCandidate[]; canonicalThreatModel?: CanonicalThreatModel }
 
 type NativeAgents = { create?: unknown }
 
@@ -37,10 +39,25 @@ export function deepDiscoveryCapability(ctx: Context): { available: boolean; wor
 
 function inside(root: string, path: string): boolean { const item = relative(root, path); return item === '' || (!item.startsWith('..') && !isAbsolute(item)) }
 function slug(value: string): string { return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'root-control' }
+const DEEP_REVIEW_LENSES: readonly DeepReviewLens[] = ['entrypoints_and_authorization', 'injection_and_execution', 'data_and_serialization', 'network_and_trust_boundaries', 'secrets_and_cryptography', 'build_and_supply_chain']
+const LENS_GUIDANCE: Readonly<Record<DeepReviewLens, string>> = {
+  entrypoints_and_authorization: 'Prioritize externally reachable entrypoints, authorization decisions, tenant boundaries, and privilege changes.',
+  injection_and_execution: 'Prioritize input reaching code, shell, query, template, filesystem, and deserialization sinks.',
+  data_and_serialization: 'Prioritize storage ownership, object lifetimes, serialization, parsing, and cross-user data exposure.',
+  network_and_trust_boundaries: 'Prioritize outbound requests, redirects, TLS, webhooks, CORS, proxy trust, and service-to-service boundaries.',
+  secrets_and_cryptography: 'Prioritize credentials, key handling, signature verification, token issuance, logging, and cryptographic downgrade paths.',
+  build_and_supply_chain: 'Prioritize CI/CD workflows, package manifests, release paths, artifact provenance, and privileged automation.',
+}
+
 function jobPath(state: string, id: string): string { if (!/^deep_[0-9a-f-]+$/.test(id)) throw new Error('Invalid deep discovery job id.'); return join(state, 'deep-discovery', `${id}.json`) }
 async function atomic(path: string, content: string): Promise<void> { await mkdir(resolve(path, '..'), { recursive: true }); const temp = `${path}.${randomUUID()}.tmp`; await writeFile(temp, content, 'utf8'); await rename(temp, path) }
 async function save(state: string, job: DeepDiscoveryJob): Promise<void> { job.updatedAt = new Date().toISOString(); await atomic(jobPath(state, job.id), `${JSON.stringify(job, null, 2)}\n`) }
-export async function loadDeepDiscoveryJob(config: Config, id: string): Promise<DeepDiscoveryJob> { return JSON.parse(await readFile(jobPath(getStateDir(config.stateDir), id), 'utf8')) as DeepDiscoveryJob }
+export async function loadDeepDiscoveryJob(config: Config, id: string): Promise<DeepDiscoveryJob> {
+  const job = JSON.parse(await readFile(jobPath(getStateDir(config.stateDir), id), 'utf8')) as DeepDiscoveryJob
+  // Jobs written before prioritization remain resumable, with an explicitly neutral score.
+  job.worklist = job.worklist.map(item => ({ ...item, priority: Number.isFinite(item.priority) ? item.priority : 0, riskSignals: Array.isArray(item.riskSignals) ? item.riskSignals : [] }))
+  return job
+}
 
 /** Serialize read-modify-write transitions because workers report concurrently. */
 async function updateJob<T>(config: Config, id: string, update: (job: DeepDiscoveryJob) => Promise<T> | T): Promise<T> {
@@ -61,9 +78,31 @@ async function updateJob<T>(config: Config, id: string, update: (job: DeepDiscov
   }
 }
 
+function riskSignals(path: string, content: string): string[] {
+  const signals: string[] = []; const value = `${path}\n${content}`
+  if (/(?:^|\/)(?:routes?|controllers?|handlers?|api|server|middleware)(?:\/|\.|$)|\b(?:app|router)\.(?:get|post|put|delete|use)\b/i.test(value)) signals.push('externally reachable request surface')
+  if (/\b(?:eval|Function|exec(?:File)?|spawn|system|child_process|Runtime\.getRuntime)\b|\b(?:SELECT|INSERT|UPDATE|DELETE)\b/i.test(value)) signals.push('execution or query sink')
+  if (/\b(?:fetch|axios|request|http\.request|https\.request|urlopen|net\.Dial)\b|rejectUnauthorized\s*:\s*false|InsecureSkipVerify/i.test(value)) signals.push('outbound network or transport control')
+  if (/\b(?:auth|authori[sz]|permission|role|session|jwt|token|oauth)\b/i.test(value)) signals.push('authorization or identity control')
+  if (/\b(?:secret|password|api[_-]?key|private[_-]?key|credential)\b/i.test(value)) signals.push('credential or key material')
+  if (/(?:^|\/)(?:\.github\/workflows|Dockerfile|package(?:-lock)?\.json|pnpm-lock\.yaml|yarn\.lock|Cargo\.lock|go\.sum)(?:$|\/)/i.test(path)) signals.push('build or supply-chain control')
+  if (/\b(?:deserialize|pickle|yaml\.load|XMLParser|ObjectInputStream|unserialize)\b/i.test(value)) signals.push('parser or deserialization boundary')
+  return [...new Set(signals)]
+}
+
+async function prioritizedWorklist(scan: ScanRecord): Promise<DeepWorkItem[]> {
+  const rows = await Promise.all(scan.coverage.receipts.map(async receipt => {
+    const source = resolve(scan.target, receipt.path); if (!inside(scan.target, source)) throw new Error('Scan receipt path is outside the scan target.')
+    const content = await readFile(source, 'utf8'); if (sha256(content) !== receipt.sha256) throw new Error(`Source file changed after scan receipt: ${receipt.path}. Create a follow-up scan before deep discovery.`)
+    const signals = riskSignals(receipt.path, content)
+    return { path: receipt.path, sha256: receipt.sha256, language: receipt.language, priority: signals.length, riskSignals: signals }
+  }))
+  return rows.sort((left, right) => right.priority - left.priority || left.path.localeCompare(right.path))
+}
+
 export async function createDeepDiscoveryJob(config: Config, scanId: string, maxRounds = 10): Promise<DeepDiscoveryJob> {
   const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); if (scan.mode !== 'deep') throw new Error('Delegated deep discovery requires a scan started in deep mode.'); if (scan.lifecycle === 'completed') throw new Error('Completed scans cannot accept new discovery candidates.')
-  const worklist = scan.coverage.receipts.map(item => ({ path: item.path, sha256: item.sha256, language: item.language })).sort((left, right) => left.path.localeCompare(right.path))
+  const worklist = await prioritizedWorklist(scan)
   const now = new Date().toISOString(); const job: DeepDiscoveryJob = { id: `deep_${randomUUID()}`, scanId, target: scan.target, createdAt: now, updatedAt: now, lifecycle: 'queued', maxRounds: Math.max(1, Math.min(maxRounds, 10)), worklist, worklistDigest: sha256(JSON.stringify(worklist)), rounds: [], workers: [], candidates: [] }
   await persistInvestigationArtifacts(state, scan)
   await writeArtifact(scan, 'artifacts/02_discovery/rank_input.jsonl', `${worklist.map(item => JSON.stringify(item)).join('\n')}\n`)
@@ -132,7 +171,7 @@ export async function readScanSource(config: Config, scanId: string, path: strin
 }
 
 function transcript(agent: { session: { deriveMessages(): Array<{ role: string; content: Array<{ type: string; text?: string }> }> } }): string { return agent.session.deriveMessages().filter(message => message.role === 'assistant').flatMap(message => message.content.filter(block => block.type === 'text' || block.type === 'reasoning').map(block => block.text ?? '')).join('\n\n').slice(-200_000) }
-function brief(job: DeepDiscoveryJob, worker: DeepWorker): string { return `You are one of six independent DSH security discovery workers. You have exactly four DSH tools: security_deep_get_worklist, security_deep_read_source, security_deep_report_candidate, and security_deep_report_worker. Do not modify source, validate or fix findings, or use external services. Call security_deep_get_worklist with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}; confirm its digest is ${job.worklistDigest}; then inspect every returned path with security_deep_read_source. Independently create a source-evidenced worker threat model; do not use another worker's analysis. For every distinct candidate with a concrete local source line, call security_deep_report_candidate with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, stable rule_id, title, severity, CWE, workspace-relative file, line, and root_cause. When all worklist rows are closed, call security_deep_report_worker with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, your worker threat model, every reviewed path, explicit deferred rows with reasons, and a coverage summary. A worker run without that report is incomplete. Report only candidates you can support with source evidence.` }
+function brief(job: DeepDiscoveryJob, worker: DeepWorker): string { const lens = worker.lens ? `${worker.lens}: ${LENS_GUIDANCE[worker.lens]}` : 'legacy neutral review lens'; return `You are one of six independent DSH security discovery workers. Your assigned independent review lens is ${lens} You have exactly four DSH tools: security_deep_get_worklist, security_deep_read_source, security_deep_report_candidate, and security_deep_report_worker. Do not modify source, validate or fix findings, or use external services. Call security_deep_get_worklist with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}; confirm its digest is ${job.worklistDigest}; then inspect every returned path with security_deep_read_source in descending priority order, using risk signals as review leads rather than proof. Independently create a source-evidenced worker threat model; do not use another worker's analysis. For every distinct candidate with a concrete local source line, call security_deep_report_candidate with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, stable rule_id, title, severity, CWE, workspace-relative file, line, and root_cause. When all worklist rows are closed, call security_deep_report_worker with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, your worker threat model, every reviewed path, explicit deferred rows with reasons, and a coverage summary. A worker run without that report is incomplete. Report only candidates you can support with source evidence.` }
 
 function cancelled(signal: AbortSignal | undefined): boolean { return signal?.aborted === true }
 
@@ -227,7 +266,7 @@ export async function runDeepDiscovery(ctx: Context, config: Config, jobId: stri
   while (completedRounds < job.maxRounds) {
     number++
     if (cancelled(signal)) { job.lifecycle = 'cancelled'; await save(state, job); return job }
-    const workers = Array.from({ length: WORKERS_PER_ROUND }, (_, index): DeepWorker => ({ id: `worker_${number}_${index + 1}`, round: number, status: 'pending', token: randomUUID(), candidateIds: [] })); job.workers.push(...workers); const round: DeepRound = { number, workerIds: workers.map(worker => worker.id), candidateCount: 0, novelty: 0, status: 'running' }; job.rounds.push(round); await save(state, job)
+    const workers = Array.from({ length: WORKERS_PER_ROUND }, (_, index): DeepWorker => ({ id: `worker_${number}_${index + 1}`, round: number, lens: DEEP_REVIEW_LENSES[index], status: 'pending', token: randomUUID(), candidateIds: [] })); job.workers.push(...workers); const round: DeepRound = { number, workerIds: workers.map(worker => worker.id), candidateCount: 0, novelty: 0, status: 'running' }; job.rounds.push(round); await save(state, job)
     await Promise.all(workers.map(worker => runWorker(ctx, config, job, worker, signal)))
     job = await loadDeepDiscoveryJob(config, jobId)
     const completedRound = job.rounds.find(item => item.number === number); if (!completedRound) throw new Error('Deep discovery round state is missing.')
@@ -239,10 +278,16 @@ export async function runDeepDiscovery(ctx: Context, config: Config, jobId: stri
     completedRounds++
     if (completedRounds === job.maxRounds) job.lifecycle = 'capped'
   }
-  const eligibleWorkers = completeWorkerIds(job); const eligibleCandidates = job.candidates.filter(candidate => candidate.workerIds.some(workerId => eligibleWorkers.has(workerId))); const scan = await loadScan(state, job.scanId); for (const candidate of eligibleCandidates) addCandidate(scan, candidate); scan.activity.push({ at: new Date().toISOString(), phase: 'discovery', message: `Delegated deep discovery ${job.lifecycle}: ${job.rounds.filter(round => round.status === 'complete').length} complete rounds, ${eligibleCandidates.length} eligible worker candidates.` }); await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); await save(state, job); return job
+  const eligibleWorkers = completeWorkerIds(job); const eligibleCandidates = job.candidates.filter(candidate => candidate.workerIds.some(workerId => eligibleWorkers.has(workerId))); const scan = await loadScan(state, job.scanId); for (const candidate of eligibleCandidates) addCandidate(scan, candidate)
+  const reports = job.workers.filter(worker => eligibleWorkers.has(worker.id) && worker.report).map(worker => ({ worker, report: worker.report! }))
+  if (reports.length !== WORKERS_PER_ROUND * job.rounds.filter(round => round.status === 'complete').length) throw new Error('A terminal deep discovery job is missing a completed worker threat model.')
+  const model = ['# Canonical Deep Validation Threat Model', '', `- Discovery job: \`${job.id}\``, `- Immutable worklist digest: \`${job.worklistDigest}\``, `- Completed workers: ${reports.map(({ worker }) => `\`${worker.id}\``).join(', ')}`, '', 'This model is synthesized from independent DSH worker reports. Worker statements are evidence leads, not proof; validation must reopen scan-receipted source and record counterevidence.', '', ...reports.flatMap(({ worker, report }) => [`## ${worker.id} (${worker.lens ?? 'legacy neutral review'})`, '', report.threatModel.trim(), ''])].join('\n').trim() + '\n'
+  scan.threatModel = model
+  const artifactRef = await writeArtifact(scan, 'artifacts/01_context/deep_canonical_threat_model.md', model); job.canonicalThreatModel = { artifactRef, digest: sha256(model), workerIds: reports.map(({ worker }) => worker.id), createdAt: new Date().toISOString() }
+  scan.activity.push({ at: new Date().toISOString(), phase: 'threat_model', message: `Synthesized a canonical deep validation threat model from ${reports.length} independent worker reports.` }); scan.activity.push({ at: new Date().toISOString(), phase: 'discovery', message: `Delegated deep discovery ${job.lifecycle}: ${job.rounds.filter(round => round.status === 'complete').length} complete rounds, ${eligibleCandidates.length} eligible worker candidates.` }); await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); await save(state, job); return job
 }
 
-export interface DeepClosureJob { id: string; scanId: string; phase: 'validation' | 'attack_path'; createdAt: string; updatedAt: string; lifecycle: 'queued' | 'running' | 'completed' | 'incomplete' | 'cancelled' | 'failed'; workers: Array<{ id: string; status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed'; sessionId?: string; transcript?: string; error?: string }>; completedTaskIds: string[] }
+export interface DeepClosureJob { id: string; scanId: string; phase: 'validation' | 'attack_path'; createdAt: string; updatedAt: string; lifecycle: 'queued' | 'running' | 'completed' | 'incomplete' | 'cancelled' | 'failed'; workers: Array<{ id: string; status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed'; sessionId?: string; transcript?: string; error?: string }>; completedTaskIds: string[]; threatModel: { artifactRef: string; digest: string; source: 'canonical_deep_discovery' | 'scan_preflight' } }
 const closureWrites = new Map<string, Promise<void>>()
 function closurePath(state: string, id: string): string { if (!/^deepclose_[0-9a-f-]+$/.test(id)) throw new Error('Invalid deep closure job id.'); return join(state, 'deep-closure', `${id}.json`) }
 async function saveClosure(state: string, job: DeepClosureJob): Promise<void> { job.updatedAt = new Date().toISOString(); await atomic(closurePath(state, job.id), `${JSON.stringify(job, null, 2)}\n`) }
@@ -251,13 +296,25 @@ async function updateClosure<T>(config: Config, id: string, update: (job: DeepCl
   const previous = closureWrites.get(id) ?? Promise.resolve(); let release!: () => void; const barrier = new Promise<void>(resolveBarrier => { release = resolveBarrier }); const chained = previous.then(() => barrier); closureWrites.set(id, chained); await previous
   try { const job = await loadDeepClosureJob(config, id); const value = await update(job); await saveClosure(getStateDir(config.stateDir), job); return value } finally { release(); if (closureWrites.get(id) === chained) closureWrites.delete(id) }
 }
+async function verifyClosureThreatModel(config: Config, job: DeepClosureJob): Promise<void> {
+  const scan = await loadScan(getStateDir(config.stateDir), job.scanId)
+  if (sha256(scan.threatModel) !== job.threatModel.digest) throw new Error('The bound deep closure threat model changed after job creation. Create a new closure job from the current scan state.')
+  const artifact = join(scan.artifacts.directory, job.threatModel.artifactRef)
+  const content = await readFile(artifact, 'utf8').catch(() => { throw new Error('The bound deep closure threat-model artifact is unavailable. Create a new closure job from the current scan state.') })
+  if (sha256(content) !== job.threatModel.digest) throw new Error('The bound deep closure threat-model artifact no longer matches the current scan model. Create a new closure job.')
+}
 export async function createDeepClosureJob(config: Config, scanId: string, phase: 'validation' | 'attack_path'): Promise<DeepClosureJob> {
   const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); if (scan.mode !== 'deep') throw new Error('Centralized deep closure requires a deep scan.'); if (scan.lifecycle === 'completed') throw new Error('Completed scans cannot accept centralized review evidence.')
   const existing = scan.tasks.filter(task => task.phase === phase && (task.status === 'pending' || task.status === 'claimed')).length; if (!existing) throw new Error(`No pending ${phase} tasks are available for centralized deep closure.`)
-  const now = new Date().toISOString(); const job: DeepClosureJob = { id: `deepclose_${randomUUID()}`, scanId, phase, createdAt: now, updatedAt: now, lifecycle: 'queued', workers: [], completedTaskIds: [] }; await saveClosure(state, job); return job
+  // A workbench scan may have been saved without its mutable artifacts; materialize
+  // the exact current model before freezing the closure's evidence binding.
+  await persistInvestigationArtifacts(state, scan); await saveScan(state, scan)
+  const canonicalPath = join(scan.artifacts.directory, 'artifacts/01_context/deep_canonical_threat_model.md'); let canonical = false
+  try { canonical = sha256(await readFile(canonicalPath, 'utf8')) === sha256(scan.threatModel) } catch { /* A direct deep workbench can legitimately use its scan-time threat model. */ }
+  const now = new Date().toISOString(); const job: DeepClosureJob = { id: `deepclose_${randomUUID()}`, scanId, phase, createdAt: now, updatedAt: now, lifecycle: 'queued', workers: [], completedTaskIds: [], threatModel: { artifactRef: canonical ? 'artifacts/01_context/deep_canonical_threat_model.md' : 'artifacts/01_context/threat_model.md', digest: sha256(scan.threatModel), source: canonical ? 'canonical_deep_discovery' : 'scan_preflight' } }; await saveClosure(state, job); return job
 }
 function closureBrief(job: DeepClosureJob, workerId: string): string {
-  const common = `You are a centralized DSH deep ${job.phase} worker. You may use only security_claim_audit_task, security_get_scan, security_read_scan_source, ${job.phase === 'validation' ? 'security_record_validation' : 'security_record_attack_path'}. Work only on tasks you claim. Do not modify source, run commands, use external services, create findings, or access unreceipted paths. Claim ${job.phase} tasks using scan_id ${job.scanId}, owner ${workerId}; for each claimed task, read its scan record and cited source through security_read_scan_source, then submit a complete source-evidenced ${job.phase} receipt with the returned claim token. Continue until security_claim_audit_task returns null. Do not infer a runtime test that was not performed.`
+  const common = `You are a centralized DSH deep ${job.phase} worker. The required threat model is ${job.threatModel.source} at ${job.threatModel.artifactRef} with digest ${job.threatModel.digest}. Retrieve security_get_scan first and verify its threat model digest before reviewing. You may use only security_claim_audit_task, security_get_scan, security_read_scan_source, ${job.phase === 'validation' ? 'security_record_validation' : 'security_record_attack_path'}. Work only on tasks you claim. Do not modify source, run commands, use external services, create findings, or access unreceipted paths. Claim ${job.phase} tasks using scan_id ${job.scanId}, owner ${workerId}; for each claimed task, read its scan record and cited source through security_read_scan_source, then submit a complete source-evidenced ${job.phase} receipt with the returned claim token. Continue until security_claim_audit_task returns null. Do not infer a runtime test that was not performed.`
   return job.phase === 'validation' ? `${common} A reportable conclusion requires a plausible attacker, concrete entry point, trust boundary, root control, sink, impact, counterevidence, limitations, and calibrated confidence. Otherwise use suppressed, deferred, or not_applicable with the exact proof gap.` : `${common} Attack-path work is only for reportable findings. Preserve the root-control location and explain attacker, entry point, preconditions, source-to-sink dataflow, outcome, severity rationale, and conditions that would change the conclusion.`
 }
 async function runClosureWorker(ctx: Context, config: Config, job: DeepClosureJob, worker: DeepClosureJob['workers'][number], signal?: AbortSignal): Promise<void> {
@@ -275,9 +332,10 @@ async function runClosureWorker(ctx: Context, config: Config, job: DeepClosureJo
 /** Run a six-worker centralized closure phase. Incomplete worker rounds never claim completion. */
 export async function runDeepClosure(ctx: Context, config: Config, jobId: string, signal?: AbortSignal): Promise<DeepClosureJob> {
   let job = await loadDeepClosureJob(config, jobId); if (!['queued', 'cancelled', 'incomplete'].includes(job.lifecycle)) throw new Error('Deep closure job has already completed or failed.'); const capability = deepDiscoveryCapability(ctx); if (!capability.available) { job.lifecycle = 'failed'; await saveClosure(getStateDir(config.stateDir), job); throw new Error(capability.reason) }
+  try { await verifyClosureThreatModel(config, job) } catch (error) { job.lifecycle = 'failed'; await saveClosure(getStateDir(config.stateDir), job); throw error }
   if (cancelled(signal)) { job.lifecycle = 'cancelled'; await saveClosure(getStateDir(config.stateDir), job); return job }
   job.lifecycle = 'running'; const round = job.workers.length / WORKERS_PER_ROUND + 1; const workers = Array.from({ length: WORKERS_PER_ROUND }, (_, index) => ({ id: `closure_${job.phase}_${round}_${index + 1}`, status: 'pending' as const })); job.workers.push(...workers); await saveClosure(getStateDir(config.stateDir), job); await Promise.all(workers.map(worker => runClosureWorker(ctx, config, job, worker, signal))); job = await loadDeepClosureJob(config, jobId)
   if (cancelled(signal)) { job.lifecycle = 'cancelled'; await saveClosure(getStateDir(config.stateDir), job); return job }
   const completeWorkers = workers.every(worker => job.workers.find(row => row.id === worker.id)?.status === 'completed'); const scan = await loadScan(getStateDir(config.stateDir), job.scanId); const remaining = scan.tasks.filter(task => task.phase === job.phase && (task.status === 'pending' || task.status === 'claimed'))
-  job.completedTaskIds = scan.tasks.filter(task => task.phase === job.phase && task.status === 'completed').map(task => task.id); job.lifecycle = completeWorkers && remaining.length === 0 ? 'completed' : 'incomplete'; await writeArtifact(scan, `artifacts/04_reconciliation/deep-${job.phase}-closure-${job.id}.json`, `${JSON.stringify({ jobId: job.id, phase: job.phase, lifecycle: job.lifecycle, workers: job.workers, completedTaskIds: job.completedTaskIds, remainingTaskIds: remaining.map(task => task.id) }, null, 2)}\n`); scan.activity.push({ at: new Date().toISOString(), phase: job.phase, message: `Centralized deep ${job.phase} closure ${job.lifecycle}: ${job.completedTaskIds.length} completed task(s), ${remaining.length} remaining.` }); await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan); await saveClosure(getStateDir(config.stateDir), job); return job
+  job.completedTaskIds = scan.tasks.filter(task => task.phase === job.phase && task.status === 'completed').map(task => task.id); job.lifecycle = completeWorkers && remaining.length === 0 ? 'completed' : 'incomplete'; await writeArtifact(scan, `artifacts/04_reconciliation/deep-${job.phase}-closure-${job.id}.json`, `${JSON.stringify({ jobId: job.id, phase: job.phase, lifecycle: job.lifecycle, threatModel: job.threatModel, workers: job.workers, completedTaskIds: job.completedTaskIds, remainingTaskIds: remaining.map(task => task.id) }, null, 2)}\n`); scan.activity.push({ at: new Date().toISOString(), phase: job.phase, message: `Centralized deep ${job.phase} closure ${job.lifecycle}: ${job.completedTaskIds.length} completed task(s), ${remaining.length} remaining.` }); await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan); await saveClosure(getStateDir(config.stateDir), job); return job
 }
