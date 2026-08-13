@@ -60,6 +60,16 @@ test('Python and Go module analysis trace request-derived SQL text but exclude b
   assert.equal(go.candidates[0]?.file, 'queries.go')
 })
 
+test('Python module analysis traces request bytes into unsafe deserializers and excludes SafeLoader', () => {
+  const result = analyzePythonModuleGraph([
+    { file: 'routes.py', source: 'from parsers import load_pickle, load_yaml, load_safe\ndef route():\n    load_pickle(request.get_data())\n    load_yaml(request.get_data())\n    load_safe(request.get_data())\n' },
+    { file: 'parsers.py', source: 'import pickle\nimport yaml\ndef load_pickle(payload):\n    return pickle.loads(payload)\ndef load_yaml(payload):\n    return yaml.load(payload, Loader=yaml.FullLoader)\ndef load_safe(payload):\n    return yaml.load(payload, Loader=yaml.SafeLoader)\n' },
+  ])
+  assert.deepEqual(result.candidates.map(item => item.rule), ['unsafe-deserialization', 'unsafe-deserialization'])
+  assert.deepEqual(result.candidates.map(item => item.file), ['parsers.py', 'parsers.py'])
+  assert.equal(result.candidates.every(item => item.evidence.some(evidence => evidence.detail.includes('cross-function'))), true)
+})
+
 test('Go package analysis follows request input across same-package files to a command sink', () => {
   const result = analyzeGoPackageGraph([
     { file: 'route.go', source: 'package app\nfunc Route(r Request) { Execute(r.FormValue("cmd")) }\n' },

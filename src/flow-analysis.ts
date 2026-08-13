@@ -17,6 +17,7 @@ const PYTHON_RULES: FlowRule[] = [
   { id: 'path-traversal-sink', title: 'Filesystem operation from request data', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a filesystem API without proven containment.', sink: /\b(?:open|os\.path\.join|send_file)\s*\(/ },
   { id: 'ssrf-request-sink', title: 'Outbound request from request data', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects an outbound network destination.', sink: /\b(?:requests\.(?:get|post|request)|httpx\.(?:get|post|request)|urllib\.request\.urlopen)\s*\(/ },
   { id: 'sql-injection-query-construction', title: 'SQL query construction from request data', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a Python database query-text API.', sink: /\b(?:cursor|connection|conn|db|database|session)\.(?:execute|executemany|executescript)\s*\(/i },
+  { id: 'unsafe-deserialization', title: 'Unsafe Python deserialization from request data', cwe: 'CWE-502', severity: 'high', rationale: 'Request-derived bytes reach a Python deserializer that can construct attacker-controlled objects.', sink: /\b(?:pickle\.loads|yaml\.load)\s*\(/i },
 ]
 
 const GO_RULES: FlowRule[] = [
@@ -26,7 +27,7 @@ const GO_RULES: FlowRule[] = [
   { id: 'sql-injection-query-construction', title: 'SQL query construction from request data', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a Go database query-text API.', sink: /\b(?:db|database|tx|stmt)\.(?:Query|QueryContext|Exec|ExecContext)\s*\(/ },
 ]
 
-const PYTHON_SOURCE = /\b(?:request\.(?:args|form|json|data|values|headers)|input\s*\()/i
+const PYTHON_SOURCE = /\b(?:request\.(?:args|form|json|data|values|headers|get_data|get_json)|input\s*\()/i
 const GO_SOURCE = /\b(?:r\.(?:URL\.Query\(\)\.Get|FormValue|PostFormValue)|c\.Query|ctx\.Query)\s*\(/
 const IDENTIFIER = /[A-Za-z_]\w*/g
 
@@ -81,6 +82,18 @@ function calls(line: string, _language: 'python' | 'go'): Array<{ name: string; 
 }
 
 function sinkTainted(value: string, rule: FlowRule, tainted: Set<string>, sources: RegExp, language: 'python' | 'go'): boolean {
+  if (rule.id === 'unsafe-deserialization') {
+    if (language !== 'python') return false
+    for (const call of calls(value, language)) {
+      rule.sink.lastIndex = 0
+      if (!rule.sink.test(`${call.name}(`)) continue
+      // pickle has no safe loader mode. yaml.load is only in scope when the
+      // call does not explicitly select the standard SafeLoader family.
+      if (call.name === 'yaml.load' && call.args.some(argument => /(?:^|[.=])SafeLoader\b/.test(argument))) continue
+      if (call.args[0] && expressionTainted(call.args[0], tainted, sources)) return true
+    }
+    return false
+  }
   if (rule.id === 'sql-injection-query-construction') {
     for (const call of calls(value, language)) {
       rule.sink.lastIndex = 0
