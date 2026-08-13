@@ -269,6 +269,19 @@ test('directory assessment records AST-proven embedded JavaScript credentials bu
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment records AST-proven TLS verification disablement only in a client configuration path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'client.ts'), "const options = { rejectUnauthorized: false }\nhttps.request('https://api.example.test', options)\nlogger.info({ rejectUnauthorized: false })\n")
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'tls-verification-disabled')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.line, 1)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.line === 2 && item.location.role === 'sink'), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'ast.local-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment follows a CommonJS default function export', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -713,6 +726,25 @@ test('diff scan retains an added AST-proven embedded JavaScript credential liter
     assert.ok(finding)
     assert.equal(finding.locations[0]?.file, 'config.ts')
     assert.equal(finding.locations[0]?.line, 2)
+    assert.equal(finding.evidence.some(item => item.location?.line === 2 && item.location.role === 'sink'), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan retains a newly added supported TLS client configuration path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'client.ts'), 'const options = { rejectUnauthorized: false }\nlogger.info(options)\n')
+    await execFileAsync('git', ['add', 'client.ts'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'client.ts'), "const options = { rejectUnauthorized: false }\nhttps.request('https://api.example.test', options)\n")
+    const scan = await runDiffScan(root, undefined, '')
+    const finding = scan.findings.find(item => item.ruleId === 'tls.verification.disabled')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.file, 'client.ts')
+    assert.equal(finding.locations[0]?.line, 1)
     assert.equal(finding.evidence.some(item => item.location?.line === 2 && item.location.role === 'sink'), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }

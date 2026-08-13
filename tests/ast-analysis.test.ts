@@ -238,3 +238,17 @@ test('AST analysis finds only embedded non-placeholder credential literals in se
   assert.deepEqual(candidates.map(candidate => candidate.line), [2, 3, 4])
   assert.equal(candidates.every(candidate => candidate.evidence.some(item => item.detail.includes('credential field'))), true)
 })
+
+test('AST analysis relates rejectUnauthorized false only to supported TLS client calls', () => {
+  const result = analyzeJavaScriptAst(`
+    request({ rejectUnauthorized: false })
+    const options = { rejectUnauthorized: false }
+    https.request('https://api.example.test', options)
+    logger.info({ rejectUnauthorized: false })
+    const unrelated = { rejectUnauthorized: false }
+    fetch('https://api.example.test', { rejectUnauthorized: false })
+  `, 'tls.ts')
+  const candidates = result.candidates.filter(candidate => candidate.rule === 'tls-verification-disabled')
+  assert.deepEqual(candidates.map(candidate => candidate.line), [2, 3])
+  assert.equal(candidates.every(candidate => candidate.evidence.some(item => item.location?.role === 'sink')), true)
+})

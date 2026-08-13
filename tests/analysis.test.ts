@@ -145,9 +145,9 @@ test('backlog triage preserves every supplied item and ranks needs-review entrie
     assert.equal(result.schemaVersion, 'dsh-security-suite.triage/v1')
     assert.equal(result.items.length, 2)
     assert.deepEqual(result.items.map(item => item.inputId), ['first', 'second'])
-    assert.equal(result.items.every(item => item.verdict === 'needs_review'), true)
+    assert.equal(result.items.every(item => item.verdict === 'confirmed'), true)
     assert.deepEqual(result.items.map(item => item.exploitabilityStackRank.rank), [1, 2])
-    assert.equal(result.items.every(item => item.exploitabilityStackRank.rankQueue === 'needs_review'), true)
+    assert.equal(result.items.every(item => item.exploitabilityStackRank.rankQueue === 'confirmed'), true)
     assert.match(await readFile(result.artifactPath, 'utf8'), /triage-001/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })

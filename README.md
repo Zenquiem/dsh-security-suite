@@ -41,6 +41,8 @@ JavaScript/TypeScript weak-randomness discovery is AST-based: it recognizes `Mat
 
 JavaScript/TypeScript embedded-credential discovery is also AST-based: a non-placeholder string literal must be assigned to a named API key, access key, secret, password, token, private key, or credential field. Environment-derived and other dynamic values, ordinary strings, and recognized sample or replacement values remain unproven. Other supported source languages retain their literal rule coverage.
 
+JavaScript/TypeScript TLS verification discovery is AST-based: `rejectUnauthorized: false` must be in an inline or local named configuration object that reaches a supported TLS/HTTPS client call. Unused, logged, or unrelated objects with that property do not establish a client path. Other supported source languages retain explicit TLS-disablement rule coverage.
+
 Ruby deserialization analysis follows request-derived values through same-directory local wrappers into `YAML.load`, `Psych.load`, and `Marshal.load`. `safe_load`, static data, and unrelated parser methods remain unproven.
 
 PHP deserialization analysis follows request-derived values through same-directory local wrappers into `unserialize()`. It recognizes the explicit `allowed_classes => false` control; other allowlists, wrappers, and parser APIs remain validation-required.

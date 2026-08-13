@@ -28,6 +28,7 @@ const AST_RULES: AstRule[] = [
   { id: 'prototype-pollution-merge', title: 'Prototype-polluting merge from request data', cwe: 'CWE-1321', severity: 'medium', rationale: 'Request-derived object data reaches a generic object merge primitive without a proven prototype-key filter.', sinks: ['assign', 'merge'] },
   { id: 'weak-randomness-security', title: 'Predictable randomness in a security field', cwe: 'CWE-330', severity: 'medium', rationale: 'Math.random() reaches a security-sensitive value where a cryptographic random source is required.', sinks: [] },
   { id: 'hardcoded-secret-marker', title: 'Embedded credential literal', cwe: 'CWE-798', severity: 'medium', rationale: 'A credential-named field contains a non-placeholder string literal that should be moved to managed secret storage.', sinks: [] },
+  { id: 'tls-verification-disabled', title: 'TLS certificate verification disabled', cwe: 'CWE-295', severity: 'high', rationale: 'A TLS client configuration explicitly disables certificate verification.', sinks: [] },
 ]
 
 function children(node: AstNode): AstNode[] {
@@ -262,6 +263,64 @@ function hardcodedSecretCandidates(program: AstNode, source: string, file: strin
   return [...unique.values()]
 }
 
+function falseLiteral(node: AstNode | undefined): boolean { return node?.type === 'Literal' && node.value === false }
+
+function objectBindingSources(program: AstNode): Map<string, AstNode> {
+  const bindings = new Map<string, AstNode>()
+  walk(program, node => {
+    if (node.type !== 'VariableDeclarator' && node.type !== 'AssignmentExpression') return
+    const name = id(node.type === 'VariableDeclarator' ? node.id as AstNode : node.left as AstNode)
+    const value = node.type === 'VariableDeclarator' ? node.init as AstNode | undefined : node.right as AstNode | undefined
+    if (name && value?.type === 'ObjectExpression') bindings.set(name, value)
+  })
+  return bindings
+}
+
+function tlsConfigurationArgument(node: AstNode | undefined, bindings: Map<string, AstNode>): AstNode | undefined {
+  if (node?.type === 'ObjectExpression') return node
+  return node?.type === 'Identifier' ? bindings.get(String(node.name)) : undefined
+}
+
+function tlsClientCall(node: AstNode): boolean {
+  if (node.type !== 'CallExpression' && node.type !== 'NewExpression') return false
+  const callee = memberName(node.callee as AstNode).toLowerCase()
+  return /^(?:request|https\.(?:request|get)|tls\.(?:connect|createsecurecontext)|https\.agent)$/.test(callee)
+}
+
+function tlsDisabledCandidate(rule: AstRule, source: string, file: string, property: AstNode, call: AstNode): Candidate | undefined {
+  const number = property.loc?.start.line; const callLine = call.loc?.start.line
+  if (!number || !callLine) return undefined
+  const excerpt = line(source, number)
+  return {
+    rule: rule.id, severity: rule.severity, file, line: number, excerpt, rationale: rule.rationale, cwe: rule.cwe,
+    evidence: [
+      { kind: 'pattern', detail: 'AST resolved rejectUnauthorized: false in a TLS client configuration object.', location: { file, line: number, excerpt, role: 'root_control' } },
+      { kind: 'context', detail: 'AST resolved that configuration object as an argument to a supported TLS client call.', location: { file, line: callLine, excerpt: line(source, callLine), role: 'sink' } },
+    ],
+  }
+}
+
+function tlsVerificationDisabledCandidates(program: AstNode, source: string, file: string): Candidate[] {
+  const rule = AST_RULES.find(item => item.id === 'tls-verification-disabled')
+  if (!rule) return []
+  const bindings = objectBindingSources(program); const candidates: Candidate[] = []
+  walk(program, node => {
+    if (!tlsClientCall(node)) return
+    const args = (node.arguments ?? []) as AstNode[]
+    for (const argument of args) {
+      const config = tlsConfigurationArgument(argument, bindings)
+      if (!config) continue
+      for (const property of (config.properties ?? []) as AstNode[]) {
+        if (property.type !== 'Property' || propertyName(property) !== 'rejectunauthorized' || !falseLiteral(property.value as AstNode)) continue
+        const item = tlsDisabledCandidate(rule, source, file, property, node)
+        if (item) candidates.push(item)
+      }
+    }
+  })
+  const unique = new Map<string, Candidate>(); for (const item of candidates) unique.set(`${item.rule}:${item.file}:${item.line}:${item.excerpt}`, item)
+  return [...unique.values()]
+}
+
 /** Fixed-point summaries for named local functions: parameter index -> reachable sink. */
 function localFunctionSinks(program: AstNode): Map<string, Map<number, FunctionSink[]>> {
   const functions = localFunctions(program); const byName = new Map(functions.map(item => [item.name, item])); const summaries = new Map<string, Map<number, FunctionSink[]>>(functions.map(item => [item.name, new Map()]))
@@ -296,7 +355,7 @@ export function analyzeJavaScriptAst(source: string, file: string): { candidates
     if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value, requestDestructure: false }) }
   })
   for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && (assignment.requestDestructure || sourceExpression(assignment.value, tainted))) { tainted.add(assignment.name); changed = true } if (!changed) break }
-  const candidates: Candidate[] = [...weakRandomnessCandidates(program, source, file), ...hardcodedSecretCandidates(program, source, file)]; const functions = new Map(localFunctions(program).map(item => [item.name, item])); const summaries = localFunctionSinks(program)
+  const candidates: Candidate[] = [...weakRandomnessCandidates(program, source, file), ...hardcodedSecretCandidates(program, source, file), ...tlsVerificationDisabledCandidates(program, source, file)]; const functions = new Map(localFunctions(program).map(item => [item.name, item])); const summaries = localFunctionSinks(program)
   walk(program, node => {
     if (node.type !== 'CallExpression') return
     for (const sink of sinkFor(node)) { const input = sink.argumentsList.find(argument => sourceExpression(argument, tainted)); if (input) { const item = candidate(sink.rule, source, file, node, sink.sink, input); if (item) candidates.push(item) } }
@@ -471,6 +530,7 @@ export function analyzeJavaScriptModuleGraph(inputs: JavaScriptModule[]): Module
   for (const module of modules.values()) {
     candidates.push(...weakRandomnessCandidates(module.program, module.source, module.file))
     candidates.push(...hardcodedSecretCandidates(module.program, module.source, module.file))
+    candidates.push(...tlsVerificationDisabledCandidates(module.program, module.source, module.file))
     const tainted = new Set<string>(); const assignments: Array<{ name: string; value: AstNode; requestDestructure: boolean }> = []
     walk(module.program, node => { if (node.type === 'VariableDeclarator') { const pattern = node.id as AstNode; const value = node.init as AstNode | undefined; if (value) for (const name of assignmentNames(pattern)) assignments.push({ name, value, requestDestructure: destructuresRequestObject(pattern, value) }) }; if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value, requestDestructure: false }) } })
     for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && (assignment.requestDestructure || sourceExpression(assignment.value, tainted))) { tainted.add(assignment.name); changed = true }; if (!changed) break }
