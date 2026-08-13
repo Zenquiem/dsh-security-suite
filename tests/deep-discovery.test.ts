@@ -166,3 +166,65 @@ test('missing DSH agent runtime marks the queued job failed without a fallback e
     assert.equal((await loadDeepDiscoveryJob(config, job.id)).lifecycle, 'failed')
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
+
+test('cancelling deep discovery disposes active DSH workers and preserves the incomplete round without merging it', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'runUntrustedCommand(input)\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false)
+    await saveScan(state, scan)
+    const job = await createDeepDiscoveryJob(config, scan.id, 1)
+    const controller = new AbortController(); let created = 0; let disposed = 0; let releaseCreated!: () => void
+    const allCreated = new Promise<void>(resolve => { releaseCreated = resolve })
+    const ctx = {
+      agents: {
+        async create(options: { setup?: (ctx: { tools: { restrict(): void }; systemPrompt: { section(): void } }) => void }) {
+          options.setup?.({ tools: { restrict() {} }, systemPrompt: { section() {} } })
+          created++; if (created === 6) releaseCreated()
+          return {
+            agent: {
+              followup() {},
+              async whenIdle() { await new Promise<void>(() => undefined) },
+              session: { deriveMessages: () => [] },
+            },
+            async dispose() { disposed++ },
+          }
+        },
+      },
+    }
+    const running = runDeepDiscovery(ctx as never, config, job.id, controller.signal)
+    await allCreated
+    controller.abort('user cancelled')
+    const result = await running
+    assert.equal(result.lifecycle, 'cancelled')
+    assert.equal(disposed, 6)
+    assert.equal(result.workers.filter(worker => worker.status === 'cancelled').length, 6)
+    assert.equal(result.rounds[0]?.status, 'incomplete')
+    assert.equal((await loadScan(state, scan.id)).findings.length, scan.findings.length)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('a cancelled deep discovery resumes with fresh workers and merges only its completed round', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'runUntrustedCommand(input)\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false)
+    await saveScan(state, scan)
+    const job = await createDeepDiscoveryJob(config, scan.id, 1)
+    const controller = new AbortController(); let releaseCreated!: () => void
+    const allCreated = new Promise<void>(resolve => { releaseCreated = resolve }); let created = 0
+    const cancelledContext = { agents: { async create(options: { setup?: (ctx: { tools: { restrict(): void }; systemPrompt: { section(): void } }) => void }) { options.setup?.({ tools: { restrict() {} }, systemPrompt: { section() {} } }); if (++created === 6) releaseCreated(); return { agent: { followup() {}, async whenIdle() { await new Promise<void>(() => undefined) }, session: { deriveMessages: () => [] } }, async dispose() {} } } } }
+    const interrupted = runDeepDiscovery(cancelledContext as never, config, job.id, controller.signal)
+    await allCreated; controller.abort()
+    assert.equal((await interrupted).lifecycle, 'cancelled')
+    const resumed = await runDeepDiscovery(deepWorkerContext(config, true).ctx as never, config, job.id)
+    assert.equal(resumed.lifecycle, 'capped')
+    assert.equal(resumed.rounds.length, 2)
+    assert.deepEqual(resumed.rounds.map(round => round.status), ['incomplete', 'complete'])
+    assert.equal((await loadScan(state, scan.id)).findings.some(finding => finding.ruleId === 'custom.delegated-sink'), true)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})

@@ -16,14 +16,21 @@ const jobWrites = new Map<string, Promise<void>>()
 export interface DeepCandidateInput { ruleId: string; title: string; severity: Severity; cwe: string; file: string; line: number; rootCause: string }
 export interface DeepCandidate extends DeepCandidateInput { id: string; workerId: string; workerIds: string[]; reportIds: string[]; excerpt: string; fingerprint: string; reportedAt: string }
 export interface DeepWorkerReport { threatModel: string; reviewedPaths: string[]; deferred: Array<{ path: string; reason: string }>; coverageSummary: string; reportedAt: string }
-export interface DeepWorker { id: string; round: number; status: 'pending' | 'running' | 'completed' | 'failed'; token: string; sessionId?: string; transcript?: string; error?: string; candidateIds: string[]; report?: DeepWorkerReport }
+export interface DeepWorker { id: string; round: number; status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed'; token: string; sessionId?: string; transcript?: string; error?: string; candidateIds: string[]; report?: DeepWorkerReport }
 export interface DeepRound { number: number; workerIds: string[]; candidateCount: number; novelty: number; status: 'running' | 'complete' | 'incomplete'; artifactRefs?: string[] }
 export interface DeepWorkItem { path: string; sha256: string; language: string }
-export interface DeepDiscoveryJob { id: string; scanId: string; target: string; createdAt: string; updatedAt: string; lifecycle: 'queued' | 'running' | 'saturated' | 'capped' | 'incomplete' | 'failed'; maxRounds: number; worklist: DeepWorkItem[]; worklistDigest: string; rounds: DeepRound[]; workers: DeepWorker[]; candidates: DeepCandidate[] }
+export interface DeepDiscoveryJob { id: string; scanId: string; target: string; createdAt: string; updatedAt: string; lifecycle: 'queued' | 'running' | 'saturated' | 'capped' | 'incomplete' | 'cancelled' | 'failed'; maxRounds: number; worklist: DeepWorkItem[]; worklistDigest: string; rounds: DeepRound[]; workers: DeepWorker[]; candidates: DeepCandidate[] }
+
+type NativeAgents = { create?: unknown }
+
+function nativeAgents(ctx: Context): NativeAgents | undefined {
+  const get = (ctx as Context & { get?: (name: string) => unknown }).get
+  return (typeof get === 'function' ? get.call(ctx, 'agents') : (ctx as Context & { agents?: NativeAgents }).agents) as NativeAgents | undefined
+}
 
 /** This suite delegates only through the public DSH agent registry. */
 export function deepDiscoveryCapability(ctx: Context): { available: boolean; workersPerRound: number; reason?: string } {
-  const agents = (ctx as Context & { agents?: { create?: unknown } }).agents
+  const agents = nativeAgents(ctx)
   if (!agents || typeof agents.create !== 'function') return { available: false, workersPerRound: WORKERS_PER_ROUND, reason: 'The active DSH profile has no native agent-creation service.' }
   return { available: true, workersPerRound: WORKERS_PER_ROUND }
 }
@@ -117,29 +124,54 @@ export async function readDeepSource(config: Config, jobId: string, workerId: st
 function transcript(agent: { session: { deriveMessages(): Array<{ role: string; content: Array<{ type: string; text?: string }> }> } }): string { return agent.session.deriveMessages().filter(message => message.role === 'assistant').flatMap(message => message.content.filter(block => block.type === 'text' || block.type === 'reasoning').map(block => block.text ?? '')).join('\n\n').slice(-200_000) }
 function brief(job: DeepDiscoveryJob, worker: DeepWorker): string { return `You are one of six independent DSH security discovery workers. You have exactly four DSH tools: security_deep_get_worklist, security_deep_read_source, security_deep_report_candidate, and security_deep_report_worker. Do not modify source, validate or fix findings, or use external services. Call security_deep_get_worklist with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}; confirm its digest is ${job.worklistDigest}; then inspect every returned path with security_deep_read_source. Independently create a source-evidenced worker threat model; do not use another worker's analysis. For every distinct candidate with a concrete local source line, call security_deep_report_candidate with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, stable rule_id, title, severity, CWE, workspace-relative file, line, and root_cause. When all worklist rows are closed, call security_deep_report_worker with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, your worker threat model, every reviewed path, explicit deferred rows with reasons, and a coverage summary. A worker run without that report is incomplete. Report only candidates you can support with source evidence.` }
 
-async function runWorker(ctx: Context, config: Config, job: DeepDiscoveryJob, worker: DeepWorker): Promise<void> {
+function cancelled(signal: AbortSignal | undefined): boolean { return signal?.aborted === true }
+
+async function runWorker(ctx: Context, config: Config, job: DeepDiscoveryJob, worker: DeepWorker, signal?: AbortSignal): Promise<void> {
   const sessionId = SessionId(`dsh-security-deep-${randomUUID()}`)
   await updateJob(config, job.id, current => { const record = current.workers.find(item => item.id === worker.id); if (!record) throw new Error('Deep discovery worker was not created.'); record.status = 'running'; record.sessionId = sessionId as unknown as string })
   let handle: Awaited<ReturnType<typeof ctx.agents.create>> | undefined
+  let disposePromise: Promise<void> | undefined
+  const dispose = (): Promise<void> => handle ? (disposePromise ??= handle.dispose().catch(() => undefined)) : Promise.resolve()
+  let cancelledByCaller = cancelled(signal)
+  const onAbort = (): void => { cancelledByCaller = true; void dispose() }
+  signal?.addEventListener('abort', onAbort, { once: true })
   try {
-    handle = await ctx.agents.create({ sessionId, meta: { cwd: resolve(job.target), origin: 'subagent', delegationDepth: 1 }, setup(agentCtx) {
+    if (cancelledByCaller) return
+    const agents = nativeAgents(ctx) as typeof ctx.agents | undefined
+    if (!agents || typeof agents.create !== 'function') throw new Error('The active DSH profile has no native agent-creation service.')
+    handle = await agents.create({ sessionId, meta: { cwd: resolve(job.target), origin: 'subagent', delegationDepth: 1 }, setup(agentCtx) {
       agentCtx.tools.restrict({ allow: ['security_deep_get_worklist', 'security_deep_read_source', 'security_deep_report_candidate', 'security_deep_report_worker'] })
       agentCtx.systemPrompt.section({ name: `dsh-security-suite:deep-worker:${worker.id}`, order: 162, text: brief(job, worker) })
     } })
+    if (cancelledByCaller) return
     handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: brief(job, worker) }], source: { kind: 'plugin', plugin: 'dsh-security-suite', form: 'relay' } }))
-    await handle.agent.whenIdle()
+    if (signal) {
+      let removeAbortWait = (): void => undefined
+      const aborted = new Promise<void>(resolveAbort => { const wake = (): void => resolveAbort(); signal.addEventListener('abort', wake, { once: true }); removeAbortWait = (): void => signal.removeEventListener('abort', wake) })
+      try { await Promise.race([handle.agent.whenIdle(), aborted]) } finally { removeAbortWait() }
+    } else await handle.agent.whenIdle()
+    if (cancelledByCaller) return
     const workerTranscript = transcript(handle.agent)
     await updateJob(config, job.id, current => { const record = current.workers.find(item => item.id === worker.id); if (record) { record.transcript = workerTranscript; record.status = 'completed' } })
   } catch (error) {
+    if (cancelledByCaller) return
     const message = error instanceof Error ? error.message : String(error)
     await updateJob(config, job.id, current => { const record = current.workers.find(item => item.id === worker.id); if (record) { record.status = 'failed'; record.error = message } })
-  } finally { await handle?.dispose().catch(() => undefined) }
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+    if (cancelledByCaller) await updateJob(config, job.id, current => { const record = current.workers.find(item => item.id === worker.id); if (record && record.status !== 'completed') { record.status = 'cancelled'; record.error = 'Cancelled by the owning DSH tool call.' } })
+    await dispose()
+  }
 }
 
 function addCandidate(scan: ScanRecord, candidate: DeepCandidate): void {
   if (scan.findings.some(finding => finding.fingerprint === candidate.fingerprint)) return
   const anchor = slug(`${candidate.file}-${candidate.excerpt}`); const id = candidateId(candidate.ruleId, candidate.file, candidate.line); const reporters = candidate.workerIds.join(', '); const finding: Finding = { id: findingId(candidate.ruleId, anchor), candidateId: id, fingerprint: candidate.fingerprint, ruleId: candidate.ruleId, identity: { anchor, instance: slug(`${candidate.file}-${candidate.line}`) }, title: candidate.title, severity: candidate.severity, confidence: 'low', cwe: candidate.cwe, status: 'open', disposition: 'discovered', locations: [{ file: candidate.file, line: candidate.line, excerpt: candidate.excerpt, role: 'root_control' }], rootCause: candidate.rootCause, validation: 'Discovery-only delegated candidate. Validate source, closest control, sink, reachability, impact, and counterevidence.', attackPath: 'Not established.', impact: 'Not established.', remediation: 'Determine the narrowest effective control after validation.', counterevidence: 'No validation has been completed.', evidence: [{ kind: 'pattern', detail: `Independent delegated discovery workers ${reporters} reported this candidate; absorbed report ids: ${candidate.reportIds.join(', ')}.`, location: { file: candidate.file, line: candidate.line, excerpt: candidate.excerpt, role: 'root_control' } }], ledger: [{ at: candidate.reportedAt, phase: 'discovery', disposition: 'discovered', summary: `Delegated workers ${reporters} reported ${candidate.ruleId}; absorbed reports: ${candidate.reportIds.join(', ')}.` }] }
   scan.findings.push(finding); scan.tasks.push({ id: `task_${sha256(`${scan.id}:${id}:validation`).slice(0, 24)}`, candidateId: id, phase: 'validation', focus: `Validate delegated discovery candidate ${finding.title}: establish attacker, entrypoint, control, sink, impact, and counterevidence.`, status: 'pending' })
+}
+
+function completeWorkerIds(job: DeepDiscoveryJob): Set<string> {
+  return new Set(job.rounds.filter(round => round.status === 'complete').flatMap(round => round.workerIds))
 }
 
 async function persistRoundArtifacts(scan: ScanRecord, job: DeepDiscoveryJob, round: DeepRound): Promise<string[]> {
@@ -172,25 +204,30 @@ async function persistRoundArtifacts(scan: ScanRecord, job: DeepDiscoveryJob, ro
   return refs
 }
 
-export async function runDeepDiscovery(ctx: Context, config: Config, jobId: string): Promise<DeepDiscoveryJob> {
-  const state = getStateDir(config.stateDir); let job = await loadDeepDiscoveryJob(config, jobId); if (job.lifecycle !== 'queued') throw new Error('Deep discovery job has already started or ended.')
+export async function runDeepDiscovery(ctx: Context, config: Config, jobId: string, signal?: AbortSignal): Promise<DeepDiscoveryJob> {
+  const state = getStateDir(config.stateDir); let job = await loadDeepDiscoveryJob(config, jobId); if (!['queued', 'cancelled', 'incomplete'].includes(job.lifecycle)) throw new Error('Deep discovery job has already completed or failed.')
   const capability = deepDiscoveryCapability(ctx)
   if (!capability.available) {
     job.lifecycle = 'failed'; await save(state, job)
     throw new Error(capability.reason)
   }
+  if (cancelled(signal)) { job.lifecycle = 'cancelled'; await save(state, job); return job }
   job.lifecycle = 'running'; await save(state, job)
-  let known = new Set<string>()
-  for (let number = 1; number <= job.maxRounds; number++) {
+  const completedWorkerIds = completeWorkerIds(job); const known = new Set(job.candidates.filter(candidate => candidate.workerIds.some(workerId => completedWorkerIds.has(workerId))).map(candidate => candidate.fingerprint)); let completedRounds = job.rounds.filter(round => round.status === 'complete').length; let number = Math.max(0, ...job.rounds.map(round => round.number))
+  while (completedRounds < job.maxRounds) {
+    number++
+    if (cancelled(signal)) { job.lifecycle = 'cancelled'; await save(state, job); return job }
     const workers = Array.from({ length: WORKERS_PER_ROUND }, (_, index): DeepWorker => ({ id: `worker_${number}_${index + 1}`, round: number, status: 'pending', token: randomUUID(), candidateIds: [] })); job.workers.push(...workers); const round: DeepRound = { number, workerIds: workers.map(worker => worker.id), candidateCount: 0, novelty: 0, status: 'running' }; job.rounds.push(round); await save(state, job)
-    await Promise.all(workers.map(worker => runWorker(ctx, config, job, worker)))
+    await Promise.all(workers.map(worker => runWorker(ctx, config, job, worker, signal)))
     job = await loadDeepDiscoveryJob(config, jobId)
     const completedRound = job.rounds.find(item => item.number === number); if (!completedRound) throw new Error('Deep discovery round state is missing.')
     const incomplete = workers.some(worker => { const record = job.workers.find(item => item.id === worker.id); return record?.status !== 'completed' || !record.report }); const candidates = job.candidates.filter(candidate => workers.some(worker => candidate.workerIds.includes(worker.id))); completedRound.candidateCount = candidates.length; completedRound.novelty = candidates.filter(candidate => !known.has(candidate.fingerprint)).length; for (const candidate of candidates) known.add(candidate.fingerprint); completedRound.status = incomplete ? 'incomplete' : 'complete'
     const source = await loadScan(state, job.scanId); completedRound.artifactRefs = await persistRoundArtifacts(source, job, completedRound); await save(state, job)
+    if (cancelled(signal)) { job.lifecycle = 'cancelled'; await save(state, job); return job }
     if (incomplete) { job.lifecycle = 'incomplete'; await save(state, job); return job }
     if (completedRound.novelty === 0) { job.lifecycle = 'saturated'; break }
-    if (number === job.maxRounds) job.lifecycle = 'capped'
+    completedRounds++
+    if (completedRounds === job.maxRounds) job.lifecycle = 'capped'
   }
-  const scan = await loadScan(state, job.scanId); for (const candidate of job.candidates) addCandidate(scan, candidate); scan.activity.push({ at: new Date().toISOString(), phase: 'discovery', message: `Delegated deep discovery ${job.lifecycle}: ${job.rounds.length} complete rounds, ${job.candidates.length} worker candidates.` }); await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); await save(state, job); return job
+  const eligibleWorkers = completeWorkerIds(job); const eligibleCandidates = job.candidates.filter(candidate => candidate.workerIds.some(workerId => eligibleWorkers.has(workerId))); const scan = await loadScan(state, job.scanId); for (const candidate of eligibleCandidates) addCandidate(scan, candidate); scan.activity.push({ at: new Date().toISOString(), phase: 'discovery', message: `Delegated deep discovery ${job.lifecycle}: ${job.rounds.filter(round => round.status === 'complete').length} complete rounds, ${eligibleCandidates.length} eligible worker candidates.` }); await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); await save(state, job); return job
 }
