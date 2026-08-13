@@ -16,12 +16,14 @@ const PYTHON_RULES: FlowRule[] = [
   { id: 'shell-command-construction', title: 'Command execution from request data', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a process execution API.', sink: /\b(?:subprocess\.(?:run|call|Popen|check_output)|os\.(?:system|popen))\s*\(/ },
   { id: 'path-traversal-sink', title: 'Filesystem operation from request data', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a filesystem API without proven containment.', sink: /\b(?:open|os\.path\.join|send_file)\s*\(/ },
   { id: 'ssrf-request-sink', title: 'Outbound request from request data', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects an outbound network destination.', sink: /\b(?:requests\.(?:get|post|request)|httpx\.(?:get|post|request)|urllib\.request\.urlopen)\s*\(/ },
+  { id: 'sql-injection-query-construction', title: 'SQL query construction from request data', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a Python database query-text API.', sink: /\b(?:cursor|connection|conn|db|database|session)\.(?:execute|executemany|executescript)\s*\(/i },
 ]
 
 const GO_RULES: FlowRule[] = [
   { id: 'shell-command-construction', title: 'Command execution from request data', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches an OS command API.', sink: /\bexec\.Command(?:Context)?\s*\(/ },
   { id: 'path-traversal-sink', title: 'Filesystem operation from request data', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a filesystem API without proven containment.', sink: /\b(?:os\.(?:Open|OpenFile|ReadFile|WriteFile)|http\.ServeFile)\s*\(/ },
   { id: 'ssrf-request-sink', title: 'Outbound request from request data', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects an outbound network destination.', sink: /\b(?:http\.(?:Get|Post)|client\.Do)\s*\(/ },
+  { id: 'sql-injection-query-construction', title: 'SQL query construction from request data', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a Go database query-text API.', sink: /\b(?:db|database|tx|stmt)\.(?:Query|QueryContext|Exec|ExecContext)\s*\(/ },
 ]
 
 const PYTHON_SOURCE = /\b(?:request\.(?:args|form|json|data|values|headers)|input\s*\()/i
@@ -31,6 +33,7 @@ const IDENTIFIER = /[A-Za-z_]\w*/g
 function escaped(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
 function identifiers(value: string): string[] { return value.match(IDENTIFIER) ?? [] }
 function expressionTainted(expression: string, tainted: Set<string>, sources: RegExp): boolean {
+  if (/^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')$/.test(expression.trim())) return false
   sources.lastIndex = 0
   if (sources.test(expression)) return true
   return [...tainted].some(name => new RegExp(`\\b${escaped(name)}\\b`).test(expression))
@@ -78,6 +81,17 @@ function calls(line: string, _language: 'python' | 'go'): Array<{ name: string; 
 }
 
 function sinkTainted(value: string, rule: FlowRule, tainted: Set<string>, sources: RegExp, language: 'python' | 'go'): boolean {
+  if (rule.id === 'sql-injection-query-construction') {
+    for (const call of calls(value, language)) {
+      rule.sink.lastIndex = 0
+      if (!rule.sink.test(`${call.name}(`)) continue
+      // Python DB-API methods take SQL text first. Go Context methods take a
+      // context first and SQL text second; binding arguments stay untainted.
+      const index = language === 'go' && /(?:QueryContext|ExecContext)$/.test(call.name) ? 1 : 0
+      if (call.args[index] && expressionTainted(call.args[index], tainted, sources)) return true
+    }
+    return false
+  }
   if (rule.id !== 'ssrf-request-sink') return expressionTainted(value, tainted, sources)
   for (const call of calls(value, language)) {
     rule.sink.lastIndex = 0

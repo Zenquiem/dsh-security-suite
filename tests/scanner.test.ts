@@ -418,6 +418,26 @@ test('diff scan traces an added request path into an unchanged local JavaScript 
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('diff scan traces an added request path into an unchanged local SQL query wrapper without treating bound values as SQL text', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, 'lib'))
+    await writeFile(join(root, 'route.ts'), 'export function route() {}\n')
+    await writeFile(join(root, 'lib', 'queries.ts'), 'export function search(sql: string) { db.query(sql) }\nexport function byId(id: string) { db.query("SELECT * FROM users WHERE id = ?", [id]) }\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'route.ts'), "import { search, byId } from './lib/queries'\nexport function route(req: Request) { search(req.query.where); byId(req.query.id) }\n")
+    const scan = await runDiffScan(root, undefined, '')
+    const finding = scan.findings.find(item => item.ruleId === 'sql.injection.query.construction')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.file, 'lib/queries.ts')
+    assert.equal(scan.findings.filter(item => item.ruleId === 'sql.injection.query.construction').length, 1)
+    assert.equal(finding.evidence.some(item => item.location?.file === 'route.ts' && item.location.line === 2), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('diff scan does not restate an unchanged JavaScript source-to-sink path', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
   try {

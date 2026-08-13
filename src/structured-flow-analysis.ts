@@ -18,34 +18,41 @@ const RULES: Record<Language, Rule[]> = {
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a Java process execution API.', sink: /\b(?:Runtime\.getRuntime\(\)\.exec|ProcessBuilder)\s*\(/ },
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a Java filesystem API.', sink: /\b(?:Files\.(?:readAllBytes|readString|write|newInputStream|newOutputStream)|new\s+FileInputStream|new\s+FileOutputStream)\s*\(/ },
     { id: 'ssrf-request-sink', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data reaches a Java outbound request API.', sink: /\b(?:new\s+URL|URI\.create|RestTemplate\.(?:getForObject|exchange))\s*\(/ },
+    { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a Java SQL query-text API.', sink: /\b(?:statement|connection|jdbcTemplate|entityManager)\.(?:execute|executeQuery|executeUpdate|query|createNativeQuery)\s*\(/i },
   ],
   csharp: [
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a .NET process execution API.', sink: /\bProcess\.Start\s*\(/ },
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a .NET filesystem API.', sink: /\b(?:File\.(?:ReadAllText|ReadAllBytes|WriteAllText|Open)|Directory\.(?:GetFiles|Delete))\s*\(/ },
     { id: 'ssrf-request-sink', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data reaches a .NET outbound request API.', sink: /\b(?:HttpClient\.)?(?:GetAsync|GetStringAsync|PostAsync|SendAsync)\s*\(/ },
+    { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a .NET SQL query-text API.', sink: /\b(?:command|connection|db|context)\.(?:Execute|ExecuteNonQuery|ExecuteScalar|Query|SqlQuery)\s*\(/i },
   ],
   php: [
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a PHP command execution API.', sink: /\b(?:system|exec|shell_exec|passthru|popen|proc_open)\s*\(/ },
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a PHP filesystem API.', sink: /\b(?:file_get_contents|file_put_contents|fopen|unlink|readfile)\s*\(/ },
     { id: 'ssrf-request-sink', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects a PHP network destination.', sink: /\b(?:curl_setopt|file_get_contents)\s*\(/ },
+    { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a PHP SQL query-text API.', sink: /\b(?:pdo|db|database|connection|stmt)\s*->\s*(?:query|exec|prepare)\s*\(/i },
   ],
   ruby: [
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a Ruby command execution API.', sink: /\b(?:system|exec|spawn|Open3\.(?:capture2|capture3|popen3))\s*\(/ },
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a Ruby filesystem API.', sink: /\b(?:File\.(?:read|write|open|delete)|IO\.read)\s*\(/ },
     { id: 'ssrf-request-sink', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects a Ruby outbound request destination.', sink: /\b(?:Net::HTTP\.(?:get|get_response|post)|URI\.open)\s*\(/ },
+    { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a Ruby SQL query-text API.', sink: /\b(?:connection|db|database)\.(?:execute|exec_query|select_all|find_by_sql)\s*\(/i },
   ],
   c: [
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Externally controlled data reaches a native process execution API.', sink: /\b(?:system|popen|execl|execv|execve)\s*\(/ },
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Externally controlled data reaches a native filesystem API.', sink: /\b(?:fopen|open|unlink|remove)\s*\(/ },
+    { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Externally controlled data reaches a native SQL query-text API.', sink: /\b(?:sqlite3_exec|mysql_query|PQexec)\s*\(/ },
   ],
   cpp: [
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Externally controlled data reaches a native process execution API.', sink: /\b(?:system|popen|execl|execv|execve)\s*\(/ },
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Externally controlled data reaches a native filesystem API.', sink: /\b(?:fopen|open|std::filesystem::remove)\s*\(/ },
+    { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Externally controlled data reaches a native SQL query-text API.', sink: /\b(?:sqlite3_exec|mysql_query|PQexec)\s*\(/ },
   ],
   rust: [
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a Rust process execution API.', sink: /\b(?:std::process::)?Command::new\s*\(/ },
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a Rust filesystem API.', sink: /\b(?:std::fs::)?(?:read|read_to_string|write|remove_file|File::open)\s*\(/ },
     { id: 'ssrf-request-sink', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects a Rust outbound request destination.', sink: /\b(?:reqwest::)?(?:get|Client::new\(\)\.(?:get|post|request))\s*\(/ },
+    { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a Rust SQL query-text API.', sink: /\b(?:client|conn|connection|pool)\.(?:query|execute|batch_execute)\s*\(/i },
   ],
 }
 
@@ -64,7 +71,7 @@ const EXTENSIONS: Record<Language, string[]> = { java: ['.java'], csharp: ['.cs'
 const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'foreach', 'using', 'return', 'new', 'function', 'def'])
 
 function escaped(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
-function sourceTainted(value: string, tainted: Set<string>, source: RegExp): boolean { source.lastIndex = 0; return source.test(value) || [...tainted].some(name => new RegExp(`\\b${escaped(name)}\\b`).test(value)) }
+function sourceTainted(value: string, tainted: Set<string>, source: RegExp): boolean { if (/^(?:"(?:[^"\\]|\\.)*"|'(?:[^'\\]|\\.)*')$/.test(value.trim())) return false; source.lastIndex = 0; return source.test(value) || [...tainted].some(name => new RegExp(`\\b${escaped(name)}\\b`).test(value)) }
 function variableAssignment(value: string, language: Language): { name: string; expression: string } | undefined {
   const match = language === 'php' ? /^\s*\$([A-Za-z_]\w*)\s*=\s*(.+?);?\s*$/.exec(value) : /^\s*(?:[A-Za-z_][\w<>\[\],?*:\s]*\s+)?([A-Za-z_]\w*)\s*=\s*(.+?);?\s*$/.exec(value)
   return match ? { name: match[1], expression: match[2] } : undefined
@@ -83,6 +90,19 @@ function calls(value: string): Array<{ name: string; args: string[] }> {
 }
 
 function sinkTainted(value: string, rule: Rule, tainted: Set<string>, source: RegExp, language: Language): boolean {
+  if (rule.id === 'sql-injection-query-construction') {
+    rule.sink.lastIndex = 0
+    if (!rule.sink.test(value)) return false
+    for (const call of calls(value)) {
+      const queryMethods = new Set(['execute', 'executeQuery', 'executeUpdate', 'query', 'createNativeQuery', 'Execute', 'ExecuteNonQuery', 'ExecuteScalar', 'Query', 'SqlQuery', 'exec', 'prepare', 'exec_query', 'select_all', 'find_by_sql', 'sqlite3_exec', 'mysql_query', 'PQexec', 'batch_execute'])
+      if (!queryMethods.has(call.name)) continue
+      // C APIs include a connection handle before SQL text; all other supported
+      // APIs accept query text first. Parameter/bind values remain unproven.
+      const index = (language === 'c' || language === 'cpp') && ['sqlite3_exec', 'mysql_query', 'PQexec'].includes(call.name) ? 1 : 0
+      if (call.args[index] && sourceTainted(call.args[index], tainted, source)) return true
+    }
+    return false
+  }
   if (rule.id !== 'ssrf-request-sink') {
     rule.sink.lastIndex = 0
     return rule.sink.test(value) && sourceTainted(value, tainted, source)

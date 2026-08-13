@@ -45,6 +45,21 @@ test('Python module analysis resolves an unambiguous package import without conf
   assert.equal(result.candidates[0]?.file, 'app/runner.py')
 })
 
+test('Python and Go module analysis trace request-derived SQL text but exclude bound values', () => {
+  const python = analyzePythonModuleGraph([
+    { file: 'routes.py', source: 'from queries import search, by_id\ndef route():\n    search(request.args.get("where"))\n    by_id(request.args.get("id"))\n' },
+    { file: 'queries.py', source: 'def search(sql):\n    cursor.execute(sql)\ndef by_id(value):\n    cursor.execute("SELECT * FROM users WHERE id = %s", [value])\n' },
+  ])
+  const go = analyzeGoPackageGraph([
+    { file: 'route.go', source: 'package app\nfunc Route(r Request) { Search(r.FormValue("where")); ByID(r.FormValue("id")) }\n' },
+    { file: 'queries.go', source: 'package app\nfunc Search(sql string) { db.QueryContext(ctx, sql) }\nfunc ByID(id string) { db.QueryContext(ctx, "SELECT * FROM users WHERE id = $1", id) }\n' },
+  ])
+  assert.deepEqual(python.candidates.map(item => item.rule), ['sql-injection-query-construction'])
+  assert.deepEqual(go.candidates.map(item => item.rule), ['sql-injection-query-construction'])
+  assert.equal(python.candidates[0]?.file, 'queries.py')
+  assert.equal(go.candidates[0]?.file, 'queries.go')
+})
+
 test('Go package analysis follows request input across same-package files to a command sink', () => {
   const result = analyzeGoPackageGraph([
     { file: 'route.go', source: 'package app\nfunc Route(r Request) { Execute(r.FormValue("cmd")) }\n' },
@@ -109,6 +124,12 @@ for (const item of structuredCases) test(`${item.language} structured analysis t
 test('Java structured SSRF analysis follows a request-derived URL destination', () => {
   const result = analyzeStructuredFlow([{ file: 'Handler.java', source: 'class Handler {\n void outbound(String url) { new URL(url); }\n void route(Request request) { outbound(request.getParameter("url")); }\n}' }], 'java')
   assert.deepEqual(result.candidates.map(item => item.rule), ['ssrf-request-sink'])
+})
+
+test('structured analysis traces request-derived SQL text and excludes parameterized Java queries', () => {
+  const result = analyzeStructuredFlow([{ file: 'Handler.java', source: 'class Handler {\n void search(String sql) { statement.executeQuery(sql); }\n void byId(String id) { statement.executeQuery("SELECT * FROM users WHERE id = ?", id); }\n void route(Request request) { search(request.getParameter("where")); byId(request.getParameter("id")); }\n}' }], 'java')
+  assert.deepEqual(result.candidates.map(item => item.rule), ['sql-injection-query-construction'])
+  assert.equal(result.candidates[0]?.line, 2)
 })
 
 test('C# structured SSRF analysis does not treat a request body sent to a fixed destination as SSRF', () => {

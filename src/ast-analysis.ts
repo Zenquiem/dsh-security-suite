@@ -24,6 +24,7 @@ const AST_RULES: AstRule[] = [
   { id: 'shell-command-construction', title: 'Command execution from request data', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a process-execution API.', sinks: ['exec', 'execsync', 'spawn', 'spawnsync', 'system', 'popen'] },
   { id: 'path-traversal-sink', title: 'Filesystem operation from request data', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a filesystem API without a proven containment control.', sinks: ['readfile', 'writefile', 'appendfile', 'open', 'createreadstream', 'createwritestream', 'sendfile'] },
   { id: 'ssrf-request-sink', title: 'Outbound request from request data', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects an outbound network destination.', sinks: ['fetch', 'request', 'get', 'post'] },
+  { id: 'sql-injection-query-construction', title: 'SQL query construction from request data', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a database query-text API.', sinks: ['query', 'execute', 'raw', 'queryraw', 'executeraw'] },
 ]
 
 function children(node: AstNode): AstNode[] {
@@ -109,7 +110,7 @@ function outboundDestinationArguments(argumentsList: AstNode[]): AstNode[] {
 function sinkFor(node: AstNode): Array<{ rule: AstRule; sink: string; argumentsList: AstNode[] }> {
   if (node.type !== 'CallExpression') return []
   const sink = memberName(node.callee as AstNode).toLowerCase(); const final = sink.split('.').at(-1) ?? sink; const argumentsList = (node.arguments ?? []) as AstNode[]
-  return AST_RULES.filter(rule => rule.sinks.includes(final) && (rule.id !== 'ssrf-request-sink' || /(?:fetch|axios|request|http|https)/.test(sink))).map(rule => ({ rule, sink, argumentsList: rule.id === 'ssrf-request-sink' ? outboundDestinationArguments(argumentsList) : argumentsList }))
+  return AST_RULES.filter(rule => rule.sinks.includes(final) && (rule.id !== 'ssrf-request-sink' || /(?:fetch|axios|request|http|https)/.test(sink)) && (rule.id !== 'sql-injection-query-construction' || /(?:^|\.)(?:db|database|pool|client|connection|manager|repository|sequelize|knex)\.(?:query|execute|raw|queryraw|executeraw)$/.test(sink))).map(rule => ({ rule, sink, argumentsList: rule.id === 'ssrf-request-sink' ? outboundDestinationArguments(argumentsList) : rule.id === 'sql-injection-query-construction' ? argumentsList.slice(0, 1) : argumentsList }))
 }
 
 /** Fixed-point summaries for named local functions: parameter index -> reachable sink. */

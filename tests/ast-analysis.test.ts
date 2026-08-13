@@ -122,3 +122,14 @@ test('AST module analysis follows a static CommonJS default function export', ()
   assert.equal(result.candidates[0]?.file, 'runner.cjs')
   assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
 })
+
+test('AST module analysis traces request-derived SQL text to a local database wrapper but not parameter bindings', () => {
+  const result = analyzeJavaScriptModuleGraph([
+    { file: 'route.ts', source: "import { search, byId } from './queries'\nexport function route(req) { search(req.query.where); byId(req.query.id) }\n" },
+    { file: 'queries.ts', source: 'export function search(sql) { db.query(sql) }\nexport function byId(id) { db.query("SELECT * FROM users WHERE id = ?", [id]) }\n' },
+  ])
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.rule, 'sql-injection-query-construction')
+  assert.equal(result.candidates[0]?.file, 'queries.ts')
+  assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
+})
