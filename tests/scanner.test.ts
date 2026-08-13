@@ -110,7 +110,7 @@ test('diff scan distinguishes added risks from deleted authorization and input c
     assert.equal(scan.coverage.receipts.length, 1)
     assert.equal(scan.coverage.receipts[0]?.path, 'route.ts')
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'removed-authorization-control')?.matches, 1)
-    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-removed-controls'])
+    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-js-ts', 'diff-removed-controls'])
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
@@ -127,6 +127,44 @@ test('diff scan does not classify ordinary deleted code as a removed security co
     const scan = await runDiffScan(root, undefined, '')
     assert.equal(scan.findings.length, 0)
     assert.equal(scan.coverage.receipts.length, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces an added request path into an unchanged local JavaScript sink wrapper', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, 'lib'))
+    await writeFile(join(root, 'lib', 'runner.ts'), 'export function execute(command: string) { exec(command) }\n')
+    await writeFile(join(root, 'route.ts'), "import { execute } from './lib/runner'\nexport function route(req: Request) { return 'ok' }\n")
+    await execFileAsync('git', ['add', 'lib/runner.ts', 'route.ts'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'route.ts'), "import { execute } from './lib/runner'\nexport function route(req: Request) { execute(req.query.command) }\n")
+    const scan = await runDiffScan(root, undefined, '')
+    const finding = scan.findings.find(item => item.ruleId === 'shell.command.construction')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.file, 'lib/runner.ts')
+    assert.equal(finding.evidence.some(item => item.detail.includes('cross-module call-chain') && item.location?.file === 'route.ts' && item.location.line === 2), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
+    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-js-ts', 'diff-removed-controls'])
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan does not restate an unchanged JavaScript source-to-sink path', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'app.ts'), 'function run(value: string) { exec(value) }\nfunction route(req: Request) { run(req.query.command) }\n')
+    await execFileAsync('git', ['add', 'app.ts'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'notes.ts'), 'export const releaseNote = "update docs"\n')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.equal(scan.findings.length, 0)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 0)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
