@@ -77,6 +77,29 @@ test('directory assessment ties Python JWT verification disablement to a PyJWT c
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment ties Python TLS disablement to supported outbound client calls', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'client.py'), 'unused = {"verify": False}\nlogger.info(verify=False)\nrequests.get("https://api.example.test", verify=False)\noptions = {"verify": False}\nhttpx.post("https://api.example.test", **options)\nrequests.get("https://api.example.test", verify=True)\nclient.get("https://api.example.test", verify=False)\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'tls-verification-disabled')
+    assert.deepEqual(candidates.map(item => item.line), [3, 4])
+    assert.equal(candidates.every(item => item.evidence.some(evidence => evidence.location?.role === 'sink')), true)
+    assert.equal(candidates.some(item => item.evidence.some(evidence => evidence.location?.line === 1)), false)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('directory assessment ties Go TLS disablement to a constructed client that makes a request', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'client.go'), 'package app\nfunc used() {\n cfg := &tls.Config{InsecureSkipVerify: true}\n transport := &http.Transport{TLSClientConfig: cfg}\n client := &http.Client{Transport: transport}\n client.Get("https://api.example.test")\n}\nfunc unused() {\n cfg := &tls.Config{InsecureSkipVerify: true}\n logger.Info(cfg)\n}\nfunc unbound() {\n cfg := &tls.Config{InsecureSkipVerify: true}\n transport := &http.Transport{}\n client := &http.Client{Transport: transport}\n client.Get("https://api.example.test")\n}\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'tls-verification-disabled')
+    assert.deepEqual(candidates.map(item => item.line), [3])
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink' && item.location.line === 6), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment ties JavaScript credentialed CORS origins to a CORS middleware call', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -844,6 +867,40 @@ test('diff scan retains a complete CORS policy when an added paired control crea
     assert.ok(finding)
     assert.equal(finding.locations[0]?.line, 2)
     assert.equal(finding.evidence.some(item => item.location?.file === 'server.ts' && item.location.line === 3), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan retains only an added Python TLS disablement consumed by a supported client', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'client.py'), 'options = {"verify": False}\nrequests.get("https://api.example.test", **options)\n')
+    await execFileAsync('git', ['add', 'client.py'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'client.py'), 'options = {"verify": False}\nrequests.get("https://api.example.test", **options)\nrequests.get("https://api.example.test", verify=False)\nlogger.info(verify=False)\n')
+    const scan = await runDiffScan(root, undefined, '', '', false)
+    const candidates = scan.findings.filter(item => item.ruleId === 'tls.verification.disabled')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.locations[0]?.line, 3)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink' && item.location.line === 3), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan retains an added Go client request that activates an existing disabled TLS config', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'client.go'), 'package app\nfunc client() {\n cfg := &tls.Config{InsecureSkipVerify: true}\n transport := &http.Transport{TLSClientConfig: cfg}\n client := &http.Client{Transport: transport}\n}\n')
+    await execFileAsync('git', ['add', 'client.go'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'client.go'), 'package app\nfunc client() {\n cfg := &tls.Config{InsecureSkipVerify: true}\n transport := &http.Transport{TLSClientConfig: cfg}\n client := &http.Client{Transport: transport}\n client.Get("https://api.example.test")\n}\n')
+    const scan = await runDiffScan(root, undefined, '', '', false)
+    const finding = scan.findings.find(item => item.ruleId === 'tls.verification.disabled')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.line, 3)
+    assert.equal(finding.evidence.some(item => item.location?.role === 'sink' && item.location.line === 6), true)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

@@ -6,6 +6,8 @@
 
 The plugin owns its scan orchestration, evidence model, persistent workbench, export formats, remediation workflow, and DSH tool surface. It has no external security-engine SDK, CLI, credential, or hosted runtime dependency.
 
+TLS configuration candidates require a client-use evidence chain. Python must pass `verify=False` or an expanded local `{"verify": False}` map to a supported `requests` or `httpx` call. Go must bind local `tls.Config{InsecureSkipVerify: true}` through `http.Transport` and `http.Client`, then invoke that client. Standalone settings, unconsumed maps, opaque construction, and unrelated functions remain unproven.
+
 Deep workers are DSH-native child agents. Their scoped tool view is restricted to the immutable worklist, bounded source reads whose digest matches that worklist, candidate submission, and coverage closure. They cannot use remediation, tracking, validation, or general plugin tools during delegated discovery. The published package imports only DSH/Cordis interfaces and its own local analysis modules; no second assistant runtime or security-engine process participates in scans.
 
 ## Capability Matrix

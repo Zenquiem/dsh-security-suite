@@ -41,15 +41,16 @@ const RULES: Rule[] = [
   { id: 'dangerous-dynamic-code', title: 'Dynamic code execution', cwe: 'CWE-95', severity: 'high', rationale: 'Dynamic evaluation can turn attacker-controlled data into code execution.', pattern: /\beval\s*\(|\bnew\s+Function\s*\(/, languages: [] },
   { id: 'shell-command-construction', title: 'Constructed shell command', cwe: 'CWE-78', severity: 'high', rationale: 'A constructed process command needs an attacker-to-shell data-flow review.', pattern: /(?:exec|execSync|spawn|spawnSync|system|popen|subprocess\.(?:run|call|Popen))\s*\([^\n]*(?:\+|`|\$\{|f["'])/i, context: /(?:req\.|params\.|query\.|argv|input|user)/i },
   { id: 'path-traversal-sink', title: 'Request-derived filesystem path', cwe: 'CWE-22', severity: 'medium', rationale: 'A filesystem sink receives request-derived data and needs canonical containment validation.', pattern: /(?:readFile|writeFile|createReadStream|createWriteStream|sendFile|open)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
-  { id: 'tls-verification-disabled', title: 'TLS verification disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled.', pattern: /(?:(?:requests|httpx)\.[A-Za-z_]+\s*\([^\n)]*\bverify\s*=\s*False|CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)|InsecureSkipVerify\s*:\s*true)/, languages: ['python', 'go', 'php', 'c', 'cpp', 'csharp'] },
+  { id: 'tls-verification-disabled', title: 'TLS verification disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled.', pattern: /(?:CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0))/, languages: ['php', 'c', 'cpp', 'csharp'] },
   { id: 'hardcoded-secret-marker', title: 'Likely hardcoded credential', cwe: 'CWE-798', severity: 'medium', rationale: 'A likely credential literal appears in source and should be moved to managed secret storage.', pattern: /(?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*["'][^"']{8,}["']/i, languages: ['python', 'go', 'java', 'php', 'ruby', 'rust', 'shell', 'c', 'cpp', 'csharp'] },
   { id: 'ssrf-request-sink', title: 'Request-derived outbound request', cwe: 'CWE-918', severity: 'medium', rationale: 'An outbound request appears to use request-derived input and needs destination allowlisting.', pattern: /(?:fetch|axios\.(?:get|post|request)|requests\.(?:get|post|request)|http\.request)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
   { id: 'sql-injection-query-construction', title: 'Constructed SQL query', cwe: 'CWE-89', severity: 'high', rationale: 'A database query appears to construct SQL syntax from request-derived input.', pattern: /(?:query|execute|raw)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input|\+|\$\{)/i, context: /(?:select|insert|update|delete|from|where)/i },
 ]
 
-const CONFIGURATION_RULES: Record<'jwt' | 'cors' | 'xml', ConfigurationRule> = {
+const CONFIGURATION_RULES: Record<'jwt' | 'cors' | 'tls' | 'xml', ConfigurationRule> = {
   jwt: { id: 'jwt-verification-disabled', cwe: 'CWE-347', severity: 'high', rationale: 'JWT signature validation is disabled or the token algorithm allowlist accepts the unsigned none algorithm.' },
   cors: { id: 'cors-wildcard-credentials', cwe: 'CWE-942', severity: 'medium', rationale: 'A credentialed CORS policy allows every origin or reflects the caller origin without an explicit allowlist.' },
+  tls: { id: 'tls-verification-disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled for a supported HTTP client request.' },
   xml: { id: 'xml-external-entity-risk', cwe: 'CWE-611', severity: 'high', rationale: 'A Java XML parser factory creates a parser without recognized external-entity hardening controls.' },
 }
 
@@ -298,6 +299,81 @@ function pythonJwtConfigurationCandidates(file: string, content: string, lines: 
   return candidates
 }
 
+/**
+ * Keep Python TLS findings tied to an actual requests/httpx operation.  A
+ * disabled value in an unrelated mapping or another library's function is not
+ * proof that certificate verification is disabled on an outbound connection.
+ */
+function pythonTlsConfigurationCandidates(file: string, content: string, lines: string[]): Candidate[] {
+  const options = new Map<string, { line: number; excerpt: string }>()
+  for (const match of content.matchAll(/\b([A-Za-z_]\w*)\s*=\s*\{([\s\S]{0,1200}?)\}/g)) {
+    const disabled = /["']verify["']\s*:\s*False\b/i.exec(match[2])
+    if (!disabled) continue
+    const line = lineAt(content, (match.index ?? 0) + match[0].indexOf(match[2]) + (disabled.index ?? 0))
+    options.set(match[1], { line, excerpt: sourceLine(lines, line) })
+  }
+  const candidates: Candidate[] = []
+  for (const match of content.matchAll(/\b(?:requests|httpx)\.(?:get|post|put|patch|delete|head|options|request)\s*\(/gi)) {
+    const open = (match.index ?? 0) + match[0].lastIndexOf('('); const close = closingParenthesis(content, open)
+    if (close === undefined || close - open > 4_000) continue
+    const call = content.slice(open, close + 1); const callLine = lineAt(content, match.index ?? 0); const callExcerpt = sourceLine(lines, callLine)
+    const controls: Array<{ line: number; excerpt: string; detail: string }> = []
+    const direct = /\bverify\s*=\s*False\b/i.exec(call)
+    if (direct) {
+      const line = lineAt(content, open + (direct.index ?? 0))
+      controls.push({ line, excerpt: sourceLine(lines, line), detail: 'the request explicitly sets verify=False' })
+    }
+    const named = /\*\*\s*([A-Za-z_]\w*)\b/.exec(call)?.[1]; const bound = named ? options.get(named) : undefined
+    if (bound) controls.push({ ...bound, detail: `the request expands local options object ${named} with verify disabled` })
+    for (const control of controls) {
+      const candidate = configurationCandidate(CONFIGURATION_RULES.tls, file, lines, control.line, `Configuration analysis found ${control.detail}.`)
+      candidate.evidence.push({ kind: 'context', detail: 'The disabled verification setting is consumed by this supported requests/httpx outbound call.', location: { file, line: callLine, excerpt: callExcerpt, role: 'sink' } })
+      candidates.push(candidate)
+    }
+  }
+  return candidates
+}
+
+/**
+ * Reconstruct the ordinary local Go construction chain from tls.Config through
+ * http.Transport and http.Client to a request. This deliberately leaves
+ * dynamic, cross-function, and opaque client construction unresolved.
+ */
+function goTlsConfigurationCandidates(file: string, content: string, lines: string[]): Candidate[] {
+  const candidates: Candidate[] = []
+  for (const match of content.matchAll(/\b([A-Za-z_]\w*)\s*:=\s*&?tls\.Config\s*\{([\s\S]{0,1200}?)\}/g)) {
+    const disabled = /\bInsecureSkipVerify\s*:\s*true\b/i.exec(match[2]); if (!disabled) continue
+    const config = match[1]!; const start = match.index ?? 0; const block = containingJavaBlock(content, start); if (!block) continue
+    const window = content.slice(block.start, block.end); const configOffset = start - block.start
+    const configLine = lineAt(content, start + match[0].indexOf(match[2]) + (disabled.index ?? 0))
+    const transports = new Map<string, number>()
+    const transportPattern = /\b([A-Za-z_]\w*)\s*:=\s*&?http\.Transport\s*\{([\s\S]{0,1200}?)\}/g
+    for (const transport of window.matchAll(transportPattern)) {
+      const bindsConfig = transport[2].replace(/\s+/g, '').includes(`TLSClientConfig:${config}`) || transport[2].replace(/\s+/g, '').includes(`TLSClientConfig:&${config}`)
+      if ((transport.index ?? 0) <= configOffset || !bindsConfig) continue
+      transports.set(transport[1]!, block.start + (transport.index ?? 0))
+    }
+    for (const [transport, transportOffset] of transports) {
+      const clients = new Map<string, number>()
+      const clientPattern = /\b([A-Za-z_]\w*)\s*:=\s*&?http\.Client\s*\{([\s\S]{0,1200}?)\}/g
+      for (const client of window.matchAll(clientPattern)) {
+        const bindsTransport = client[2].replace(/\s+/g, '').includes(`Transport:${transport}`) || client[2].replace(/\s+/g, '').includes(`Transport:&${transport}`)
+        if ((client.index ?? 0) <= transportOffset - block.start || !bindsTransport) continue
+        clients.set(client[1]!, block.start + (client.index ?? 0))
+      }
+      for (const [client, clientOffset] of clients) {
+        const invocation = new RegExp(`\\b${client}\\.(?:Get|Post|Head|Do)\\s*\\(`).exec(window.slice(clientOffset - block.start))
+        if (!invocation) continue
+        const sinkOffset = clientOffset + (invocation.index ?? 0); const sinkLine = lineAt(content, sinkOffset); const sinkExcerpt = sourceLine(lines, sinkLine)
+        const candidate = configurationCandidate(CONFIGURATION_RULES.tls, file, lines, configLine, `Configuration analysis found tls.Config ${config} disabling certificate verification before a supported Go HTTP client request.`)
+        candidate.evidence.push({ kind: 'context', detail: `The disabled tls.Config is attached to http.Transport ${transport}, http.Client ${client}, and a supported client request.`, location: { file, line: sinkLine, excerpt: sinkExcerpt, role: 'sink' } })
+        candidates.push(candidate)
+      }
+    }
+  }
+  return candidates
+}
+
 function containingJavaBlock(source: string, offset: number): { start: number; end: number } | undefined {
   for (let open = source.lastIndexOf('{', offset); open >= 0; open = source.lastIndexOf('{', open - 1)) {
     const end = closingBrace(source, open)
@@ -311,6 +387,8 @@ function analyzeSecurityConfiguration(file: string, content: string, onlyRules?:
   const lines = content.split(/\r?\n/); const candidates: Candidate[] = []
   const enabled = (rule: ConfigurationRule): boolean => !onlyRules || onlyRules.has(rule.id)
   if (enabled(CONFIGURATION_RULES.jwt) && languageFor(file) === 'python') candidates.push(...pythonJwtConfigurationCandidates(file, content, lines))
+  if (enabled(CONFIGURATION_RULES.tls) && languageFor(file) === 'python') candidates.push(...pythonTlsConfigurationCandidates(file, content, lines))
+  if (enabled(CONFIGURATION_RULES.tls) && languageFor(file) === 'go') candidates.push(...goTlsConfigurationCandidates(file, content, lines))
   if (enabled(CONFIGURATION_RULES.cors) && !['javascript', 'typescript'].includes(languageFor(file))) {
     for (const match of content.matchAll(/\bcors\s*\(\s*\{([\s\S]{0,1200}?)\}\s*\)/gi)) {
       const block = match[1]
