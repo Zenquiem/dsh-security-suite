@@ -251,6 +251,60 @@ test('diff scan does not restate an unchanged GitHub Actions workflow risk', asy
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('diff scan traces added pull-request head checkout into a later command without reporting safe checkout forms', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, '.github', 'workflows'), { recursive: true })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'on:\n  pull_request_target:\npermissions:\n  contents: read\njobs:\n  review:\n    steps:\n      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29\n      - run: npm test\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'on:\n  pull_request_target:\npermissions:\n  contents: read\njobs:\n  review:\n    steps:\n      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29\n        with:\n          ref: ${{ github.event.pull_request.head.sha }}\n      - run: npm test\n')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.deepEqual(scan.findings.map(item => item.ruleId), ['ci.pull.request.target.untrusted.checkout'])
+    const finding = scan.findings[0]
+    assert.equal(finding?.locations[0]?.line, 10)
+    assert.equal(finding?.disposition, 'reportable')
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ci-pull-request-target-untrusted-checkout')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan keeps read-only permissions and trusted shell values out of CI findings', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, '.github', 'workflows'), { recursive: true })
+    await writeFile(join(root, '.github', 'workflows', 'safe.yml'), 'on:\n  pull_request_target:\njobs:\n  review:\n    steps:\n      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, '.github', 'workflows', 'safe.yml'), 'on:\n  pull_request_target:\npermissions:\n  contents: read\njobs:\n  review:\n    steps:\n      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29\n      - run: echo "release verification"\n')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.equal(scan.findings.length, 0)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan anchors an existing untrusted checkout risk to a newly added execution step', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, '.github', 'workflows'), { recursive: true })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'on:\n  pull_request_target:\njobs:\n  review:\n    steps:\n      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29\n        with:\n          ref: ${{ github.event.pull_request.head.ref }}\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'on:\n  pull_request_target:\njobs:\n  review:\n    steps:\n      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29\n        with:\n          ref: ${{ github.event.pull_request.head.ref }}\n      - run: npm test\n')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.deepEqual(scan.findings.map(item => item.ruleId), ['ci.pull.request.target.untrusted.checkout'])
+    assert.equal(scan.findings[0]?.locations[0]?.line, 9)
+    assert.equal(scan.findings[0]?.evidence.some(item => item.location?.line === 9 && item.location.role === 'sink'), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('scan records persist canonical findings and export SARIF', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))

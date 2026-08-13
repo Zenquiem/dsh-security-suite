@@ -27,10 +27,11 @@ const REMOVED_CONTROL_RULES: RemovedControlRule[] = [
 
 interface CiWorkflowRule { id: string; severity: Severity; cwe: string; rationale: string }
 
-const CI_WORKFLOW_RULES: Record<'untrusted-shell' | 'write-permissions' | 'mutable-action-ref', CiWorkflowRule> = {
+const CI_WORKFLOW_RULES: Record<'untrusted-shell' | 'write-permissions' | 'mutable-action-ref' | 'untrusted-checkout-execution', CiWorkflowRule> = {
   'untrusted-shell': { id: 'ci-untrusted-event-shell', severity: 'high', cwe: 'CWE-78', rationale: 'A GitHub Actions workflow reachable from pull_request_target interpolates pull-request or issue event data into a shell command. A contributor-controlled value can alter the trusted runner command.' },
   'write-permissions': { id: 'ci-pull-request-target-write-permissions', severity: 'high', cwe: 'CWE-269', rationale: 'A pull_request_target workflow receives broad write permissions. Its trusted token must not be exposed to untrusted pull-request data or code.' },
   'mutable-action-ref': { id: 'ci-mutable-action-ref', severity: 'medium', cwe: 'CWE-829', rationale: 'A GitHub Actions workflow uses a mutable action branch reference. The action revision is not immutable and can change after review.' },
+  'untrusted-checkout-execution': { id: 'ci-pull-request-target-untrusted-checkout', severity: 'high', cwe: 'CWE-829', rationale: 'A pull_request_target workflow checks out contributor-controlled pull-request code and subsequently runs a command in the same job. The trusted workflow context can execute unreviewed code.' },
 }
 
 interface Rule { id: string; title: string; cwe: string; severity: Severity; rationale: string; pattern: RegExp; languages?: string[]; context?: RegExp }
@@ -241,7 +242,7 @@ async function targetSnapshot(root: string, receipts: FileReceipt[]): Promise<Ta
 function validateCandidate(finding: Finding): CandidateDisposition {
   const hasInputContext = finding.evidence.some(item => item.kind === 'context')
   const removedControl = ['removed.authorization.control', 'removed.input.validation.control'].includes(finding.ruleId)
-  const direct = removedControl || ['tls.verification.disabled', 'ci.untrusted.event.shell', 'ci.pull.request.target.write.permissions', 'ci.mutable.action.ref'].includes(finding.ruleId) || (hasInputContext && ['dangerous.dynamic.code', 'shell.command.construction', 'path.traversal.sink', 'unsafe.deserialization', 'ssrf.request.sink'].includes(finding.ruleId))
+  const direct = removedControl || ['tls.verification.disabled', 'ci.untrusted.event.shell', 'ci.pull.request.target.write.permissions', 'ci.mutable.action.ref', 'ci.pull.request.target.untrusted.checkout'].includes(finding.ruleId) || (hasInputContext && ['dangerous.dynamic.code', 'shell.command.construction', 'path.traversal.sink', 'unsafe.deserialization', 'ssrf.request.sink'].includes(finding.ruleId))
   const disposition: CandidateDisposition = direct ? 'reportable' : 'suppressed'
   const conclusion = direct ? 'reportable' : 'suppressed'
   const entry = removedControl ? 'The changed hunk deletes an explicit security control; equivalent replacement remains unproven.' : hasInputContext ? 'Nearby source contains an input/request marker.' : 'No attacker-controlled entry point was established by the local static pass.'
@@ -287,21 +288,83 @@ function workflowCandidate(rule: CiWorkflowRule, file: string, line: number, exc
   return { rule: rule.id, severity: rule.severity, file, line, excerpt, rationale: rule.rationale, cwe: rule.cwe, evidence: [{ kind: 'pattern', detail, location: { file, line, excerpt, role } }, { kind: 'context', detail: 'This CI/CD workflow finding is anchored to a newly added diff line.', location: { file, line, excerpt, role } }] }
 }
 
-/** Analyze added workflow lines with current-file context, retaining new-line anchors only. */
-function ciWorkflowDiffCandidates(file: string, lines: Array<{ line: number; source: string }>, currentSource: string): Candidate[] {
-  if (!isGitHubWorkflow(file)) return []
-  const candidates: Candidate[] = []; const pullRequestTarget = /^\s*pull_request_target\s*(?::|$)/m.test(currentSource)
-  const addedPermissions = lines.filter(item => /^\s*permissions\s*:\s*(?:write-all|\{.*\b(?:contents|actions|pull-requests|issues)\s*:\s*write)/i.test(item.source) || /^\s*(?:contents|actions|pull-requests|issues)\s*:\s*write\s*$/i.test(item.source))
-  if (pullRequestTarget) {
-    const triggerLine = currentSource.split(/\r?\n/).findIndex(line => /^\s*pull_request_target\s*(?::|$)/.test(line)) + 1
-    for (const permission of addedPermissions) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['write-permissions'], file, permission.line, permission.source.trim().slice(0, 240), `Current pull_request_target trigger at ${file}:${triggerLine} has newly added write permission at ${file}:${permission.line}.`, 'root_control'))
-    for (const [index, command] of lines.entries()) {
-      const direct = /^\s*(?:-\s*)?run\s*:\s*.*\$\{\{\s*github\.event\.(?:pull_request|issue|comment)\./i.test(command.source)
-      const block = /\$\{\{\s*github\.event\.(?:pull_request|issue|comment)\./i.test(command.source) && lines.slice(Math.max(0, index - 6), index).some(item => /^\s*(?:-\s*)?run\s*:\s*[>|]?\s*(?:#.*)?$/i.test(item.source))
-      if (direct || block) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['untrusted-shell'], file, command.line, command.source.trim().slice(0, 240), `Added pull_request_target workflow shell command interpolates untrusted GitHub event data at ${file}:${command.line}.`, 'sink'))
+interface WorkflowLine { line: number; source: string; indent: number; text: string }
+interface WorkflowStep { job: string; start: number; end: number; indent: number; fields: WorkflowLine[] }
+
+function workflowLines(source: string): WorkflowLine[] {
+  return source.split(/\r?\n/).map((source, index) => ({ line: index + 1, source, indent: /^(\s*)/.exec(source)?.[1].length ?? 0, text: source.trim() }))
+}
+
+function valueAfterKey(line: WorkflowLine, key: string): string | undefined {
+  const match = new RegExp(`^(?:-\\s*)?${key}\\s*:\\s*(.*)$`, 'i').exec(line.text)
+  return match?.[1]?.replace(/\s+#.*$/, '').trim()
+}
+
+/** Parse only the small, indentation-defined Actions subset needed for job and step trust boundaries. */
+function workflowSteps(source: string): WorkflowStep[] {
+  const lines = workflowLines(source); const jobsIndex = lines.findIndex(line => /^jobs\s*:\s*(?:#.*)?$/i.test(line.text)); if (jobsIndex < 0) return []
+  const jobsIndent = lines[jobsIndex].indent; const steps: WorkflowStep[] = []; let job = 'unknown'; let stepStart = -1; let stepIndent = -1
+  const closeStep = (end: number): void => {
+    if (stepStart < 0) return
+    steps.push({ job, start: lines[stepStart].line, end: lines[Math.max(stepStart, end - 1)].line, indent: stepIndent, fields: lines.slice(stepStart, end) })
+    stepStart = -1; stepIndent = -1
+  }
+  for (let index = jobsIndex + 1; index < lines.length; index++) {
+    const line = lines[index]
+    if (line.text && line.indent <= jobsIndent) { closeStep(index); break }
+    if (line.text && line.indent === jobsIndent + 2 && /^[A-Za-z0-9_-]+\s*:/.test(line.text)) { closeStep(index); job = line.text.replace(/\s*:.*$/, ''); continue }
+    if (/^-\s+/.test(line.text) && line.indent >= jobsIndent + 4) { closeStep(index); stepStart = index; stepIndent = line.indent }
+  }
+  closeStep(lines.length)
+  return steps
+}
+
+function isUntrustedEvent(value: string | undefined): boolean { return !!value && /\$\{\{\s*github\.event\.(?:pull_request|issue|comment)\./i.test(value) }
+function isMutableAction(value: string | undefined): boolean { return !!value && /@(?:main|master|develop|next|latest)\s*$/i.test(value) }
+function addedLine(line: WorkflowLine, added: Set<number>): boolean { return added.has(line.line) }
+
+function runEventLines(step: WorkflowStep): WorkflowLine[] {
+  const results: WorkflowLine[] = []
+  for (let index = 0; index < step.fields.length; index++) {
+    const line = step.fields[index]; const value = valueAfterKey(line, 'run')
+    if (value === undefined) continue
+    if (isUntrustedEvent(value)) results.push(line)
+    if (!/^[>|]/.test(value)) continue
+    for (let child = index + 1; child < step.fields.length && step.fields[child].indent > line.indent; child++) if (isUntrustedEvent(step.fields[child].text)) results.push(step.fields[child])
+  }
+  return results
+}
+
+function writePermissionLines(source: string): WorkflowLine[] {
+  const lines = workflowLines(source); const results: WorkflowLine[] = []
+  for (let index = 0; index < lines.length; index++) {
+    const line = lines[index]; const value = valueAfterKey(line, 'permissions')
+    if (value && (value === 'write-all' || /\b(?:contents|actions|pull-requests|issues)\s*:\s*write\b/i.test(value))) results.push(line)
+    if (value !== '') continue
+    for (let child = index + 1; child < lines.length && lines[child].indent > line.indent; child++) {
+      if (/^(?:contents|actions|pull-requests|issues)\s*:\s*write\s*(?:#.*)?$/i.test(lines[child].text)) results.push(lines[child])
     }
   }
-  for (const action of lines.filter(item => /^\s*(?:-\s*)?uses\s*:\s*[^\s#]+@(?:main|master|develop|next|latest)\s*(?:#.*)?$/i.test(item.source))) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['mutable-action-ref'], file, action.line, action.source.trim().slice(0, 240), `Added GitHub Action uses mutable ref at ${file}:${action.line}; pin an immutable commit SHA.`, 'root_control'))
+  return results
+}
+
+/** Analyze a current workflow structure, but produce findings only at added-line evidence. */
+function ciWorkflowDiffCandidates(file: string, added: Array<{ line: number; source: string }>, currentSource: string): Candidate[] {
+  if (!isGitHubWorkflow(file)) return []
+  const candidates: Candidate[] = []; const currentLines = workflowLines(currentSource); const addedNumbers = new Set(added.map(item => item.line)); const pullRequestTarget = currentLines.find(line => /^pull_request_target\s*(?::|$)/i.test(line.text))
+  if (pullRequestTarget) {
+    for (const permission of writePermissionLines(currentSource).filter(line => addedLine(line, addedNumbers))) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['write-permissions'], file, permission.line, permission.text.slice(0, 240), `Current pull_request_target trigger at ${file}:${pullRequestTarget.line} has newly added write permission at ${file}:${permission.line}.`, 'root_control'))
+    for (const step of workflowSteps(currentSource)) {
+      for (const run of runEventLines(step).filter(line => addedLine(line, addedNumbers))) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['untrusted-shell'], file, run.line, run.text.slice(0, 240), `Added pull_request_target workflow shell command interpolates untrusted GitHub event data at ${file}:${run.line}.`, 'sink'))
+      const checkout = step.fields.find(line => /^-\s*uses\s*:\s*actions\/checkout@/i.test(line.text))
+      const untrustedCheckoutField = checkout && step.fields.find(line => /^(?:ref|repository)\s*:/i.test(line.text) && isUntrustedEvent(valueAfterKey(line, 'ref') ?? valueAfterKey(line, 'repository')))
+      if (!checkout || !untrustedCheckoutField) continue
+      const laterRun = workflowSteps(currentSource).flatMap(other => other.job === step.job && other.start > step.start ? other.fields.filter(line => valueAfterKey(line, 'run') !== undefined) : [])
+      const anchor = [untrustedCheckoutField, checkout, ...laterRun].find(line => addedLine(line, addedNumbers))
+      if (laterRun.length && anchor) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['untrusted-checkout-execution'], file, anchor.line, anchor.text.slice(0, 240), `pull_request_target at ${file}:${pullRequestTarget.line} checks out pull-request head data at ${file}:${untrustedCheckoutField.line} before a later run step in job ${step.job}.`, anchor === untrustedCheckoutField || anchor === checkout ? 'entrypoint' : 'sink'))
+    }
+  }
+  for (const step of workflowSteps(currentSource)) for (const action of step.fields.filter(line => /^-\s*uses\s*:/i.test(line.text) && isMutableAction(valueAfterKey(line, 'uses')) && addedLine(line, addedNumbers))) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['mutable-action-ref'], file, action.line, action.text.slice(0, 240), `Added GitHub Action uses mutable ref at ${file}:${action.line}; pin an immutable commit SHA.`, 'root_control'))
   return candidates
 }
 

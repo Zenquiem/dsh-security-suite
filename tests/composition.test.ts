@@ -20,7 +20,7 @@ test('the suite composes with DSH registries and cleans up its native tool surfa
   assert.equal(names.includes('security_rollback_remediation'), true)
   assert.equal(names.includes('security_deep_read_source'), true)
   assert.equal(ctx.tools.get('security_scan')?.output.schema.type, 'object')
-  assert.match(ctx.tools.get('security_review_diff')?.description ?? '', /GitHub Actions pull_request_target trust-boundary regressions/)
+  assert.match(ctx.tools.get('security_review_diff')?.description ?? '', /GitHub Actions pull_request_target shell interpolation/)
   assert.deepEqual(ctx.tools.get('security_scan')?.output.schema.required, ['scanId', 'findings', 'reviewedFiles', 'complete'])
   const assembled = await ctx.systemPrompt.assemble()
   assert.equal(assembled.sections.some(section => section.name === 'dsh-security-suite:workflow'), true)
