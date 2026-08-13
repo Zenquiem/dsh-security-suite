@@ -32,12 +32,27 @@ function requireReportable(value: CandidateDisposition): asserts value is 'repor
 function candidate(scan: ScanRecord, candidateId: string): Finding { const value = scan.findings.find(item => item.candidateId === candidateId); if (!value) throw new Error('Candidate was not found in this scan.'); return value }
 function required(value: string, label: string): string { const text = value.trim(); if (!text) throw new Error(`${label} is required.`); return text }
 
-export async function claimAuditTask(config: Config, scanId: string, owner: string, phase?: 'validation' | 'attack_path'): Promise<{ taskId: string; candidateId: string; phase: 'validation' | 'attack_path'; focus: string; claimToken: string; artifactRef: string } | null> {
+function releaseExpiredClaims(scan: ScanRecord): number { const now = Date.now(); let released = 0; for (const task of scan.tasks) if (task.status === 'claimed' && task.claim && Date.parse(task.claim.expiresAt) <= now) { task.status = 'pending'; task.claim = undefined; released++ } return released }
+
+export async function claimAuditTask(config: Config, scanId: string, owner: string, phase?: 'validation' | 'attack_path', leaseMs = 30 * 60_000): Promise<{ taskId: string; candidateId: string; phase: 'validation' | 'attack_path'; focus: string; claimToken: string; artifactRef: string } | null> {
   const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId)
+  const released = releaseExpiredClaims(scan)
   const task = scan.tasks.find(item => item.status === 'pending' && (phase === undefined || item.phase === phase))
-  if (!task) return null
-  const claimToken = randomUUID(); task.status = 'claimed'; task.claim = { owner: required(owner, 'owner'), token: claimToken, claimedAt: new Date().toISOString() }; await persistInvestigationArtifacts(state, scan); await saveScan(state, scan)
+  if (!task) { if (released) { await persistInvestigationArtifacts(state, scan); await saveScan(state, scan) }; return null }
+  const claimToken = randomUUID(); const claimedAt = new Date(); task.status = 'claimed'; task.claim = { owner: required(owner, 'owner'), token: claimToken, claimedAt: claimedAt.toISOString(), expiresAt: new Date(claimedAt.getTime() + Math.max(60_000, Math.min(leaseMs, 4 * 60 * 60_000))).toISOString() }; await persistInvestigationArtifacts(state, scan); await saveScan(state, scan)
   return { taskId: task.id, candidateId: task.candidateId, phase: task.phase, focus: task.focus, claimToken, artifactRef: `artifacts/04_reconciliation/tasks/${task.id}.md` }
+}
+
+export async function cancelInvestigation(config: Config, scanId: string, reason: string): Promise<ScanRecord> {
+  const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); if (scan.lifecycle === 'completed') throw new Error('Completed scans are immutable.')
+  const message = required(reason, 'reason'); for (const task of scan.tasks) if (task.status === 'pending' || task.status === 'claimed') { task.status = 'cancelled'; task.receipt = `cancelled: ${message}` }
+  scan.lifecycle = 'cancelled'; scan.activity.push({ at: new Date().toISOString(), phase: 'reporting', message: `Investigation cancelled: ${message}` }); await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); return scan
+}
+
+export async function resumeInvestigation(config: Config, scanId: string): Promise<ScanRecord> {
+  const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); if (scan.lifecycle !== 'cancelled') throw new Error('Only cancelled investigations can be resumed.')
+  for (const task of scan.tasks) if (task.status === 'cancelled' && !scan.findings.find(finding => finding.candidateId === task.candidateId)?.ledger.some(row => row.phase === task.phase)) { task.status = 'pending'; task.receipt = undefined }
+  scan.lifecycle = 'validation'; scan.activity.push({ at: new Date().toISOString(), phase: 'validation', message: 'Investigation resumed; unfinished tasks were returned to the pending queue.' }); await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); return scan
 }
 
 function completeTask(scan: ScanRecord, candidateId: string, phase: 'validation' | 'attack_path', token?: string): void {

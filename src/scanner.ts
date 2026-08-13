@@ -6,6 +6,7 @@ import { promisify } from 'node:util'
 import type { CandidateDisposition, Confidence, Evidence, FileReceipt, Finding, Preflight, RuleReceipt, ScanActivity, ScanRecord, Severity, TargetSnapshot } from './contracts.js'
 import { candidateId, createScanId, findingId, getStateDir, scanArtifactDir, sealScan, sha256 } from './state.js'
 import { analyzeJavaScriptAst } from './ast-analysis.js'
+import { analyzeGoFlow, analyzePythonFlow } from './flow-analysis.js'
 
 export interface ScanLimits { maxFiles: number; maxFileBytes: number }
 export interface Candidate { rule: string; severity: Severity; file: string; line: number; excerpt: string; rationale: string; cwe: string; evidence: Evidence[] }
@@ -96,6 +97,8 @@ export async function assessDirectory(directory: string, limits: ScanLimits, dee
       ruleReceipts.push({ ruleId: 'ast.local-taint', pass: 'semantic', matches: ast.candidates.length })
       if (ast.parseError) ruleReceipts.push({ ruleId: 'ast.parse-error', pass: 'semantic', matches: 1 })
     }
+    if (extname(file) === '.py') { const semantic = analyzePythonFlow(content, rel); candidates.push(...semantic); ruleReceipts.push({ ruleId: 'python.local-taint', pass: 'semantic', matches: semantic.length }) }
+    if (extname(file) === '.go') { const semantic = analyzeGoFlow(content, rel); candidates.push(...semantic); ruleReceipts.push({ ruleId: 'go.local-taint', pass: 'semantic', matches: semantic.length }) }
   }
   return { root, filesScanned: files.length, filesSkipped: skipped, candidates, receipts: fileReceipts, ruleReceipts, policyFiles, complete }
 }

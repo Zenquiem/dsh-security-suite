@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { runScan } from '../src/scanner.ts'
 import { getStateDir, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
-import { claimAuditTask, completeScan, recordAttackPath, recordValidation } from '../src/workbench.ts'
+import { cancelInvestigation, claimAuditTask, completeScan, recordAttackPath, recordValidation, resumeInvestigation } from '../src/workbench.ts'
 
 test('workbench requires validation and attack-path receipts before finalization', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
@@ -50,5 +50,24 @@ test('workbench rejects attack-path evidence for a suppressed candidate', async 
     assert.ok(validationTask)
     await recordValidation(config, scan.id, candidate.candidateId, { conclusion: 'suppressed', method: 'static', attacker: 'none', entryPoint: 'none', trustBoundary: 'none', rootControl: 'static source', sink: 'none', impact: 'none', directEvidence: 'value is a test fixture', counterevidence: 'not reachable', limitations: 'none', confidence: 'high' }, validationTask.claimToken)
     await assert.rejects(() => recordAttackPath(config, scan.id, candidate.candidateId, { attacker: 'none', entryPoint: 'none', preconditions: 'none', dataflow: 'none', outcome: 'none', severityRationale: 'none', changeConditions: 'none' }), /only allowed for a reportable/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('cancelled investigations can resume unfinished task work', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'standard', '', false, state, false)
+    await saveScan(state, scan)
+    const claim = await claimAuditTask(config, scan.id, 'worker-a', 'validation')
+    assert.ok(claim)
+    const cancelled = await cancelInvestigation(config, scan.id, 'maintenance window')
+    assert.equal(cancelled.lifecycle, 'cancelled')
+    assert.equal(cancelled.tasks[0].status, 'cancelled')
+    const resumed = await resumeInvestigation(config, scan.id)
+    assert.equal(resumed.lifecycle, 'validation')
+    assert.equal(resumed.tasks[0].status, 'pending')
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })

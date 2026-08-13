@@ -6,8 +6,8 @@ import { SECURITY_REVIEW_GUIDANCE } from './prompt.js'
 import { FULL_SECURITY_WORKFLOW } from './workflows.js'
 import { generateSourceThreatModel, runDiffScan, runScan, resolveSafeTarget } from './scanner.js'
 import { finalizeAndSaveScan, getStateDir, listScans, loadScan, persistInvestigationArtifacts, renderCsv, renderMarkdownReport, saveTriageAnnotation, saveScan, toSarif, verifyScanBundle } from './state.js'
-import { applyRemediationProposal, bulkScan, installPreCommitHook, remediationPlan, rerunSavedScan, runIsolatedValidation } from './operations.js'
-import { claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation } from './workbench.js'
+import { applyRemediationProposal, bulkScan, installPreCommitHook, remediationPlan, rerunSavedScan, resumeBulkJob, runIsolatedValidation, startBulkCsvJob } from './operations.js'
+import { cancelInvestigation, claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation, resumeInvestigation } from './workbench.js'
 import { generateHardeningPortfolio, importFindings, triageImportedFinding } from './analysis.js'
 import { createTracking, previewTracking } from './tracking.js'
 
@@ -93,9 +93,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_claim_audit_task', description: 'Claim the next durable validation or attack-path task. Only the returned claim token can submit that task receipt, preventing duplicated or conflicting worker conclusions.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' }, owner: { type: 'string', required: true, description: 'DSH worker or reviewer identifier.' }, phase: { type: 'string', enum: ['validation', 'attack_path'], description: 'Optional task phase to claim.' } },
+    name: 'security_claim_audit_task', description: 'Claim the next durable validation or attack-path task. Claims expire after a bounded lease so interrupted DSH reviewers cannot permanently block the work queue.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' }, owner: { type: 'string', required: true, description: 'DSH worker or reviewer identifier.' }, phase: { type: 'string', enum: ['validation', 'attack_path'], description: 'Optional task phase to claim.' }, lease_ms: { type: 'number', description: 'Claim lease from 60,000 to 14,400,000 ms; default 30 minutes.' } },
     output: { schema: { oneOf: [{ type: 'object', properties: { taskId: { type: 'string' }, candidateId: { type: 'string' }, phase: { type: 'string' }, focus: { type: 'string' }, claimToken: { type: 'string' }, artifactRef: { type: 'string' } }, required: ['taskId', 'candidateId', 'phase', 'focus', 'claimToken', 'artifactRef'], additionalProperties: false }, { type: 'null' }] }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-    async execute(args) { return claimAuditTask(config, args.scan_id, args.owner, args.phase as 'validation' | 'attack_path' | undefined) },
+    async execute(args) { return claimAuditTask(config, args.scan_id, args.owner, args.phase as 'validation' | 'attack_path' | undefined, args.lease_ms ?? 30 * 60_000) },
   }))
 
   ctx.tools.register(defineTool({
@@ -129,6 +129,18 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }))
 
   ctx.tools.register(defineTool({
+    name: 'security_cancel_investigation', description: 'Cancel an open investigation and release all active tasks with a durable reason. Completed bundles cannot be cancelled.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' }, reason: { type: 'string', required: true, description: 'Why the investigation is being cancelled.' } },
+    output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, lifecycle: { type: 'string' } }, required: ['scanId', 'lifecycle'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { const scan = await cancelInvestigation(config, args.scan_id, args.reason); return { scanId: scan.id, lifecycle: scan.lifecycle } },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_resume_investigation', description: 'Resume a previously cancelled investigation, returning unfinished tasks to the pending queue.', parameters: { scan_id: { type: 'string', required: true, description: 'Cancelled investigation scan identifier.' } },
+    output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, lifecycle: { type: 'string' } }, required: ['scanId', 'lifecycle'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { const scan = await resumeInvestigation(config, args.scan_id); return { scanId: scan.id, lifecycle: scan.lifecycle } },
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'security_rerun_scan', description: 'Rerun a saved standard or deep scan recipe in the active workspace. The prior target must remain inside that workspace.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved standard or deep scan identifier.' } },
     output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, findings: { type: 'number' }, complete: { type: 'boolean' } }, required: ['scanId', 'findings', 'complete'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args) { const scan = await rerunSavedScan(process.cwd(), config, args.scan_id); return { scanId: scan.id, findings: scan.findings.length, complete: scan.coverage.complete } },
@@ -138,6 +150,18 @@ export function apply(ctx: Context, config: PluginConfig): void {
     name: 'security_bulk_scan', description: 'Run bounded-concurrency native scans for workspace-relative paths and persist each result. This is read-only.', parameters: { paths: { type: 'array', required: true, items: { type: 'string' }, description: 'Workspace-relative directories to scan.' }, mode: { type: 'string', enum: ['standard', 'deep'], description: 'Native scan depth.' }, concurrency: { type: 'number', description: 'Parallel scans from 1 to 4; defaults to 2.' }, threat_model: { type: 'string', description: 'Shared threat-model notes.' } },
     output: { schema: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, scanId: { type: 'string' }, findings: { type: 'number' }, error: { type: 'string' } }, required: ['path'], additionalProperties: false } }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args) { return bulkScan(process.cwd(), config, args.paths, args.mode === 'deep' ? 'deep' : 'standard', args.threat_model ?? '', args.concurrency ?? 2) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_bulk_scan_csv', description: 'Start a resumable native bulk scan from a workspace CSV. The first column or a path header supplies workspace-relative directories; every target stores attempts, outcome, and scan id.', parameters: { csv_path: { type: 'string', required: true, description: 'Workspace-relative CSV path.' }, mode: { type: 'string', enum: ['standard', 'deep'], description: 'Scan depth.' }, concurrency: { type: 'number', description: 'Parallel scans from 1 to 4; defaults to 2.' }, threat_model: { type: 'string', description: 'Shared threat-model notes.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, entries: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, status: { type: 'string' }, attempts: { type: 'number' }, scanId: { type: 'string' }, findings: { type: 'number' }, error: { type: 'string' } }, required: ['path', 'status', 'attempts'], additionalProperties: false } } }, required: ['id', 'entries'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return startBulkCsvJob(process.cwd(), config, args.csv_path, args.mode === 'deep' ? 'deep' : 'standard', args.threat_model ?? '', args.concurrency ?? 2) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_resume_bulk_scan', description: 'Resume a saved bulk job. Completed targets are retained; failed or pending targets are retried and their attempt count is incremented.', parameters: { job_id: { type: 'string', required: true, description: 'Bulk job identifier.' }, concurrency: { type: 'number', description: 'Parallel scans from 1 to 4; defaults to 2.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, entries: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, status: { type: 'string' }, attempts: { type: 'number' }, scanId: { type: 'string' }, findings: { type: 'number' }, error: { type: 'string' } }, required: ['path', 'status', 'attempts'], additionalProperties: false } } }, required: ['id', 'entries'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return resumeBulkJob(process.cwd(), config, args.job_id, args.concurrency ?? 2) },
   }))
 
   ctx.tools.register(defineTool({
@@ -213,7 +237,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
   ctx.tools.register(defineTool({
     name: 'security_update_finding', description: 'Persist a validated finding status and source-backed analysis. Use only after review establishes the fields.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Finding identifier.' }, status: { type: 'string', required: true, enum: ['open', 'false_positive', 'resolved', 'unknown'], description: 'Validated disposition.' }, validation: { type: 'string', description: 'Source-backed validation and counterevidence.' }, attack_path: { type: 'string', description: 'Attacker-to-sink path and prerequisites.' }, impact: { type: 'string', description: 'Concrete security impact.' }, remediation: { type: 'string', description: 'Focused remediation.' }, severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'], description: 'Calibrated severity.' }, confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: 'Confidence after validation.' } },
     output: { schema: { type: 'object', properties: { updated: { type: 'boolean' }, findingId: { type: 'string' } }, required: ['updated', 'findingId'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-    async execute(args) { const stateDir = getStateDir(config.stateDir); const scan = await loadScan(stateDir, args.scan_id); const finding = scan.findings.find(item => item.id === args.finding_id); if (!finding) throw new Error('Finding was not found in this scan.'); if (args.status === 'false_positive' && !args.validation) throw new Error('A false-positive disposition requires source-backed validation or counterevidence.'); if (args.status === 'open' && (!args.validation || !args.attack_path || !args.impact)) throw new Error('An open validated finding requires validation, attack path, and impact evidence.'); finding.status = args.status as typeof finding.status; if (args.validation) { finding.validation = args.validation; finding.evidence.push({ kind: args.status === 'false_positive' ? 'counterevidence' : 'validation', detail: args.validation }) }; if (args.attack_path) finding.attackPath = args.attack_path; if (args.impact) finding.impact = args.impact; if (args.remediation) finding.remediation = args.remediation; if (args.severity) finding.severity = args.severity as typeof finding.severity; if (args.confidence) finding.confidence = args.confidence as typeof finding.confidence; await saveTriageAnnotation(stateDir, scan, finding); return { updated: true, findingId: finding.id } },
+    async execute(args) { const stateDir = getStateDir(config.stateDir); const scan = await loadScan(stateDir, args.scan_id); const original = scan.findings.find(item => item.id === args.finding_id); if (!original) throw new Error('Finding was not found in this scan.'); if (args.status === 'false_positive' && !args.validation) throw new Error('A false-positive disposition requires source-backed validation or counterevidence.'); if (args.status === 'open' && (!args.validation || !args.attack_path || !args.impact)) throw new Error('An open validated finding requires validation, attack path, and impact evidence.'); const finding = structuredClone(original); finding.status = args.status as typeof finding.status; if (args.validation) { finding.validation = args.validation; finding.evidence.push({ kind: args.status === 'false_positive' ? 'counterevidence' : 'validation', detail: args.validation }) }; if (args.attack_path) finding.attackPath = args.attack_path; if (args.impact) finding.impact = args.impact; if (args.remediation) finding.remediation = args.remediation; if (args.severity) finding.severity = args.severity as typeof finding.severity; if (args.confidence) finding.confidence = args.confidence as typeof finding.confidence; await saveTriageAnnotation(stateDir, scan, finding); return { updated: true, findingId: finding.id } },
   }))
 
   ctx.tools.register(defineTool({

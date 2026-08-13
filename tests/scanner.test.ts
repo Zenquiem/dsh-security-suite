@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { assessDirectory, resolveSafeTarget, runScan } from '../src/scanner.ts'
-import { finalizeAndSaveScan, loadScan, renderCsv, saveScan, toSarif, verifyScanBundle, verifySeal } from '../src/state.ts'
+import { finalizeAndSaveScan, loadScan, renderCsv, saveScan, saveTriageAnnotation, toSarif, verifyScanBundle, verifySeal } from '../src/state.ts'
 
 test('assessDirectory reports source candidates and skips dependencies', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
@@ -88,5 +88,24 @@ test('native preflight and source-evidenced threat model are durable scan contex
     assert.deepEqual(scan.preflight.suggestedCommands, ['npm test', 'npm run build'])
     assert.match(scan.threatModel, /Source-Evidenced Threat Model/)
     assert.match(scan.threatModel, /app\.ts/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('post-completion annotations do not mutate a sealed scan bundle', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await writeFile(join(root, 'client.ts'), 'request({ rejectUnauthorized: false })\n')
+    const scan = await runScan(root, { maxFiles: 10, maxFileBytes: 4096, stateDir: state }, 'standard', '', false, state)
+    const finding = scan.findings[0]
+    finding.disposition = 'reportable'
+    finding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition: 'reportable', summary: 'Validated.' })
+    finding.ledger.push({ at: new Date().toISOString(), phase: 'attack_path', disposition: 'reportable', summary: 'Path.' })
+    scan.lifecycle = 'completed'; scan.completedAt = new Date().toISOString()
+    await finalizeAndSaveScan(state, scan)
+    const sealed = await loadScan(state, scan.id)
+    const annotated = structuredClone(sealed.findings[0]); annotated.status = 'resolved'
+    await saveTriageAnnotation(state, sealed, annotated)
+    assert.equal((await verifyScanBundle(await loadScan(state, scan.id))).valid, true)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })

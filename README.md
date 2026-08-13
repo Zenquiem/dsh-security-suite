@@ -10,7 +10,7 @@ The plugin owns its scan orchestration, evidence model, persistent workbench, ex
 
 | Workflow | DSH Security Suite capability |
 | --- | --- |
-| Standard, scoped, diff, and deep scans | Native `security_scan`, `security_review_diff`, and deep-scan planning tools |
+| Standard, scoped, diff, and deep scans | Native `security_scan`, `security_review_diff`, deep multi-pass analysis, and resumable bulk jobs |
 | Threat model and security policy | Native source-evidenced threat model, policy, and invariant tools |
 | Discovery, validation, attack paths, triage | Native evidence-backed findings and persistent validation state |
 | Scan history, rerun, semantic match, comparison | Native workbench records and scan comparison |
@@ -24,15 +24,16 @@ The plugin does not require an external security vendor credential. Any future G
 
 ## Native Operation
 
-The scanner inventories eligible source files deterministically, skips dependency and generated directories, records a SHA-256 receipt for each reviewed file, and seals every saved scan record. It runs a native preflight that records discovered manifests, languages, suggested local test commands, external-state availability, and coverage limitations. Default threat models are generated from local route, caller-input, authorization, parser, storage, secret, and outbound-network signals; supplied context is retained as an explicit assumption rather than presented as source fact. Standard scans run the baseline rule set. Deep scans run separate baseline, injection, and trust-boundary passes before reducing duplicate observations to stable fingerprints. The current local rule set covers dynamic execution, shell construction, filesystem traversal sinks, disabled TLS verification, likely hardcoded credentials, unsafe deserialization, request-derived outbound requests, and weak randomness in security-sensitive contexts.
+The scanner inventories eligible source files deterministically, skips dependency and generated directories, records a SHA-256 receipt for each reviewed file, and seals every saved scan record. It runs a native preflight that records discovered manifests, languages, suggested local test commands, external-state availability, and coverage limitations. Default threat models are generated from local route, caller-input, authorization, parser, storage, secret, and outbound-network signals; supplied context is retained as an explicit assumption rather than presented as source fact. Standard scans run the baseline rule set. Deep scans run separate baseline, injection, and trust-boundary passes before reducing duplicate observations to stable fingerprints. JS/TS AST analysis and Python/Go local flow analysis track request-derived values into dynamic execution, command, filesystem, and outbound-request sinks. The current rule set also covers disabled TLS verification, likely hardcoded credentials, unsafe deserialization, query construction, XML parser hazards, JWT verification, CORS, missing local authorization markers, and unsafe object merge patterns.
 
 `security_start_investigation` creates a durable DSH-native workbench. `security_claim_audit_task` returns an ownership token and a local task-evidence reference; validation and attack-path receipts may only be submitted with that token. `security_run_validation` runs an explicit command in a disposable copy of the target and records output, timeout, exit code, and snapshot evidence. Remediation proposals carry the source snapshot and file digests; `security_apply_remediation` requires explicit approval, rejects stale content, rescans after applying, and preserves the verification scan id. Imported third-party findings remain evidence until local triage establishes impact. The workbench persists findings, evidence, lifecycle, scan recipe, coverage, activity, and integrity seal outside the scanned repository. It intentionally exposes this task protocol instead of assuming an undocumented DSH subagent API. `security_compare_scans` compares stable fingerprints rather than volatile line numbers. CSV values are escaped correctly; SARIF exports include rule metadata, locations, fingerprints, confidence, status, and the scan seal.
 
 ## Tool Surface
 
-- `security_scan`, `security_assess`, `security_review_diff`, `security_bulk_scan`, `security_rerun_scan`
+- `security_scan`, `security_assess`, `security_review_diff`, `security_bulk_scan`, `security_bulk_scan_csv`, `security_resume_bulk_scan`, `security_rerun_scan`
 - `security_scan_history`, `security_get_scan`, `security_compare_scans`, `security_export_scan`
 - `security_threat_model_template`, `security_import_findings`, `security_triage_imported_finding`, `security_finding_writeup`, `security_hardening_proposal`
+- `security_cancel_investigation` and `security_resume_investigation` preserve task recovery; claims use expiring leases.
 - `security_run_validation` executes a simple command in a disposable copy and saves its receipt; `security_remediation_plan` and `security_apply_remediation` provide an approval-gated, stale-safe repair lifecycle.
 - `security_install_precommit_hook` changes a repository only when `approved: true` is explicitly supplied; it preserves an existing hook.
 - `security_tracking_preview` builds the exact tracker issue and can perform a read-only GitHub duplicate lookup. `security_create_tracking_issue` makes one approval-gated provider write and saves a receipt; it never persists the supplied token.

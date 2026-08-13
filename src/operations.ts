@@ -8,7 +8,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Config } from './config.js'
 import type { Finding, ScanRecord } from './contracts.js'
 import { runScan, resolveSafeTarget, snapshotDigestForDirectory } from './scanner.js'
-import { finalizeAndSaveScan, getStateDir, loadScan, saveScan, sha256, writeArtifact } from './state.js'
+import { finalizeAndSaveScan, getStateDir, loadScan, saveScan, sha256 } from './state.js'
 
 const execFileAsync = promisify(execFile)
 const MAX_COMMAND_OUTPUT = 256_000
@@ -18,6 +18,7 @@ export interface CommandReceipt { id: string; command: string; cwd: string; exit
 export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; createdAt: string; status: 'proposed' | 'applied' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; appliedAt?: string; verificationScanId?: string }
 
 export interface BulkResult { path: string; scanId?: string; findings?: number; error?: string }
+export interface BulkJob { id: string; createdAt: string; updatedAt: string; mode: 'standard' | 'deep'; threatModel: string; entries: Array<BulkResult & { status: 'pending' | 'completed' | 'failed'; attempts: number }> }
 
 function inside(root: string, target: string): boolean { const rel = relative(root, target); return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel)) }
 function safeCommand(command: string): string { const value = command.trim(); if (!value || value.length > 500 || !VALIDATION_COMMAND.test(value)) throw new Error('Validation command contains unsupported shell syntax. Use a simple executable and arguments only.'); return value }
@@ -27,6 +28,9 @@ function proposalPath(stateDir: string, id: string): string { if (!/^rem_[0-9a-f
 async function atomicWrite(path: string, content: string): Promise<void> { const temporary = `${path}.${randomUUID()}.tmp`; await mkdir(resolve(path, '..'), { recursive: true }); await writeFile(temporary, content, 'utf8'); await rename(temporary, path) }
 async function saveProposal(stateDir: string, proposal: RemediationProposal): Promise<void> { await atomicWrite(proposalPath(stateDir, proposal.id), `${JSON.stringify(proposal, null, 2)}\n`) }
 export async function loadRemediationProposal(stateDir: string, id: string): Promise<RemediationProposal> { return JSON.parse(await readFile(proposalPath(stateDir, id), 'utf8')) as RemediationProposal }
+function bulkJobPath(stateDir: string, id: string): string { if (!/^bulk_[0-9a-f-]+$/.test(id)) throw new Error('Invalid bulk job id.'); return join(stateDir, 'bulk-jobs', `${id}.json`) }
+async function saveBulkJob(stateDir: string, job: BulkJob): Promise<void> { job.updatedAt = new Date().toISOString(); await atomicWrite(bulkJobPath(stateDir, job.id), `${JSON.stringify(job, null, 2)}\n`) }
+export async function loadBulkJob(stateDir: string, id: string): Promise<BulkJob> { return JSON.parse(await readFile(bulkJobPath(stateDir, id), 'utf8')) as BulkJob }
 
 export async function runIsolatedValidation(workspace: string, config: Config, scanId: string, command: string, timeoutMs = 120_000): Promise<CommandReceipt> {
   const scan = await loadScan(getStateDir(config.stateDir), scanId); const root = resolve(workspace); const target = resolve(scan.target)
@@ -38,7 +42,10 @@ export async function runIsolatedValidation(workspace: string, config: Config, s
     await cp(target, copyTarget, { recursive: true, dereference: false, filter: source => !source.split(sep).some(part => ['.git', 'node_modules', 'dist', 'build', 'coverage'].includes(part)) })
     try { const result = await execFileAsync(args[0], args.slice(1), { cwd: copyTarget, timeout, maxBuffer: MAX_COMMAND_OUTPUT, encoding: 'utf8', windowsHide: true }); stdout = result.stdout; stderr = result.stderr; exitCode = 0 } catch (error: unknown) { const value = error as { stdout?: string; stderr?: string; code?: number | string; killed?: boolean }; stdout = value.stdout ?? ''; stderr = value.stderr ?? ''; exitCode = typeof value.code === 'number' ? value.code : undefined; timedOut = Boolean(value.killed) }
     const receipt: CommandReceipt = { id: `cmd_${randomUUID()}`, command: args.join(' '), cwd: '.', exitCode, timedOut, durationMs: Date.now() - started, stdout: stdout.slice(0, MAX_COMMAND_OUTPUT), stderr: stderr.slice(0, MAX_COMMAND_OUTPUT), snapshotDigest: await snapshotDigestForDirectory(target, config) }
-    receipt.artifactRef = await writeArtifact(scan, `artifacts/05_findings/validation_artifacts/${receipt.id}.json`, `${JSON.stringify(receipt, null, 2)}\n`)
+    const receiptPath = join(getStateDir(config.stateDir), 'validation-receipts', `${receipt.id}.json`)
+    await atomicWrite(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`)
+    receipt.artifactRef = receiptPath
+    await atomicWrite(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`)
     return receipt
   } finally { await rm(copyRoot, { recursive: true, force: true }) }
 }
@@ -67,6 +74,33 @@ export async function bulkScan(workspace: string, config: Config, paths: string[
   await Promise.all(Array.from({ length: Math.min(capped, unique.length) }, worker)); return output
 }
 
+function csvPaths(content: string): string[] {
+  const lines = content.split(/\r?\n/).map(line => line.trim()).filter(Boolean); if (!lines.length) throw new Error('CSV input contains no target paths.')
+  const first = lines[0].split(',').map(value => value.trim().replace(/^"|"$/g, '')); const pathColumn = first.findIndex(value => /^path$/i.test(value)); const start = pathColumn >= 0 ? 1 : 0; const column = pathColumn >= 0 ? pathColumn : 0
+  return lines.slice(start).map(line => line.split(',')[column]?.trim().replace(/^"|"$/g, '') ?? '').filter(Boolean)
+}
+
+async function executeBulkJob(workspace: string, config: Config, job: BulkJob, concurrency: number): Promise<BulkJob> {
+  const capped = Math.max(1, Math.min(concurrency, 4)); let cursor = 0; const state = getStateDir(config.stateDir)
+  const worker = async (): Promise<void> => {
+    while (true) {
+      const index = cursor++; const entry = job.entries[index]; if (!entry) return; if (entry.status === 'completed') continue
+      entry.attempts++; entry.error = undefined
+      try { const target = resolveSafeTarget(workspace, entry.path); const targetInfo = await access(target).then(() => true).catch(() => false); if (!targetInfo) throw new Error('Bulk target directory does not exist or cannot be accessed.'); const scan = await runScan(target, config, job.mode, job.threatModel, true, config.stateDir); await finalizeAndSaveScan(state, scan); entry.scanId = scan.id; entry.findings = scan.findings.filter(finding => finding.disposition === 'reportable').length; entry.status = 'completed' } catch (error) { entry.status = 'failed'; entry.error = error instanceof Error ? error.message : String(error) }
+      await saveBulkJob(state, job)
+    }
+  }
+  await Promise.all(Array.from({ length: Math.min(capped, job.entries.length) }, worker)); return job
+}
+
+export async function startBulkCsvJob(workspace: string, config: Config, csvPath: string, mode: 'standard' | 'deep', threatModel: string, concurrency: number): Promise<BulkJob> {
+  const root = resolve(workspace); const source = resolve(root, csvPath); if (!inside(root, source)) throw new Error('CSV input must remain inside the active workspace.')
+  const paths = [...new Set(csvPaths(await readFile(source, 'utf8')))].sort(); const now = new Date().toISOString(); const job: BulkJob = { id: `bulk_${randomUUID()}`, createdAt: now, updatedAt: now, mode, threatModel, entries: paths.map(path => ({ path, status: 'pending', attempts: 0 })) }
+  await saveBulkJob(getStateDir(config.stateDir), job); return executeBulkJob(root, config, job, concurrency)
+}
+
+export async function resumeBulkJob(workspace: string, config: Config, jobId: string, concurrency: number): Promise<BulkJob> { const job = await loadBulkJob(getStateDir(config.stateDir), jobId); return executeBulkJob(resolve(workspace), config, job, concurrency) }
+
 export async function installPreCommitHook(workspace: string, approved: boolean): Promise<{ installed: boolean; path: string; reason?: string }> {
   if (!approved) throw new Error('Installing a Git hook changes the repository. Set approved to true only after the hook content has been reviewed.')
   const root = resolve(workspace); const hookDirectory = join(root, '.git', 'hooks'); const hookPath = join(hookDirectory, 'pre-commit')
@@ -93,7 +127,7 @@ export async function remediationPlan(workspace: string, config: Config, scanId:
   const patch = after && after !== before ? `--- a/${location.file}\n+++ b/${location.file}\n@@ line ${location.line} @@\n- ${location.excerpt}\n+ ${after.split(/\r?\n/)[location.line - 1]?.trim() ?? '<review replacement>'}` : `No mechanically safe replacement is available for ${finding.ruleId}.\nReview ${location.file}:${location.line} and implement: ${finding.remediation}`
   const proposal: RemediationProposal = { id: `rem_${randomUUID()}`, findingId: finding.id, file: location.file, line: location.line, patch, baseSnapshotDigest: scan.targetSnapshot.snapshotDigest, baseFileSha256: sha256(before), createdAt: new Date().toISOString(), status: 'proposed', requiresApproval: true, requiresReview: true }
   await saveProposal(getStateDir(config.stateDir), proposal)
-  await writeArtifact(scan, `artifacts/06_remediation/${proposal.id}.json`, `${JSON.stringify(proposal, null, 2)}\n`)
+  await atomicWrite(join(getStateDir(config.stateDir), 'remediations', `${proposal.id}.json`), `${JSON.stringify(proposal, null, 2)}\n`)
   return proposal
 }
 

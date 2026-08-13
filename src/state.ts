@@ -143,6 +143,7 @@ export async function persistInvestigationArtifacts(stateDir: string, record: Sc
 }
 
 export async function finalizeAndSaveScan(stateDir: string, record: ScanRecord): Promise<ScanRecord> {
+  if (record.lifecycle !== 'completed') { await persistInvestigationArtifacts(stateDir, record); await saveScan(stateDir, record); return record }
   await persistScanBundle(stateDir, record)
   await saveScan(stateDir, record)
   return record
@@ -183,6 +184,13 @@ export async function verifyScanBundle(record: ScanRecord): Promise<{ valid: boo
 }
 
 export async function saveTriageAnnotation(stateDir: string, scan: ScanRecord, finding: Finding): Promise<void> {
+  if (scan.lifecycle === 'completed') {
+    const annotations = resolve(stateDir, 'annotations', `${scan.id}.json`)
+    const payload = await readAnnotations(annotations)
+    payload.findings[finding.id] = { status: finding.status, validation: finding.validation, attackPath: finding.attackPath, impact: finding.impact, remediation: finding.remediation, severity: finding.severity, confidence: finding.confidence, updatedAt: new Date().toISOString() }
+    await atomicWrite(annotations, json(payload))
+    return
+  }
   const annotations = resolve(stateDir, 'annotations', `${scan.id}.json`)
   const payload = await readAnnotations(annotations)
   payload.findings[finding.id] = { status: finding.status, validation: finding.validation, attackPath: finding.attackPath, impact: finding.impact, remediation: finding.remediation, severity: finding.severity, confidence: finding.confidence, updatedAt: new Date().toISOString() }

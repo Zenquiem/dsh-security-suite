@@ -78,7 +78,7 @@ export interface AuditTask {
   phase: 'validation' | 'attack_path'
   focus: string
   status: 'pending' | 'claimed' | 'completed' | 'cancelled'
-  claim?: { owner: string; token: string; claimedAt: string }
+  claim?: { owner: string; token: string; claimedAt: string; expiresAt: string }
   completedAt?: string
   receipt?: string
 }
