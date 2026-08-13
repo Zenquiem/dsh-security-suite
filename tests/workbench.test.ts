@@ -7,6 +7,10 @@ import { runScan } from '../src/scanner.ts'
 import { getStateDir, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
 import { cancelInvestigation, claimAuditTask, completeScan, recordAttackPath, recordValidation, resumeInvestigation } from '../src/workbench.ts'
 
+function references(finding: { locations: Array<{ file: string; line: number; role?: string }> }) {
+  return finding.locations.map(location => ({ file: location.file, line: location.line, role: location.role ?? 'root_control' })) as Array<{ file: string; line: number; role: 'entrypoint' | 'wrapper' | 'propagation' | 'root_control' | 'sink' | 'outcome' | 'expected_control' }>
+}
+
 test('workbench requires validation and attack-path receipts before finalization', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
@@ -24,12 +28,12 @@ test('workbench requires validation and attack-path receipts before finalization
     assert.ok(validationTask)
     assert.match(await readFile(join(scan.artifacts.directory, validationTask.artifactRef), 'utf8'), /Security Audit Task/)
     assert.equal(await claimAuditTask(config, scan.id, 'worker-b', 'validation'), null)
-    await assert.rejects(() => recordValidation(config, scan.id, candidate.candidateId, { conclusion: 'reportable', method: 'static', attacker: 'remote caller', entryPoint: 'req.query.code', trustBoundary: 'HTTP request to evaluator', rootControl: 'eval(value)', sink: 'eval', impact: 'code execution', directEvidence: 'AST data-flow reaches eval', counterevidence: 'no allowlist', limitations: 'not executed', confidence: 'medium' }, 'wrong-token'), /claim token/)
-    await recordValidation(config, scan.id, candidate.candidateId, { conclusion: 'reportable', method: 'static', attacker: 'remote caller', entryPoint: 'req.query.code', trustBoundary: 'HTTP request to evaluator', rootControl: 'eval(value)', sink: 'eval', impact: 'code execution', directEvidence: 'AST data-flow reaches eval', counterevidence: 'no allowlist', limitations: 'not executed', confidence: 'medium' }, validationTask.claimToken)
+    await assert.rejects(() => recordValidation(config, scan.id, candidate.candidateId, { conclusion: 'reportable', method: 'static', attacker: 'remote caller', entryPoint: 'req.query.code', trustBoundary: 'HTTP request to evaluator', rootControl: 'eval(value)', sink: 'eval', impact: 'code execution', directEvidence: 'AST data-flow reaches eval', counterevidence: 'no allowlist', limitations: 'not executed', confidence: 'medium', sourceReferences: references(candidate) }, 'wrong-token'), /claim token/)
+    await recordValidation(config, scan.id, candidate.candidateId, { conclusion: 'reportable', method: 'static', attacker: 'remote caller', entryPoint: 'req.query.code', trustBoundary: 'HTTP request to evaluator', rootControl: 'eval(value)', sink: 'eval', impact: 'code execution', directEvidence: 'AST data-flow reaches eval', counterevidence: 'no allowlist', limitations: 'not executed', confidence: 'medium', sourceReferences: references(candidate) }, validationTask.claimToken)
     await assert.rejects(() => completeScan(config, scan.id), /incomplete/)
     const attackTask = await claimAuditTask(config, scan.id, 'worker-c', 'attack_path')
     assert.ok(attackTask)
-    await recordAttackPath(config, scan.id, candidate.candidateId, { attacker: 'remote caller', entryPoint: 'HTTP query', preconditions: 'route reachable', dataflow: 'req.query.code -> value -> eval(value)', outcome: 'arbitrary script execution', severityRationale: 'high impact with reachable source', changeConditions: 'runtime test can raise confidence' }, attackTask.claimToken)
+    await recordAttackPath(config, scan.id, candidate.candidateId, { attacker: 'remote caller', entryPoint: 'HTTP query', preconditions: 'route reachable', dataflow: 'req.query.code -> value -> eval(value)', outcome: 'arbitrary script execution', severityRationale: 'high impact with reachable source', changeConditions: 'runtime test can raise confidence', sourceReferences: references(candidate) }, attackTask.claimToken)
     const completed = await completeScan(config, scan.id)
     assert.equal(completed.lifecycle, 'completed')
     const verified = await verifyScanBundle(await loadScan(state, scan.id))
@@ -48,8 +52,32 @@ test('workbench rejects attack-path evidence for a suppressed candidate', async 
     const candidate = scan.findings[0]
     const validationTask = await claimAuditTask(config, scan.id, 'worker-a', 'validation')
     assert.ok(validationTask)
-    await recordValidation(config, scan.id, candidate.candidateId, { conclusion: 'suppressed', method: 'static', attacker: 'none', entryPoint: 'none', trustBoundary: 'none', rootControl: 'static source', sink: 'none', impact: 'none', directEvidence: 'value is a test fixture', counterevidence: 'not reachable', limitations: 'none', confidence: 'high' }, validationTask.claimToken)
-    await assert.rejects(() => recordAttackPath(config, scan.id, candidate.candidateId, { attacker: 'none', entryPoint: 'none', preconditions: 'none', dataflow: 'none', outcome: 'none', severityRationale: 'none', changeConditions: 'none' }), /only allowed for a reportable/)
+    await recordValidation(config, scan.id, candidate.candidateId, { conclusion: 'suppressed', method: 'static', attacker: 'none', entryPoint: 'none', trustBoundary: 'none', rootControl: 'static source', sink: 'none', impact: 'none', directEvidence: 'value is a test fixture', counterevidence: 'not reachable', limitations: 'none', confidence: 'high', sourceReferences: references(candidate) }, validationTask.claimToken)
+    await assert.rejects(() => recordAttackPath(config, scan.id, candidate.candidateId, { attacker: 'none', entryPoint: 'none', preconditions: 'none', dataflow: 'none', outcome: 'none', severityRationale: 'none', changeConditions: 'none', sourceReferences: references(candidate) }), /only allowed for a reportable/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('workbench rejects unretained citations and endpoint-free reportable flow receipts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { const value = req.query.code; eval(value) }\n')
+    const scan = await runScan(root, config, 'standard', '', false, state, false); await saveScan(state, scan)
+    const candidate = scan.findings.find(finding => finding.ruleId === 'dangerous.dynamic.code'); assert.ok(candidate)
+    const validation = await claimAuditTask(config, scan.id, 'worker-a', 'validation'); assert.ok(validation)
+    const fields = { conclusion: 'reportable' as const, method: 'static' as const, attacker: 'remote caller', entryPoint: 'req.query.code', trustBoundary: 'HTTP request to evaluator', rootControl: 'eval(value)', sink: 'eval', impact: 'code execution', directEvidence: 'AST data-flow reaches eval', counterevidence: 'no allowlist', limitations: 'not executed', confidence: 'medium' as const }
+    await assert.rejects(() => recordValidation(config, scan.id, candidate.candidateId, { ...fields, sourceReferences: [{ file: 'outside.ts', line: 1, role: 'sink' }] }, validation.claimToken), /not a retained location/)
+    const endpointOnly = references(candidate).filter(reference => reference.role === 'entrypoint')
+    await assert.rejects(() => recordValidation(config, scan.id, candidate.candidateId, { ...fields, sourceReferences: endpointOnly }, validation.claimToken), /root_control or sink/)
+    await recordValidation(config, scan.id, candidate.candidateId, { ...fields, sourceReferences: references(candidate) }, validation.claimToken)
+    const attack = await claimAuditTask(config, scan.id, 'worker-b', 'attack_path'); assert.ok(attack)
+    await assert.rejects(() => recordAttackPath(config, scan.id, candidate.candidateId, { attacker: 'remote caller', entryPoint: 'HTTP query', preconditions: 'route reachable', dataflow: 'req.query.code -> value -> eval(value)', outcome: 'arbitrary script execution', severityRationale: 'high impact with reachable source', changeConditions: 'runtime test can raise confidence', sourceReferences: references(candidate).filter(reference => reference.role === 'sink') }, attack.claimToken), /both endpoint roles/)
+    await recordAttackPath(config, scan.id, candidate.candidateId, { attacker: 'remote caller', entryPoint: 'HTTP query', preconditions: 'route reachable', dataflow: 'req.query.code -> value -> eval(value)', outcome: 'arbitrary script execution', severityRationale: 'high impact with reachable source', changeConditions: 'runtime test can raise confidence', sourceReferences: references(candidate) }, attack.claimToken)
+    const completed = await completeScan(config, scan.id)
+    const report = await readFile(join(completed.artifacts.directory, 'findings', candidate.candidateId, `${candidate.candidateId}.md`), 'utf8')
+    assert.match(report, /Source references:.*entrypoint/)
+    assert.match(report, /Source references:.*sink/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

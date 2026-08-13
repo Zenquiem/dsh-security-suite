@@ -7,6 +7,8 @@ export type EvidenceKind = 'pattern' | 'context' | 'policy' | 'validation' | 'co
 export type LocationRole = 'entrypoint' | 'wrapper' | 'propagation' | 'root_control' | 'sink' | 'outcome' | 'expected_control'
 
 export interface Location { file: string; line: number; excerpt: string; role?: LocationRole }
+/** An exact, immutable-source location cited by a validation or attack-path receipt. */
+export interface ReceiptSourceReference { file: string; line: number; role: LocationRole }
 export interface Evidence { kind: EvidenceKind; detail: string; location?: Location; artifactRef?: string }
 
 export interface ValidationRecord {
@@ -22,6 +24,7 @@ export interface ValidationRecord {
   counterevidence: string
   limitations: string
   confidence: Confidence
+  sourceReferences: ReceiptSourceReference[]
   recordedAt: string
 }
 
@@ -33,6 +36,7 @@ export interface AttackPathRecord {
   outcome: string
   severityRationale: string
   changeConditions: string
+  sourceReferences: ReceiptSourceReference[]
   recordedAt: string
 }
 

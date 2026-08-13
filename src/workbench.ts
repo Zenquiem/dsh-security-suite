@@ -1,4 +1,4 @@
-import type { AttackPathRecord, CandidateDisposition, Finding, ScanRecord, ValidationRecord } from './contracts.js'
+import type { AttackPathRecord, CandidateDisposition, EvidenceKind, Finding, Location, LocationRole, ReceiptSourceReference, ScanRecord, ValidationRecord } from './contracts.js'
 import { finalizeAndSaveScan, getStateDir, loadScan, persistInvestigationArtifacts, saveScan } from './state.js'
 import { randomUUID } from 'node:crypto'
 import type { Config } from './config.js'
@@ -16,6 +16,7 @@ export interface ValidationInput {
   counterevidence: string
   limitations: string
   confidence: 'high' | 'medium' | 'low'
+  sourceReferences: ReceiptSourceReference[]
 }
 
 export interface AttackPathInput {
@@ -26,11 +27,41 @@ export interface AttackPathInput {
   outcome: string
   severityRationale: string
   changeConditions: string
+  sourceReferences: ReceiptSourceReference[]
 }
 
 function requireReportable(value: CandidateDisposition): asserts value is 'reportable' { if (value !== 'reportable') throw new Error('Attack-path analysis is only allowed for a reportable validated candidate.') }
 function candidate(scan: ScanRecord, candidateId: string): Finding { const value = scan.findings.find(item => item.candidateId === candidateId); if (!value) throw new Error('Candidate was not found in this scan.'); return value }
 function required(value: string, label: string): string { const text = value.trim(); if (!text) throw new Error(`${label} is required.`); return text }
+
+function locationRole(location: Location): LocationRole { return location.role ?? 'root_control' }
+
+/** Resolve receipt citations only against the scan's frozen, finding-local source locations. */
+function resolveSourceReferences(finding: Finding, references: ReceiptSourceReference[]): Location[] {
+  if (!Array.isArray(references) || references.length === 0) throw new Error('At least one source reference is required.')
+  const seen = new Set<string>(); const resolved: Location[] = []
+  for (const reference of references) {
+    if (!reference || typeof reference.file !== 'string' || !reference.file.trim() || !Number.isInteger(reference.line) || reference.line < 1 || !['entrypoint', 'wrapper', 'propagation', 'root_control', 'sink', 'outcome', 'expected_control'].includes(reference.role)) throw new Error('Each source reference requires a snapshot file, positive line, and recognized role.')
+    const key = `${reference.file}:${reference.line}:${reference.role}`
+    if (seen.has(key)) throw new Error(`Duplicate source reference: ${key}.`)
+    const location = finding.locations.find(item => item.file === reference.file && item.line === reference.line && locationRole(item) === reference.role)
+    if (!location) throw new Error(`Source reference is not a retained location in this finding snapshot: ${key}.`)
+    seen.add(key); resolved.push(location)
+  }
+  return resolved
+}
+
+function requireReportableValidationReferences(references: Location[]): void {
+  if (!references.some(reference => locationRole(reference) === 'root_control' || locationRole(reference) === 'sink')) throw new Error('A reportable validation requires a cited root_control or sink source reference.')
+}
+
+function requireAttackPathEndpointReferences(finding: Finding, references: Location[]): void {
+  const roles = new Set(finding.locations.map(locationRole))
+  if (roles.has('entrypoint') && roles.has('sink')) {
+    const cited = new Set(references.map(locationRole))
+    if (!cited.has('entrypoint') || !cited.has('sink')) throw new Error('An attack path with retained entrypoint and sink locations must cite both endpoint roles.')
+  }
+}
 
 function releaseExpiredClaims(scan: ScanRecord): number { const now = Date.now(); let released = 0; for (const task of scan.tasks) if (task.status === 'claimed' && task.claim && Date.parse(task.claim.expiresAt) <= now) { task.status = 'pending'; task.claim = undefined; released++ } return released }
 
@@ -70,10 +101,13 @@ export async function pendingCandidates(config: Config, scanId: string): Promise
 export async function recordValidation(config: Config, scanId: string, candidateId: string, input: ValidationInput, claimToken?: string): Promise<ScanRecord> {
   const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); if (scan.lifecycle === 'completed') throw new Error('Completed scans are immutable. Create a follow-up scan for new validation evidence.')
   const finding = candidate(scan, candidateId)
-  for (const [label, value] of Object.entries(input)) required(String(value), label)
+  for (const [label, value] of Object.entries(input)) if (label !== 'sourceReferences') required(String(value), label)
   if (!['reportable', 'suppressed', 'deferred', 'not_applicable'].includes(input.conclusion)) throw new Error('Validation conclusion is invalid.')
+  const citedLocations = resolveSourceReferences(finding, input.sourceReferences)
+  if (input.conclusion === 'reportable') requireReportableValidationReferences(citedLocations)
   const record: ValidationRecord = { ...input, conclusion: input.conclusion as ValidationRecord['conclusion'], recordedAt: new Date().toISOString() }
-  finding.validationRecord = record; finding.disposition = input.conclusion; finding.confidence = input.confidence; finding.validation = `${input.method} validation: ${input.directEvidence}`; finding.impact = input.impact; finding.counterevidence = input.counterevidence; finding.evidence.push({ kind: input.method === 'runtime' ? 'runtime' : input.method === 'test' ? 'test' : 'validation', detail: input.directEvidence, location: finding.locations[0] }); finding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition: input.conclusion, summary: finding.validation })
+  const evidenceKind: EvidenceKind = input.method === 'runtime' ? 'runtime' : input.method === 'test' ? 'test' : 'validation'
+  finding.validationRecord = record; finding.disposition = input.conclusion; finding.confidence = input.confidence; finding.validation = `${input.method} validation: ${input.directEvidence}`; finding.impact = input.impact; finding.counterevidence = input.counterevidence; finding.evidence.push(...citedLocations.map((location, index) => ({ kind: evidenceKind, detail: `${input.directEvidence} [receipt citation ${index + 1}/${citedLocations.length}]`, location }))); finding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition: input.conclusion, summary: finding.validation })
   completeTask(scan, candidateId, 'validation', claimToken)
   if (input.conclusion === 'reportable') scan.tasks.push({ id: `task_${randomUUID()}`, candidateId, phase: 'attack_path', focus: `Trace the attacker-to-outcome path for ${finding.title} and calibrate severity from evidence.`, status: 'pending' })
   scan.lifecycle = input.conclusion === 'reportable' ? 'attack_path' : 'validation'; await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); return scan
@@ -82,8 +116,9 @@ export async function recordValidation(config: Config, scanId: string, candidate
 export async function recordAttackPath(config: Config, scanId: string, candidateId: string, input: AttackPathInput, claimToken?: string): Promise<ScanRecord> {
   const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); if (scan.lifecycle === 'completed') throw new Error('Completed scans are immutable. Create a follow-up scan for new attack-path evidence.')
   const finding = candidate(scan, candidateId); requireReportable(finding.disposition)
-  for (const [label, value] of Object.entries(input)) required(value, label)
-  const record: AttackPathRecord = { ...input, recordedAt: new Date().toISOString() }; finding.attackPathRecord = record; finding.attackPath = `${input.dataflow}\n\nAttacker: ${input.attacker}\nOutcome: ${input.outcome}`; finding.ledger.push({ at: new Date().toISOString(), phase: 'attack_path', disposition: 'reportable', summary: input.dataflow }); finding.evidence.push({ kind: 'attack_path', detail: input.dataflow, location: finding.locations[0] }); completeTask(scan, candidateId, 'attack_path', claimToken); scan.lifecycle = 'reporting'; await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); return scan
+  for (const [label, value] of Object.entries(input)) if (label !== 'sourceReferences') required(value as string, label)
+  const citedLocations = resolveSourceReferences(finding, input.sourceReferences); requireAttackPathEndpointReferences(finding, citedLocations)
+  const record: AttackPathRecord = { ...input, recordedAt: new Date().toISOString() }; finding.attackPathRecord = record; finding.attackPath = `${input.dataflow}\n\nAttacker: ${input.attacker}\nOutcome: ${input.outcome}`; finding.ledger.push({ at: new Date().toISOString(), phase: 'attack_path', disposition: 'reportable', summary: input.dataflow }); finding.evidence.push(...citedLocations.map((location, index) => ({ kind: 'attack_path' as const, detail: `${input.dataflow} [receipt citation ${index + 1}/${citedLocations.length}]`, location }))); completeTask(scan, candidateId, 'attack_path', claimToken); scan.lifecycle = 'reporting'; await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); return scan
 }
 
 export async function completeScan(config: Config, scanId: string): Promise<ScanRecord> {
