@@ -142,6 +142,20 @@ test('structured analysis traces request-derived SQL text and excludes parameter
   assert.equal(result.candidates[0]?.line, 2)
 })
 
+test('Java structured analysis traces request streams into ObjectInputStream readObject directly and through local wrappers', () => {
+  const direct = analyzeStructuredFlow([{ file: 'Direct.java', source: 'class Direct {\n Object route(Request request) throws Exception {\n  ObjectInputStream input = new ObjectInputStream(request.getInputStream());\n  return input.readObject();\n }\n}' }], 'java')
+  const wrapped = analyzeStructuredFlow([{ file: 'Wrapped.java', source: 'class Wrapped {\n Object load(InputStream payload) throws Exception {\n  ObjectInputStream input = new ObjectInputStream(payload);\n  return input.readObject();\n }\n Object route(Request request) throws Exception {\n  return load(request.getInputStream());\n }\n}' }], 'java')
+  assert.deepEqual(direct.candidates.map(item => item.rule), ['unsafe-deserialization'])
+  assert.equal(direct.candidates[0]?.evidence.some(item => item.location?.role === 'entrypoint' && item.location.line === 3), true)
+  assert.deepEqual(wrapped.candidates.map(item => item.rule), ['unsafe-deserialization'])
+  assert.equal(wrapped.candidates[0]?.evidence.some(item => item.detail.includes('structured function data-flow') && item.location?.role === 'propagation'), true)
+})
+
+test('Java structured deserialization analysis excludes trusted streams and readObject on non-ObjectInputStream variables', () => {
+  const result = analyzeStructuredFlow([{ file: 'Trusted.java', source: 'class Trusted {\n Object load() throws Exception {\n  ObjectInputStream input = new ObjectInputStream(new ByteArrayInputStream(FIXTURE));\n  return input.readObject();\n }\n Object unrelated() throws Exception {\n  Reader input = source;\n  return input.readObject();\n }\n}' }], 'java')
+  assert.equal(result.candidates.some(item => item.rule === 'unsafe-deserialization'), false)
+})
+
 test('C# structured SSRF analysis does not treat a request body sent to a fixed destination as SSRF', () => {
   const result = analyzeStructuredFlow([{ file: 'Handler.cs', source: 'class Handler {\n void outbound(string body) { client.PostAsync("https://api.example.test/events", body); }\n void route(HttpRequest Request) { outbound(Request.Body); }\n}' }], 'csharp')
   assert.equal(result.candidates.some(item => item.rule === 'ssrf-request-sink'), false)

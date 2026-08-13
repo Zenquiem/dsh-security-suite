@@ -19,6 +19,7 @@ const RULES: Record<Language, Rule[]> = {
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a Java filesystem API.', sink: /\b(?:Files\.(?:readAllBytes|readString|write|newInputStream|newOutputStream)|new\s+FileInputStream|new\s+FileOutputStream)\s*\(/ },
     { id: 'ssrf-request-sink', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data reaches a Java outbound request API.', sink: /\b(?:new\s+URL|URI\.create|RestTemplate\.(?:getForObject|exchange))\s*\(/ },
     { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a Java SQL query-text API.', sink: /\b(?:statement|connection|jdbcTemplate|entityManager)\.(?:execute|executeQuery|executeUpdate|query|createNativeQuery)\s*\(/i },
+    { id: 'unsafe-deserialization', cwe: 'CWE-502', severity: 'high', rationale: 'Request-derived bytes construct an ObjectInputStream whose object graph is deserialized without a proven safe boundary.', sink: /\b[A-Za-z_]\w*\.readObject\s*\(/ },
   ],
   csharp: [
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a .NET process execution API.', sink: /\bProcess\.Start\s*\(/ },
@@ -89,7 +90,12 @@ function calls(value: string): Array<{ name: string; args: string[] }> {
   return results
 }
 
-function sinkTainted(value: string, rule: Rule, tainted: Set<string>, source: RegExp, language: Language): boolean {
+function sinkTainted(value: string, rule: Rule, tainted: Set<string>, source: RegExp, language: Language, deserializers = new Set<string>()): boolean {
+  if (rule.id === 'unsafe-deserialization') {
+    if (language !== 'java') return false
+    const reader = /\b([A-Za-z_]\w*)\.readObject\s*\(/.exec(value)?.[1]
+    return Boolean(reader && deserializers.has(reader))
+  }
   if (rule.id === 'sql-injection-query-construction') {
     rule.sink.lastIndex = 0
     if (!rule.sink.test(value)) return false
@@ -157,6 +163,39 @@ function candidate(rule: Rule, file: string, line: number, excerpt: string, lang
   return { rule: rule.id, severity: rule.severity, file, line, excerpt, rationale: rule.rationale, cwe: rule.cwe, evidence }
 }
 
+function directJavaDeserializationCandidate(rule: Rule, file: string, line: number, excerpt: string, entrypoint: { line: number; excerpt: string }): Candidate {
+  return {
+    rule: rule.id,
+    severity: rule.severity,
+    file,
+    line,
+    excerpt,
+    rationale: rule.rationale,
+    cwe: rule.cwe,
+    evidence: [
+      { kind: 'pattern', detail: 'Java structured deserialization analysis resolved ObjectInputStream.readObject().', location: { file, line, excerpt, role: 'sink' } },
+      { kind: 'context', detail: 'Java structured deserialization analysis resolved request-derived bytes used to construct this ObjectInputStream.', location: { file, line: entrypoint.line, excerpt: entrypoint.excerpt, role: 'entrypoint' } },
+    ],
+  }
+}
+
+function javaRequestDeserializers(fn: FunctionRecord, source: RegExp, parameterTaint = false): Map<string, { line: number; excerpt: string }> {
+  const assignments = fn.lines.map((value, index) => ({ assignment: variableAssignment(value, 'java'), index, value })).filter((item): item is { assignment: { name: string; expression: string }; index: number; value: string } => Boolean(item.assignment))
+  const tainted = new Set(parameterTaint ? fn.params : [])
+  for (let round = 0; round <= assignments.length; round++) {
+    let changed = false
+    for (const item of assignments) if (!tainted.has(item.assignment.name) && sourceTainted(item.assignment.expression, tainted, source)) { tainted.add(item.assignment.name); changed = true }
+    if (!changed) break
+  }
+  const values = new Map<string, { line: number; excerpt: string }>()
+  for (const item of assignments) {
+    if (!/\bnew\s+ObjectInputStream\s*\(/.test(item.assignment.expression)) continue
+    if (!sourceTainted(item.assignment.expression, tainted, source)) continue
+    values.set(item.assignment.name, { line: fn.start + item.index + 1, excerpt: item.value.trim().slice(0, 240) })
+  }
+  return values
+}
+
 /** Trace parameter-to-sink flows through local functions of one language and directory. */
 export function analyzeStructuredFlow(inputs: ModuleInput[], language: Language): StructuredFlowAnalysis {
   const allowed = new Set(EXTENSIONS[language]); const modules = new Map<string, ModuleRecord>(); for (const input of inputs.filter(item => allowed.has(item.file.slice(item.file.lastIndexOf('.'))))) { const file = normalize(input.file); const lines = input.source.split(/\r?\n/); modules.set(file, { file, lines, functions: functions(file, input.source, language) }) }
@@ -174,8 +213,9 @@ export function analyzeStructuredFlow(inputs: ModuleInput[], language: Language)
         for (const item of assignments) if (!tainted.has(item.name) && sourceTainted(item.expression, tainted, source)) { tainted.add(item.name); propagated = true }
         if (!propagated) break
       }
+      const deserializers = new Set([...javaRequestDeserializers(fn, source, true).keys()])
       for (const [offset, value] of fn.lines.entries()) {
-        for (const rule of rules) if (sinkTainted(value, rule, tainted, source, language)) changed = add(fn, parameterIndex, { rule, line: fn.start + offset + 1, excerpt: value.trim().slice(0, 240) }) || changed
+        for (const rule of rules) if (sinkTainted(value, rule, tainted, source, language, deserializers)) changed = add(fn, parameterIndex, { rule, line: fn.start + offset + 1, excerpt: value.trim().slice(0, 240) }) || changed
         for (const call of calls(value)) {
           const target = lookup(fn.file, call.name); if (!target) continue
           for (const [targetIndex] of target.params.entries()) if (call.args[targetIndex] && sourceTainted(call.args[targetIndex], tainted, source)) for (const sink of summaries.get(target.id)?.get(targetIndex) ?? []) changed = add(fn, parameterIndex, sink) || changed
@@ -184,7 +224,19 @@ export function analyzeStructuredFlow(inputs: ModuleInput[], language: Language)
     }
     if (!changed) break
   }
-  const candidates: Candidate[] = []; for (const module of modules.values()) { const tainted = new Set<string>(); const assignments = module.lines.map(value => variableAssignment(value, language)).filter((item): item is { name: string; expression: string } => Boolean(item)); for (let round = 0; round <= assignments.length; round++) { let propagated = false; for (const item of assignments) if (!tainted.has(item.name) && sourceTainted(item.expression, tainted, source)) { tainted.add(item.name); propagated = true }; if (!propagated) break }
+  const candidates: Candidate[] = []
+  if (language === 'java') {
+    const rule = rules.find(item => item.id === 'unsafe-deserialization')
+    if (rule) for (const module of modules.values()) for (const fn of module.functions) {
+      const deserializers = javaRequestDeserializers(fn, source)
+      for (const [offset, value] of fn.lines.entries()) {
+        const reader = /\b([A-Za-z_]\w*)\.readObject\s*\(/.exec(value)?.[1]
+        const entrypoint = reader ? deserializers.get(reader) : undefined
+        if (entrypoint) candidates.push(directJavaDeserializationCandidate(rule, fn.file, fn.start + offset + 1, value.trim().slice(0, 240), entrypoint))
+      }
+    }
+  }
+  for (const module of modules.values()) { const tainted = new Set<string>(); const assignments = module.lines.map(value => variableAssignment(value, language)).filter((item): item is { name: string; expression: string } => Boolean(item)); for (let round = 0; round <= assignments.length; round++) { let propagated = false; for (const item of assignments) if (!tainted.has(item.name) && sourceTainted(item.expression, tainted, source)) { tainted.add(item.name); propagated = true }; if (!propagated) break }
     for (const [line, value] of module.lines.entries()) for (const call of calls(value)) { const target = lookup(module.file, call.name); if (!target) continue; for (const [parameterIndex] of target.params.entries()) if (call.args[parameterIndex] && sourceTainted(call.args[parameterIndex], tainted, source)) for (const sink of summaries.get(target.id)?.get(parameterIndex) ?? []) candidates.push(candidate(sink.rule, target.file, sink.line, sink.excerpt, language, { file: module.file, line: line + 1, excerpt: value.trim().slice(0, 240) })) }
   }
   const unique = new Map<string, Candidate>(); for (const item of candidates) unique.set(`${item.rule}:${item.file}:${item.line}:${item.excerpt}`, item); return { candidates: [...unique.values()] }

@@ -277,6 +277,20 @@ test('directory assessment records Python and Go cross-file data-flow evidence',
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment records request-derived Java ObjectInputStream evidence and excludes trusted fixtures', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'Handler.java'), 'class Handler {\n Object load(InputStream payload) throws Exception {\n  ObjectInputStream input = new ObjectInputStream(payload);\n  return input.readObject();\n }\n Object route(Request request) throws Exception {\n  return load(request.getInputStream());\n }\n Object fixture() throws Exception {\n  ObjectInputStream input = new ObjectInputStream(new ByteArrayInputStream(FIXTURE));\n  return input.readObject();\n }\n}\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'unsafe-deserialization')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.file, 'Handler.java')
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink' && item.location.line === 4), true)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'propagation' && item.location.line === 7), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'java.structured-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment traces Go data flow through a static local-module import', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -471,6 +485,25 @@ test('diff scan traces an added request object into an unchanged local merge wra
     assert.equal(findings[0]?.locations[0]?.file, 'lib/merge.ts')
     assert.equal(findings[0]?.evidence.some(item => item.location?.file === 'route.ts' && item.location.line === 2 && item.location.role === 'propagation'), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces an added Java request stream into an unchanged ObjectInputStream wrapper', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'Handler.java'), 'class Handler {\n Object load(InputStream payload) throws Exception {\n  ObjectInputStream input = new ObjectInputStream(payload);\n  return input.readObject();\n }\n Object route() { return null; }\n}\n')
+    await execFileAsync('git', ['add', 'Handler.java'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'Handler.java'), 'class Handler {\n Object load(InputStream payload) throws Exception {\n  ObjectInputStream input = new ObjectInputStream(payload);\n  return input.readObject();\n }\n Object route(Request request) throws Exception { return load(request.getInputStream()); }\n}\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const findings = scan.findings.filter(item => item.ruleId === 'unsafe.deserialization')
+    assert.equal(findings.length, 1)
+    assert.equal(findings[0]?.locations[0]?.file, 'Handler.java')
+    assert.equal(findings[0]?.locations[0]?.line, 4)
+    assert.equal(findings[0]?.evidence.some(item => item.location?.line === 6 && item.location.role === 'propagation'), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'java.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
