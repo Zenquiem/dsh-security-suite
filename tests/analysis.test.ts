@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { generateHardeningPortfolio, importFindings, importGitHubSecurityFindings, triageFindingBacklog, triageImportedFinding } from '../src/analysis.ts'
+import { generateHardeningPortfolio, importFindings, importGitHubSecurityFindings, importSecurityTickets, triageFindingBacklog, triageImportedFinding } from '../src/analysis.ts'
 import { runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan } from '../src/state.ts'
 
@@ -93,6 +93,41 @@ test('GitHub all-source intake requests each selected REST family without callin
     assert.equal(requests.some(url => url.includes('/dependabot/alerts?classification=malware')), true)
     for (const state of ['triage', 'draft', 'published', 'closed']) assert.equal(requests.some(url => url.includes(`/security-advisories?state=${state}`)), true)
     assert.equal(requests.some(url => /\/issues(?:\?|\/|$)/.test(url)), false)
+  } finally { globalThis.fetch = original }
+})
+
+test('Jira ticket intake is caller-scoped, read-only, and preserves ticket provenance as untrusted evidence', async () => {
+  const original = globalThis.fetch; const requests: Array<{ url: string; method?: string }> = []
+  globalThis.fetch = (async (input, init) => {
+    const url = String(input); requests.push({ url, method: init?.method })
+    assert.match(decodeURIComponent(url), /project = "SEC"/)
+    return Response.json({ issues: [{ key: 'SEC-13', fields: { summary: 'Remote command execution report', description: 'CWE-78 reported by a researcher', priority: { name: 'High' }, status: { name: 'Open' }, components: [{ name: 'api' }] } }] })
+  }) as typeof fetch
+  try {
+    const [ticket] = await importSecurityTickets('jira', 'https://jira.example', 'token', 'SEC')
+    assert.equal(ticket?.inputId, 'jira:SEC-13')
+    assert.equal(ticket?.sourceType, 'scanner_ticket')
+    assert.match(ticket?.description ?? '', /Jira ticket/)
+    assert.equal(ticket?.provenance?.provider, 'jira')
+    assert.equal(requests.length, 1)
+    assert.equal(requests[0]?.method, undefined)
+  } finally { globalThis.fetch = original }
+})
+
+test('Linear ticket intake is a GraphQL query and never turns ticket text into a local conclusion', async () => {
+  const original = globalThis.fetch; let method = ''; let request: { query: string; variables: { teamId: string; query: string } } | undefined
+  globalThis.fetch = (async (_input, init) => {
+    method = init?.method ?? ''; request = JSON.parse(String(init?.body))
+    return Response.json({ data: { issues: { nodes: [{ id: 'linear-1', identifier: 'SEC-8', title: 'Potential SSRF', description: 'CWE-918', url: 'https://linear.app/acme/issue/SEC-8', priority: 2, team: { name: 'Security' }, state: { name: 'Triage' } }] } } })
+  }) as typeof fetch
+  try {
+    const [ticket] = await importSecurityTickets('linear', 'https://linear.example/graphql', 'token', 'team-1', 'SSRF')
+    assert.equal(method, 'POST')
+    assert.match(request?.query ?? '', /DshSecurityTicketIntake/)
+    assert.deepEqual(request?.variables, { teamId: 'team-1', query: 'SSRF' })
+    assert.equal(ticket?.inputId, 'linear:SEC-8')
+    assert.equal(ticket?.sourceType, 'scanner_ticket')
+    assert.match(ticket?.sourcePath ?? '', /^linear:/)
   } finally { globalThis.fetch = original }
 })
 

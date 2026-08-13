@@ -10,6 +10,7 @@ export interface ImportedFinding { id: string; title: string; description: strin
 export interface TriageResult { id: string; importedFindingId: string; target: string; status: 'affected' | 'not_affected' | 'needs_information'; confidence: 'high' | 'medium' | 'low'; rationale: string; evidence: string[]; limitations: string[]; staticAssessment: { exactCandidateMatches: number; requestContextMatches: number }; createdAt: string }
 export interface HardeningResult { id: string; scanId: string; outcome: 'structural_hardening_recommended' | 'local_remediation_preferred'; directory: string; portfolio: string; structured: string; opportunities: number[] }
 export type GitHubFindingSource = 'code_scanning' | 'dependabot' | 'advisories' | 'all'
+export type TicketFindingProvider = 'jira' | 'linear'
 export interface BacklogTriageItem {
   triageItemId: string
   inputId: string
@@ -37,6 +38,7 @@ function stringList(value: unknown): string[] { return list(value).map(text).fil
 function stringValue(value: unknown): string | undefined { const result = typeof value === 'number' && Number.isFinite(value) ? String(value) : text(value); return result || undefined }
 function sourceType(value: unknown): ImportedFinding['sourceType'] { const source = text(value); return ['sarif', 'cve', 'advisory', 'scanner_ticket', 'bug_bounty', 'freeform', 'generic', 'text'].includes(source) ? source as ImportedFinding['sourceType'] : 'generic' }
 function githubHeaders(token: string): Record<string, string> { if (!token.trim()) throw new Error('A GitHub token is required for GitHub security finding intake.'); return { authorization: `Bearer ${token}`, accept: 'application/vnd.github+json', 'user-agent': 'dsh-security-suite' } }
+function ticketHeaders(token: string): Record<string, string> { if (!token.trim()) throw new Error('A provider token is required for security ticket intake.'); return { authorization: `Bearer ${token}`, accept: 'application/json', 'content-type': 'application/json', 'user-agent': 'dsh-security-suite' } }
 function githubRepository(repository: string): [string, string] { const parts = repository.split('/'); if (parts.length !== 2 || !parts[0] || !parts[1]) throw new Error('GitHub intake requires repository in owner/name form.'); return [parts[0], parts[1]] }
 function digestImported(value: unknown): string { return sha256(JSON.stringify(value)) }
 
@@ -129,6 +131,33 @@ export async function importGitHubSecurityFindings(repository: string, source: G
     imported.push(...advisories.map((raw, index) => githubImported(object(raw), index, repository, 'advisories')))
   }
   return imported
+}
+
+function jiraFinding(value: Record<string, unknown>, endpoint: string): ImportedFinding {
+  const fields = object(value.fields); const key = stringValue(value.key) ?? 'unknown'; const description = typeof fields.description === 'string' ? fields.description : JSON.stringify(fields.description ?? '')
+  const url = `${endpoint.replace(/\/$/, '')}/browse/${encodeURIComponent(key)}`
+  return { id: `jira_${sha256(`${endpoint}:${key}`).slice(0, 24)}`, inputId: `jira:${key}`, title: stringValue(fields.summary) ?? `Jira security ticket ${key}`, description: `${description}\n\nJira ticket: ${url}`.trim(), severity: stringValue(object(fields.priority).name), sourceType: 'scanner_ticket', locations: [], sourcePath: `jira://${endpoint.replace(/^https?:\/\//, '')}/${key}`, sourceSha256: digestImported(value), references: [url], component: list(fields.components).map(item => stringValue(object(item).name) ?? '').filter(Boolean).join(', ') || undefined, provenance: { provider: 'jira', key, endpoint, ...(stringValue(fields.status ? object(fields.status).name : undefined) ? { state: stringValue(object(fields.status).name)! } : {}) } }
+}
+
+function linearFinding(value: Record<string, unknown>, endpoint: string): ImportedFinding {
+  const id = stringValue(value.identifier) ?? stringValue(value.id) ?? 'unknown'; const url = stringValue(value.url) ?? endpoint
+  return { id: `linear_${sha256(`${endpoint}:${id}`).slice(0, 24)}`, inputId: `linear:${id}`, title: stringValue(value.title) ?? `Linear security ticket ${id}`, description: `${stringValue(value.description) ?? ''}\n\nLinear ticket: ${url}`.trim(), severity: stringValue(object(value.priorityLabel).name) ?? stringValue(value.priority), sourceType: 'scanner_ticket', locations: [], sourcePath: `linear://${endpoint.replace(/^https?:\/\//, '')}/${id}`, sourceSha256: digestImported(value), references: [url], component: stringValue(object(value.team).name), provenance: { provider: 'linear', identifier: id, endpoint, ...(stringValue(object(value.state).name) ? { state: stringValue(object(value.state).name)! } : {}) } }
+}
+
+/** Read a caller-scoped Jira or Linear ticket set and normalize it as untrusted triage input. */
+export async function importSecurityTickets(provider: TicketFindingProvider, endpoint: string, token: string, project: string, query = ''): Promise<ImportedFinding[]> {
+  const base = endpoint.replace(/\/$/, ''); if (!/^https?:\/\//.test(base)) throw new Error('Ticket intake endpoint must be an absolute HTTP(S) URL.')
+  if (!project.trim()) throw new Error('Ticket intake requires an explicit Jira project or Linear team identifier.')
+  if (provider === 'jira') {
+    const jql = query.trim() || `project = "${project.replace(/"/g, '\\"')}" AND labels = security ORDER BY updated DESC`
+    const response = await fetch(`${base}/rest/api/3/search/jql?maxResults=100&jql=${encodeURIComponent(jql)}`, { headers: ticketHeaders(token) }); const value = object(await response.json().catch(() => ({})))
+    if (!response.ok || !Array.isArray(value.issues)) throw new Error(`Jira security ticket intake failed with HTTP ${response.status}.`)
+    return value.issues.map(object).map(issue => jiraFinding(issue, base))
+  }
+  const queryDocument = `query DshSecurityTicketIntake($teamId: String!, $query: String!) { issues(filter: { team: { id: { eq: $teamId } }, title: { containsIgnoreCase: $query } }, first: 100) { nodes { id identifier title description url priority priorityLabel team { name } state { name } } } }`
+  const response = await fetch(base, { method: 'POST', headers: ticketHeaders(token), body: JSON.stringify({ query: queryDocument, variables: { teamId: project, query: query.trim() || 'security' } }) }); const value = object(await response.json().catch(() => ({}))); const nodes = list(object(object(value.data).issues).nodes)
+  if (!response.ok || !Array.isArray(object(object(value.data).issues).nodes)) throw new Error(`Linear security ticket intake failed with HTTP ${response.status}.`)
+  return nodes.map(object).map(issue => linearFinding(issue, base))
 }
 
 function compatibleRules(imported: ImportedFinding): Set<string> {
