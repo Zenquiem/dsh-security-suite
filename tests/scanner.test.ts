@@ -110,7 +110,7 @@ test('diff scan distinguishes added risks from deleted authorization and input c
     assert.equal(scan.coverage.receipts.length, 1)
     assert.equal(scan.coverage.receipts[0]?.path, 'route.ts')
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'removed-authorization-control')?.matches, 1)
-    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-multilanguage', 'diff-removed-controls'])
+    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-multilanguage', 'diff-ci-workflows', 'diff-removed-controls'])
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
@@ -148,7 +148,7 @@ test('diff scan traces an added request path into an unchanged local JavaScript 
     assert.equal(finding.locations[0]?.file, 'lib/runner.ts')
     assert.equal(finding.evidence.some(item => item.detail.includes('cross-module call-chain') && item.location?.file === 'route.ts' && item.location.line === 2), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
-    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-multilanguage', 'diff-removed-controls'])
+    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-multilanguage', 'diff-ci-workflows', 'diff-removed-controls'])
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
@@ -208,6 +208,46 @@ test('diff scan traces an added Rust request path into an unchanged same-directo
     assert.equal(finding.locations[0]?.file, 'runner.rs')
     assert.equal(finding.evidence.some(item => item.location?.file === 'route.rs' && item.location.line === 2), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'rust.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan reports new GitHub Actions trust-boundary regressions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, '.github', 'workflows'), { recursive: true })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'name: review\non: [pull_request]\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@a5ac7e51b41094c92402da3b24376905380afc29\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'name: review\non:\n  pull_request_target:\npermissions:\n  contents: write\njobs:\n  check:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@main\n      - run: echo "${{ github.event.pull_request.title }}"\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const rules = scan.findings.map(item => item.ruleId).sort()
+    assert.deepEqual(rules, ['ci.mutable.action.ref', 'ci.pull.request.target.write.permissions', 'ci.untrusted.event.shell'])
+    assert.equal(scan.findings.every(item => item.disposition === 'reportable'), true)
+    assert.equal(scan.findings.every(item => item.locations[0]?.file === '.github/workflows/review.yml'), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ci-untrusted-event-shell')?.matches, 1)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ci-pull-request-target-write-permissions')?.matches, 1)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ci-mutable-action-ref')?.matches, 1)
+    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-multilanguage', 'diff-ci-workflows', 'diff-removed-controls'])
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan does not restate an unchanged GitHub Actions workflow risk', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, '.github', 'workflows'), { recursive: true })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'on:\n  pull_request_target:\npermissions:\n  contents: write\njobs:\n  check:\n    steps:\n      - run: echo "${{ github.event.pull_request.title }}"\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'notes.txt'), 'Documentation only\n')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.equal(scan.findings.length, 0)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ci-untrusted-event-shell')?.matches, 0)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

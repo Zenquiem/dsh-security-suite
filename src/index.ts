@@ -263,7 +263,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: 'security_review_diff',
-    description: 'Perform a read-only native Git diff security review. It analyzes added code and added JS/TS, Python, Go, Java, C#, PHP, Ruby, C, C++, or Rust call paths into local sink wrappers, detects deleted authorization or input-validation controls, and preserves changed-file receipts and static evidence.',
+    description: 'Perform a read-only native Git diff security review. It analyzes added code and added JS/TS, Python, Go, Java, C#, PHP, Ruby, C, C++, or Rust call paths into local sink wrappers; detects GitHub Actions pull_request_target trust-boundary regressions and deleted authorization or input-validation controls; and preserves changed-file receipts and static evidence.',
     parameters: {
       base: { type: 'string', description: 'Optional Git base ref. Defaults to the working tree diff.' },
     },
