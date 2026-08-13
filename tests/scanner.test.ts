@@ -110,7 +110,7 @@ test('diff scan distinguishes added risks from deleted authorization and input c
     assert.equal(scan.coverage.receipts.length, 1)
     assert.equal(scan.coverage.receipts[0]?.path, 'route.ts')
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'removed-authorization-control')?.matches, 1)
-    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-js-ts', 'diff-removed-controls'])
+    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-multilanguage', 'diff-removed-controls'])
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
@@ -148,7 +148,7 @@ test('diff scan traces an added request path into an unchanged local JavaScript 
     assert.equal(finding.locations[0]?.file, 'lib/runner.ts')
     assert.equal(finding.evidence.some(item => item.detail.includes('cross-module call-chain') && item.location?.file === 'route.ts' && item.location.line === 2), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
-    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-js-ts', 'diff-removed-controls'])
+    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-multilanguage', 'diff-removed-controls'])
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
@@ -165,6 +165,49 @@ test('diff scan does not restate an unchanged JavaScript source-to-sink path', a
     const scan = await runDiffScan(root, undefined, '')
     assert.equal(scan.findings.length, 0)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 0)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces added Python and Go request paths into unchanged local wrappers', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'py_runner.py'), 'import subprocess\ndef execute(command):\n    subprocess.run(command, shell=True)\n')
+    await writeFile(join(root, 'py_route.py'), 'def route():\n    return "ok"\n')
+    await writeFile(join(root, 'go_runner.go'), 'package app\nfunc Execute(command string) { exec.Command("sh", "-c", command) }\n')
+    await writeFile(join(root, 'go_route.go'), 'package app\nfunc Route() string { return "ok" }\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'py_route.py'), 'from py_runner import execute\ndef route():\n    execute(request.args.get("cmd"))\n')
+    await writeFile(join(root, 'go_route.go'), 'package app\nfunc Route(r Request) { Execute(r.FormValue("cmd")) }\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const shells = scan.findings.filter(item => item.ruleId === 'shell.command.construction')
+    assert.equal(shells.some(item => item.locations[0]?.file === 'py_runner.py' && item.evidence.some(evidence => evidence.location?.file === 'py_route.py' && evidence.location.line === 3)), true)
+    assert.equal(shells.some(item => item.locations[0]?.file === 'go_runner.go' && item.evidence.some(evidence => evidence.location?.file === 'go_route.go' && evidence.location.line === 2)), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'python.diff-semantic-taint')?.matches, 1)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'go.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces an added Rust request path into an unchanged same-directory wrapper', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'runner.rs'), 'pub fn execute(command: String) {\n Command::new(command);\n}\n')
+    await writeFile(join(root, 'route.rs'), 'async fn route() {}\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'route.rs'), 'async fn route(req: Request) {\n execute(req.query("cmd"));\n}\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const finding = scan.findings.find(item => item.ruleId === 'shell.command.construction')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.file, 'runner.rs')
+    assert.equal(finding.evidence.some(item => item.location?.file === 'route.rs' && item.location.line === 2), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'rust.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
