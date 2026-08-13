@@ -82,7 +82,7 @@ config:
   maxFileBytes: 262144
 ```
 
-The native engine confines repository and knowledge-base arguments to the active workspace, forwards cancellation, seals canonical artifacts, and places state under `DSH_SECURITY_SUITE_STATE_DIR` or `stateDir` (default: `~/.dsh-security-suite`).
+The native engine confines repository and knowledge-base arguments to the active workspace, forwards cancellation, seals the entire retained evidence directory (including deep-worker, coverage, canonical-model, and closure records), and rejects completed bundles with altered, missing, or unregistered evidence files. State is placed under `DSH_SECURITY_SUITE_STATE_DIR` or `stateDir` (default: `~/.dsh-security-suite`).
 
 ## Attribution
 

@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { createDeepClosureJob, createDeepDiscoveryJob, getDeepWorklist, loadDeepDiscoveryJob, readDeepSource, readScanSource, reportDeepCandidate, reportDeepWorker, runDeepClosure, runDeepDiscovery } from '../src/deep-discovery.ts'
 import { runScan } from '../src/scanner.ts'
-import { loadScan, saveScan } from '../src/state.ts'
+import { finalizeAndSaveScan, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
 import { claimAuditTask, recordAttackPath, recordValidation } from '../src/workbench.ts'
 
 test('deep candidate reports require the exact active worker token and readable source location', async () => {
@@ -197,6 +197,38 @@ test('deep closure binds the canonical model synthesized from complete delegated
     const closure = await createDeepClosureJob(config, scan.id, 'validation')
     assert.equal(closure.threatModel.source, 'canonical_deep_discovery')
     assert.equal(closure.threatModel.digest, result.canonicalThreatModel?.digest)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('final deep bundles seal every retained worker, coverage, model, and closure artifact', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    const discovery = await createDeepDiscoveryJob(config, scan.id, 1)
+    await runDeepDiscovery(deepWorkerContext(config, true).ctx as never, config, discovery.id)
+    const validation = await createDeepClosureJob(config, scan.id, 'validation')
+    await runDeepClosure(deepClosureContext(config, 'validation').ctx as never, config, validation.id)
+    const attack = await createDeepClosureJob(config, scan.id, 'attack_path')
+    await runDeepClosure(deepClosureContext(config, 'attack_path').ctx as never, config, attack.id)
+    const completed = await loadScan(state, scan.id)
+    completed.lifecycle = 'completed'; completed.completedAt = new Date().toISOString()
+    await finalizeAndSaveScan(state, completed)
+    const sealed = await loadScan(state, scan.id)
+    const verified = await verifyScanBundle(sealed)
+    assert.equal(verified.valid, true, verified.errors.join('\n'))
+    const manifest = JSON.parse(await readFile(join(sealed.artifacts.directory, sealed.artifacts.manifest!), 'utf8')) as { scan: { artifacts: Array<{ path: string }> } }
+    const paths = new Set(manifest.scan.artifacts.map(item => item.path))
+    assert.equal(paths.has('artifacts/01_context/deep_canonical_threat_model.md'), true)
+    assert.equal([...paths].some(path => path.includes('artifacts/02_discovery/deep/round-01/worker_1_1/coverage.json')), true)
+    assert.equal([...paths].some(path => path.includes(`deep-validation-closure-${validation.id}.json`)), true)
+    assert.equal([...paths].some(path => path.includes(`deep-attack_path-closure-${attack.id}.json`)), true)
+    await writeFile(join(sealed.artifacts.directory, 'artifacts', '04_reconciliation', 'late-evidence.json'), '{}\n')
+    const afterAddition = await verifyScanBundle(sealed)
+    assert.equal(afterAddition.valid, false)
+    assert.equal(afterAddition.errors.some(error => error.includes('late-evidence.json')), true)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

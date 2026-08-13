@@ -156,10 +156,42 @@ function coverageDocument(scan: ScanRecord): Record<string, unknown> {
 function manifestDocument(scan: ScanRecord, artifacts: Array<{ path: string; sha256: string; mediaType: string }>): Record<string, unknown> {
   return {
     documentType: 'dsh-security-suite.scan-manifest', schemaVersion: '1.0',
-    scan: { id: scan.id, producer: { name: 'dsh-security-suite', version: '0.35.0' }, status: 'completed', startedAt: scan.createdAt, completedAt: scan.completedAt, sealedAt: scan.completedAt, target: scan.targetSnapshot,
+    scan: { id: scan.id, producer: { name: 'dsh-security-suite', version: '0.36.0' }, status: 'completed', startedAt: scan.createdAt, completedAt: scan.completedAt, sealedAt: scan.completedAt, target: scan.targetSnapshot,
       scope: { includePaths: ['.'], excludePaths: scan.coverage.exclusions, summary: `${scan.coverage.reviewedFiles} source files reviewed.`, limitations: scan.coverage.deferred.map(item => item.reason) },
       threatModel: { summary: scan.threatModel }, coverageRef: 'coverage.json', findingsRef: 'findings.json', artifacts },
   }
+}
+
+type ArtifactDescriptor = { path: string; sha256: string; mediaType: string }
+
+function mediaTypeForArtifact(path: string): string {
+  if (path.endsWith('.json') || path.endsWith('.jsonl') || path.endsWith('.sarif')) return 'application/json'
+  return 'text/markdown'
+}
+
+/**
+ * Freeze every regular evidence file rather than maintaining a hand-written
+ * allowlist. Deep worker receipts and closure records are produced outside the
+ * baseline bundle writer, so an allowlist could accidentally omit them.
+ */
+async function inventoryArtifacts(record: ScanRecord, exclude: Set<string> = new Set()): Promise<ArtifactDescriptor[]> {
+  const root = resolve(record.artifacts.directory)
+  const paths: string[] = []
+  const visit = async (directory: string): Promise<void> => {
+    const entries = await readdir(directory, { withFileTypes: true })
+    for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
+      const absolute = join(directory, entry.name)
+      if (entry.isSymbolicLink()) throw new Error(`Artifact inventory refuses symbolic link: ${relative(root, absolute)}`)
+      if (entry.isDirectory()) { await visit(absolute); continue }
+      if (!entry.isFile()) continue
+      const path = relative(root, absolute).replaceAll('\\', '/')
+      if (!exclude.has(path)) paths.push(path)
+    }
+  }
+  await visit(root)
+  const descriptors: ArtifactDescriptor[] = []
+  for (const path of paths.sort((left, right) => left.localeCompare(right))) descriptors.push({ path, sha256: sha256(await readArtifact(record, path)), mediaType: mediaTypeForArtifact(path) })
+  return descriptors
 }
 
 export async function persistScanBundle(stateDir: string, record: ScanRecord): Promise<ScanRecord> {
@@ -167,12 +199,11 @@ export async function persistScanBundle(stateDir: string, record: ScanRecord): P
   const root = resolve(record.artifacts.directory); await mkdir(root, { recursive: true }); await persistFindingWriteups(record)
   const hardening = await generateDerivedHardening(record)
   record.hardening = hardening && { ...hardening, generatedAt: new Date().toISOString() }
-  const findingPaths = await Promise.all(record.findings.map(async finding => {
+  await Promise.all(record.findings.map(async finding => {
     const base = `artifacts/05_findings/${finding.candidateId}`
     await writeArtifact(record, `${base}/candidate_ledger.jsonl`, `${finding.ledger.map(row => JSON.stringify(row)).join('\n')}\n`)
     if (finding.validationRecord) await writeArtifact(record, `${base}/validation_report.md`, renderValidationReport(finding))
     if (finding.attackPathRecord) await writeArtifact(record, `${base}/attack_path_analysis_report.md`, renderAttackPathReport(finding))
-    return `${base}/candidate_ledger.jsonl`
   }))
   await writeArtifact(record, 'artifacts/01_context/security_guidance.md', record.policyGuidance)
   await writeArtifact(record, 'artifacts/01_context/threat_model.md', record.threatModel)
@@ -186,13 +217,11 @@ export async function persistScanBundle(stateDir: string, record: ScanRecord): P
   await writeArtifact(record, 'artifacts/03_coverage/reviewed_surfaces.json', json(record.coverage.surfaces))
   const coverageRef = await writeArtifact(record, 'coverage.json', json(coverageDocument(record)))
   const findingsRef = await writeArtifact(record, 'findings.json', json(findingsDocument(record)))
-  const artifactRefs = [...new Set(['coverage.json', 'findings.json', 'artifacts/01_context/security_guidance.md', 'artifacts/01_context/threat_model.md', 'artifacts/02_discovery/finding_discovery_report.md', 'artifacts/02_discovery/audit_tasks.json', 'artifacts/03_coverage/reviewed_surfaces.json', ...record.tasks.map(task => `artifacts/04_reconciliation/tasks/${task.id}.md`), ...findingPaths, ...record.findings.flatMap(finding => finding.writeup ? [finding.writeup.reportPath] : [])])]
-  const artifacts: Array<{ path: string; sha256: string; mediaType: string }> = []
-  for (const path of artifactRefs) artifacts.push({ path, sha256: sha256(await readArtifact(record, path)), mediaType: path.endsWith('.json') || path.endsWith('.jsonl') ? 'application/json' : 'text/markdown' })
-  await writeArtifact(record, 'scan-manifest.json', json(manifestDocument(record, artifacts)))
   record.artifacts = { directory: root, manifest: 'scan-manifest.json', findings: findingsRef, coverage: coverageRef, report: 'report.md' }
   record.seal = sealScan(record)
   await writeArtifact(record, 'report.md', renderMarkdownReport(record))
+  const artifacts = await inventoryArtifacts(record, new Set(['scan-manifest.json']))
+  await writeArtifact(record, 'scan-manifest.json', json(manifestDocument(record, artifacts)))
   return record
 }
 
@@ -270,7 +299,13 @@ export async function verifyScanBundle(record: ScanRecord): Promise<{ valid: boo
           seen.add(item.path)
           try { if (sha256(await readArtifact(record, item.path)) !== item.sha256) errors.push(`Artifact digest mismatch: ${item.path}.`) } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
         }
-        for (const canonical of [record.artifacts.findings, record.artifacts.coverage]) if (canonical && !seen.has(canonical)) errors.push(`Manifest does not seal canonical artifact ${canonical}.`)
+        for (const canonical of [record.artifacts.findings, record.artifacts.coverage, record.artifacts.report]) if (canonical && !seen.has(canonical)) errors.push(`Manifest does not seal canonical artifact ${canonical}.`)
+        try {
+          const actual = await inventoryArtifacts(record, new Set([record.artifacts.manifest]))
+          const actualPaths = new Set(actual.map(item => item.path))
+          for (const item of actual) if (!seen.has(item.path)) errors.push(`Manifest does not seal retained artifact ${item.path}.`)
+          for (const path of seen) if (!actualPaths.has(path)) errors.push(`Manifest references missing retained artifact ${path}.`)
+        } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
       }
     } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
   }
