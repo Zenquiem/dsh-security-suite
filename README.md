@@ -6,6 +6,8 @@
 
 The plugin owns its scan orchestration, evidence model, persistent workbench, export formats, remediation workflow, and DSH tool surface. It has no external security-engine SDK, CLI, credential, or hosted runtime dependency.
 
+Deep workers are DSH-native child agents. Their scoped tool view is restricted to the immutable worklist, bounded source reads whose digest matches that worklist, candidate submission, and coverage closure. They cannot use remediation, tracking, validation, or general plugin tools during delegated discovery.
+
 ## Capability Matrix
 
 | Workflow | DSH Security Suite capability |
@@ -22,7 +24,7 @@ The plugin owns its scan orchestration, evidence model, persistent workbench, ex
 
 The plugin does not require an external security vendor credential. Any future GitHub, Jira, or Linear write integration remains explicitly approval-gated and must use the user-configured provider credentials.
 
-Deep delegated discovery is available only through DSH's native agent runtime. `security_deep_discovery_capability` reports whether the active profile can provide that runtime. `security_start_deep_discovery` then creates exactly six independent worker agents per round and only records saturation after a fully completed round produces no new source-backed candidates. If the installed DSH profile cannot create or drive subagents, the job fails explicitly; it does not substitute a local static pass or any external agent runtime.
+Deep delegated discovery is available only through DSH's native agent runtime. `security_deep_discovery_capability` reports whether the active profile can provide that runtime. `security_start_deep_discovery` creates exactly six independent worker agents per round. All workers receive one immutable, exhaustive source worklist and must submit an independent threat model, a closure for every worklist row, source-backed candidates, and explicit deferrals. The suite saves worker artifacts, coverage ledger, reconciliation records, and absorbed-candidate provenance before it can record saturation after a fully completed zero-novelty round. If the installed DSH profile cannot create or drive subagents, the job fails explicitly; it does not substitute a local static pass or any external agent runtime.
 
 ## Native Operation
 

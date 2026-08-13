@@ -32,3 +32,28 @@ test('AST analysis does not treat static sensitive calls as request-derived find
   `, 'static.ts')
   assert.equal(result.candidates.length, 0)
 })
+
+test('AST analysis follows request input through named local helper calls to a sensitive sink', () => {
+  const result = analyzeJavaScriptAst(`
+    function executeTemplate(command) { exec(command) }
+    function route(req) {
+      const command = req.query.command
+      executeTemplate(command)
+    }
+  `, 'helpers.ts')
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.rule, 'shell-command-construction')
+  assert.equal(result.candidates[0]?.line, 2)
+  assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('call-chain analysis')), true)
+})
+
+test('AST analysis follows named local wrapper chains without treating static helper calls as tainted', () => {
+  const result = analyzeJavaScriptAst(`
+    const executeTemplate = (command) => exec(command)
+    function wrapper(value) { executeTemplate(value) }
+    function route(req) { wrapper(req.query.command) }
+    wrapper('git --version')
+  `, 'wrappers.ts')
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.rule, 'shell-command-construction')
+})
