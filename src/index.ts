@@ -6,8 +6,10 @@ import { SECURITY_REVIEW_GUIDANCE } from './prompt.js'
 import { FULL_SECURITY_WORKFLOW } from './workflows.js'
 import { generateSourceThreatModel, runDiffScan, runScan, resolveSafeTarget } from './scanner.js'
 import { finalizeAndSaveScan, getStateDir, listScans, loadScan, persistInvestigationArtifacts, renderCsv, renderMarkdownReport, saveTriageAnnotation, saveScan, toSarif, verifyScanBundle } from './state.js'
-import { bulkScan, installPreCommitHook, remediationPlan, rerunSavedScan } from './operations.js'
+import { applyRemediationProposal, bulkScan, installPreCommitHook, remediationPlan, rerunSavedScan, runIsolatedValidation } from './operations.js'
 import { claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation } from './workbench.js'
+import { generateHardeningPortfolio, importFindings, triageImportedFinding } from './analysis.js'
+import { createTracking, previewTracking } from './tracking.js'
 
 export const name = 'dsh-security-suite'
 export const inject = ['tools', 'systemPrompt']
@@ -22,6 +24,30 @@ export function apply(ctx: Context, config: PluginConfig): void {
     text: SECURITY_REVIEW_GUIDANCE,
   })
   ctx.systemPrompt.section({ name: 'dsh-security-suite:workflow', order: 161, text: FULL_SECURITY_WORKFLOW })
+
+  ctx.tools.register(defineTool({
+    name: 'security_import_findings', description: 'Import JSON or text security findings from a workspace file. Imported material is treated as untrusted evidence and must be triaged against local source before it becomes a repository-impact conclusion.', parameters: { path: { type: 'string', required: true, description: 'Workspace-relative JSON or text finding file.' } },
+    output: { schema: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' }, description: { type: 'string' }, sourcePath: { type: 'string' }, sourceSha256: { type: 'string' } }, required: ['id', 'title', 'description', 'sourcePath', 'sourceSha256'], additionalProperties: false } }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return importFindings(process.cwd(), args.path) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_triage_imported_finding', description: 'Triage one imported finding against local source. It returns affected, not_affected, or needs_information with source evidence and limitations; it does not silently convert third-party text into a confirmed finding.', parameters: { imported_finding: { type: 'object', required: true, additionalProperties: true, description: 'One object returned by security_import_findings.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, importedFindingId: { type: 'string' }, status: { type: 'string' }, confidence: { type: 'string' }, rationale: { type: 'string' }, evidence: { type: 'array', items: { type: 'string' } }, limitations: { type: 'array', items: { type: 'string' } } }, required: ['id', 'importedFindingId', 'status', 'confidence', 'rationale', 'evidence', 'limitations'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return triageImportedFinding(process.cwd(), config, args.imported_finding as unknown as Parameters<typeof triageImportedFinding>[2]) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_hardening_proposal', description: 'Generate a source- and scan-evidence-backed hardening portfolio. It distinguishes structural opportunities from cases where local remediation is proportionate, and records options with explicit tradeoffs.', parameters: { scan_id: { type: 'string', required: true, description: 'Completed saved scan identifier.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, scanId: { type: 'string' }, outcome: { type: 'string' }, portfolio: { type: 'string' }, structured: { type: 'string' }, opportunities: { type: 'array', items: { type: 'number' } } }, required: ['id', 'scanId', 'outcome', 'portfolio', 'structured', 'opportunities'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return generateHardeningPortfolio(config, args.scan_id) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_run_validation', description: 'Run one explicit test or build command in an isolated temporary copy of a saved scan target. The source tree is never modified; stdout, stderr, timeout, snapshot, and exit code are retained as evidence.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, command: { type: 'string', required: true, description: 'Simple test or build command without shell operators.' }, timeout_ms: { type: 'number', description: 'Timeout from 1,000 to 600,000 ms; default 120,000.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, command: { type: 'string' }, exitCode: { type: 'number' }, timedOut: { type: 'boolean' }, durationMs: { type: 'number' }, stdout: { type: 'string' }, stderr: { type: 'string' }, snapshotDigest: { type: 'string' }, artifactRef: { type: 'string' } }, required: ['id', 'command', 'timedOut', 'durationMs', 'stdout', 'stderr', 'snapshotDigest'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return runIsolatedValidation(process.cwd(), config, args.scan_id, args.command, args.timeout_ms ?? 120_000) },
+  }))
 
   ctx.tools.register(defineTool({
     name: 'security_assess',
@@ -198,8 +224,14 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: 'security_remediation_plan', description: 'Generate a review-required patch proposal for one saved finding. It never modifies source files.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Finding identifier.' } },
-    output: { schema: { type: 'object', properties: { findingId: { type: 'string' }, file: { type: 'string' }, line: { type: 'number' }, patch: { type: 'string' }, requiresReview: { type: 'boolean' } }, required: ['findingId', 'file', 'line', 'patch', 'requiresReview'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.patch ?? '' }] },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, findingId: { type: 'string' }, file: { type: 'string' }, line: { type: 'number' }, patch: { type: 'string' }, baseSnapshotDigest: { type: 'string' }, status: { type: 'string' }, requiresApproval: { type: 'boolean' }, requiresReview: { type: 'boolean' } }, required: ['id', 'findingId', 'file', 'line', 'patch', 'baseSnapshotDigest', 'status', 'requiresApproval', 'requiresReview'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.patch ?? '' }] },
     async execute(args) { return remediationPlan(process.cwd(), config, args.scan_id, args.finding_id) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_apply_remediation', description: 'Apply one generated remediation only after explicit approval. It rejects stale targets, writes the exact safe replacement, then runs a focused native rescan and records the verification scan.', parameters: { scan_id: { type: 'string', required: true, description: 'Source scan identifier.' }, remediation_id: { type: 'string', required: true, description: 'Identifier from security_remediation_plan.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the patch and approving the source change.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, findingId: { type: 'string' }, status: { type: 'string' }, appliedAt: { type: 'string' }, verificationScanId: { type: 'string' } }, required: ['id', 'findingId', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return applyRemediationProposal(process.cwd(), config, args.scan_id, args.remediation_id, args.approved) },
   }))
 
   ctx.tools.register(defineTool({
@@ -209,8 +241,14 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_tracking_preview', description: 'Create an exact Markdown preview for a GitHub, Jira, or Linear finding ticket. This tool never creates an external issue.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Finding identifier.' }, provider: { type: 'string', required: true, enum: ['github', 'jira', 'linear'], description: 'Proposed external tracker.' } },
-    output: { schema: { type: 'object', properties: { provider: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, requiresApproval: { type: 'boolean' } }, required: ['provider', 'title', 'body', 'requiresApproval'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: `${value.title ?? ''}\n\n${value.body ?? ''}` }] },
-    async execute(args) { const scan = await loadScan(getStateDir(config.stateDir), args.scan_id); const finding = scan.findings.find(item => item.id === args.finding_id); if (!finding) throw new Error('Finding was not found in this scan.'); const body = `## ${finding.title}\n\n- Severity: ${finding.severity}\n- CWE: ${finding.cwe}\n- Confidence: ${finding.confidence}\n- Location: ${finding.locations[0].file}:${finding.locations[0].line}\n\n${finding.rootCause}\n\n### Attack Path\n${finding.attackPath}\n\n### Impact\n${finding.impact}\n\n### Remediation\n${finding.remediation}`; return { provider: args.provider, title: `[${finding.severity.toUpperCase()}] ${finding.title}`, body, requiresApproval: true } },
+    name: 'security_tracking_preview', description: 'Build an exact GitHub, Jira, or Linear issue preview. With a configured GitHub token it performs read-only duplicate lookup; it never creates an external issue.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Reportable finding identifier.' }, provider: { type: 'string', required: true, enum: ['github', 'jira', 'linear'], description: 'External tracker.' }, repository: { type: 'string', description: 'GitHub repository owner/name.' }, token: { type: 'string', description: 'Optional provider token for GitHub duplicate lookup.' } },
+    output: { schema: { type: 'object', properties: { provider: { type: 'string' }, title: { type: 'string' }, body: { type: 'string' }, duplicates: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, title: { type: 'string' }, url: { type: 'string' } }, required: ['id', 'title'], additionalProperties: false } }, requiresApproval: { type: 'boolean' } }, required: ['provider', 'title', 'body', 'duplicates', 'requiresApproval'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: `${value.title ?? ''}\n\n${value.body ?? ''}` }] },
+    async execute(args) { return previewTracking(config, { provider: args.provider as 'github' | 'jira' | 'linear', scanId: args.scan_id, findingId: args.finding_id, repository: args.repository, token: args.token }) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_create_tracking_issue', description: 'Create exactly one GitHub, Jira, or Linear issue only after explicit approval. It performs duplicate detection when available and persists a local receipt.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Reportable finding identifier.' }, provider: { type: 'string', required: true, enum: ['github', 'jira', 'linear'], description: 'External tracker.' }, token: { type: 'string', required: true, description: 'Provider credential used only for this request.' }, repository: { type: 'string', description: 'GitHub repository owner/name.' }, endpoint: { type: 'string', description: 'Jira base URL or Linear GraphQL endpoint.' }, project: { type: 'string', description: 'Jira project key or Linear team id.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing security_tracking_preview output.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, provider: { type: 'string' }, status: { type: 'string' }, externalId: { type: 'string' }, url: { type: 'string' }, duplicateOf: { type: 'string' }, error: { type: 'string' } }, required: ['id', 'provider', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return createTracking(config, { provider: args.provider as 'github' | 'jira' | 'linear', scanId: args.scan_id, findingId: args.finding_id, token: args.token, repository: args.repository, endpoint: args.endpoint, project: args.project, approved: args.approved }) },
   }))
 }

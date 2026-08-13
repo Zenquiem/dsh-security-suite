@@ -100,6 +100,12 @@ export async function assessDirectory(directory: string, limits: ScanLimits, dee
   return { root, filesScanned: files.length, filesSkipped: skipped, candidates, receipts: fileReceipts, ruleReceipts, policyFiles, complete }
 }
 
+export async function snapshotDigestForDirectory(directory: string, limits: ScanLimits): Promise<string> {
+  const result = await assessDirectory(directory, limits)
+  const inventory = result.receipts.slice().sort((a, b) => a.path.localeCompare(b.path)).map(receipt => `${receipt.path}\0${receipt.sha256}`).join('\n')
+  return `dsh-security-suite-snapshot/v1:sha256:${sha256(inventory)}`
+}
+
 function slug(value: string): string { return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'root-control' }
 
 function candidateToFinding(candidate: Candidate): Finding {
