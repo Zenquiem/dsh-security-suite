@@ -157,6 +157,26 @@ test('diff scan distinguishes added risks from deleted authorization and input c
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
+test('open diff investigations retain candidates but require independent validation before reportability', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-open-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'route.ts'), 'const result = "safe"\n')
+    await execFileAsync('git', ['add', 'route.ts'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'route.ts'), 'const script = req.query.code\neval(script)\n')
+    const scan = await runDiffScan(root, undefined, '', state, false)
+    assert.equal(scan.lifecycle, 'validation')
+    assert.equal(scan.findings.length, 1)
+    assert.equal(scan.findings[0]?.disposition, 'discovered')
+    assert.equal(scan.findings[0]?.ledger.some(row => row.phase === 'validation'), false)
+    assert.equal(scan.tasks.length, 1)
+    assert.equal(scan.coverage.surfaces[0]?.disposition, 'needs_follow_up')
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
 test('diff scan does not classify ordinary deleted code as a removed security control', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
   try {

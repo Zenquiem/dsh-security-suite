@@ -164,8 +164,8 @@ export async function rerunSavedScan(workspace: string, config: Config, scanId: 
   if (previous.mode === 'diff') throw new Error('Diff scans must be rerun with security_review_diff so the requested base can be supplied explicitly.')
   const root = resolve(workspace); const target = resolve(previous.target)
   if (!inside(root, target)) throw new Error('Saved scan target is outside the active workspace.')
-  const scan = await runScan(target, config, previous.mode, previous.threatModel, previous.recipe.scopeRequested, config.stateDir)
-  await finalizeAndSaveScan(getStateDir(config.stateDir), scan)
+  const scan = await runScan(target, config, previous.mode, previous.threatModel, previous.recipe.scopeRequested, config.stateDir, false)
+  await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan)
   return scan
 }
 
@@ -177,7 +177,7 @@ export async function bulkScan(workspace: string, config: Config, paths: string[
     while (true) {
       const index = cursor++; if (index >= unique.length) return
       const item = unique[index]
-      try { const scan = await runScan(resolveSafeTarget(workspace, item), config, mode, threatModel, true, config.stateDir); await finalizeAndSaveScan(getStateDir(config.stateDir), scan); output[index] = { path: item, scanId: scan.id, findings: scan.findings.filter(finding => finding.disposition === 'reportable').length } } catch (error) { output[index] = { path: item, error: error instanceof Error ? error.message : String(error) } }
+      try { const scan = await runScan(resolveSafeTarget(workspace, item), config, mode, threatModel, true, config.stateDir, false); await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan); output[index] = { path: item, scanId: scan.id, findings: scan.findings.length } } catch (error) { output[index] = { path: item, error: error instanceof Error ? error.message : String(error) } }
     }
   }
   await Promise.all(Array.from({ length: Math.min(capped, unique.length) }, worker)); return output
@@ -195,7 +195,7 @@ async function executeBulkJob(workspace: string, config: Config, job: BulkJob, c
     while (true) {
       const index = cursor++; const entry = job.entries[index]; if (!entry) return; if (entry.status === 'completed') continue
       entry.attempts++; entry.error = undefined
-      try { const target = resolveSafeTarget(workspace, entry.path); const targetInfo = await access(target).then(() => true).catch(() => false); if (!targetInfo) throw new Error('Bulk target directory does not exist or cannot be accessed.'); const scan = await runScan(target, config, job.mode, job.threatModel, true, config.stateDir); await finalizeAndSaveScan(state, scan); entry.scanId = scan.id; entry.findings = scan.findings.filter(finding => finding.disposition === 'reportable').length; entry.status = 'completed' } catch (error) { entry.status = 'failed'; entry.error = error instanceof Error ? error.message : String(error) }
+      try { const target = resolveSafeTarget(workspace, entry.path); const targetInfo = await access(target).then(() => true).catch(() => false); if (!targetInfo) throw new Error('Bulk target directory does not exist or cannot be accessed.'); const scan = await runScan(target, config, job.mode, job.threatModel, true, config.stateDir, false); await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); entry.scanId = scan.id; entry.findings = scan.findings.length; entry.status = 'completed' } catch (error) { entry.status = 'failed'; entry.error = error instanceof Error ? error.message : String(error) }
       await saveBulkJob(state, job)
     }
   }

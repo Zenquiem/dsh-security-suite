@@ -240,7 +240,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: 'security_assess',
-    description: 'Perform a read-only security candidate scan of a directory inside the current workspace.',
+    description: 'Perform a read-only security candidate scan of a directory inside the current workspace. It returns a saved investigation id; candidates still require validation before they can be reported.',
     parameters: {
       path: { type: 'string', description: 'Optional workspace-relative directory. Defaults to the current workspace root.' },
     },
@@ -248,6 +248,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
       schema: {
         type: 'object',
         properties: {
+          scanId: { type: 'string' },
           filesScanned: { type: 'number' },
           filesSkipped: { type: 'number' },
           candidates: {
@@ -267,7 +268,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
             },
           },
         },
-        required: ['filesScanned', 'filesSkipped', 'candidates'],
+        required: ['scanId', 'filesScanned', 'filesSkipped', 'candidates'],
         additionalProperties: false,
       },
       render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }],
@@ -275,9 +276,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
     async execute(args) {
       const workspace = process.cwd()
       const target = resolveSafeTarget(workspace, args.path)
-      const scan = await runScan(target, config, 'standard', '', args.path !== undefined, config.stateDir)
-      await finalizeAndSaveScan(getStateDir(config.stateDir), scan)
-      return { filesScanned: scan.coverage.reviewedFiles, filesSkipped: scan.coverage.skippedFiles, candidates: scan.findings.map(finding => ({ rule: finding.ruleId, severity: finding.severity, file: finding.locations[0].file, line: finding.locations[0].line, excerpt: finding.locations[0].excerpt, rationale: finding.rootCause })) }
+      const scan = await runScan(target, config, 'standard', '', args.path !== undefined, config.stateDir, false)
+      await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan)
+      return { scanId: scan.id, filesScanned: scan.coverage.reviewedFiles, filesSkipped: scan.coverage.skippedFiles, candidates: scan.findings.map(finding => ({ rule: finding.ruleId, severity: finding.severity, file: finding.locations[0].file, line: finding.locations[0].line, excerpt: finding.locations[0].excerpt, rationale: finding.rootCause })) }
     },
   }))
 
@@ -373,7 +374,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: 'security_review_diff',
-    description: 'Perform a read-only native Git diff security review. It analyzes added code and added JS/TS, Python, Go, Java, C#, PHP, Ruby, C, C++, or Rust call paths into local sink wrappers; detects GitHub Actions pull_request_target shell interpolation, broad permissions, mutable action references, and pull-request-head checkout before execution; detects deleted authorization or input-validation controls; and preserves changed-file receipts and static evidence.',
+    description: 'Perform a read-only native Git diff candidate review. It analyzes added code and added JS/TS, Python, Go, Java, C#, PHP, Ruby, C, C++, or Rust call paths into local sink wrappers; detects GitHub Actions pull_request_target shell interpolation, broad permissions, mutable action references, and pull-request-head checkout before execution; detects deleted authorization or input-validation controls; saves a validation investigation; and never auto-confirms static candidates.',
     parameters: {
       base: { type: 'string', description: 'Optional Git base ref. Defaults to the working tree diff.' },
     },
@@ -381,28 +382,29 @@ export function apply(ctx: Context, config: PluginConfig): void {
       schema: {
         type: 'object',
         properties: {
+          scanId: { type: 'string' },
           mode: { type: 'string' },
           diff: { type: 'string' },
           truncated: { type: 'boolean' },
         },
-        required: ['mode', 'diff', 'truncated'],
+        required: ['scanId', 'mode', 'diff', 'truncated'],
         additionalProperties: false,
       },
       render: (_args, value) => [{ type: 'text', text: value.diff ?? '' }],
     },
     async execute(args) {
-      const scan = await runDiffScan(process.cwd(), args.base, '', config.stateDir)
-      await finalizeAndSaveScan(getStateDir(config.stateDir), scan)
+      const scan = await runDiffScan(process.cwd(), args.base, '', config.stateDir, false)
+      await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan)
       const diff = scan.findings.map(finding => `${finding.locations[0].file}:${finding.locations[0].line} ${finding.ruleId}: ${finding.locations[0].excerpt}`).join('\n')
-      return { mode: scan.mode, diff, truncated: !scan.coverage.complete }
+      return { scanId: scan.id, mode: scan.mode, diff, truncated: !scan.coverage.complete }
     },
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_scan', description: 'Run a standard or deep read-only native scan and save canonical findings outside the target repository.',
+    name: 'security_scan', description: 'Run a standard or deep read-only native discovery scan and save candidate evidence outside the target repository. It never auto-confirms vulnerabilities; claim and validate candidates before finalization.',
     parameters: { path: { type: 'string', description: 'Optional workspace-relative scan scope.' }, mode: { type: 'string', enum: ['standard', 'deep'], description: 'standard performs one rule pass; deep executes independent injection and trust-boundary rule passes before reduction.' }, threat_model: { type: 'string', description: 'Optional security assumptions and protected assets.' } },
     output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, findings: { type: 'number' }, reviewedFiles: { type: 'number' }, complete: { type: 'boolean' } }, required: ['scanId', 'findings', 'reviewedFiles', 'complete'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-    async execute(args) { const scan = await runScan(resolveSafeTarget(process.cwd(), args.path), config, args.mode === 'deep' ? 'deep' : 'standard', args.threat_model ?? '', args.path !== undefined, config.stateDir); await finalizeAndSaveScan(getStateDir(config.stateDir), scan); return { scanId: scan.id, findings: scan.findings.filter(finding => finding.disposition === 'reportable').length, reviewedFiles: scan.coverage.reviewedFiles, complete: scan.coverage.complete } },
+    async execute(args) { const scan = await runScan(resolveSafeTarget(process.cwd(), args.path), config, args.mode === 'deep' ? 'deep' : 'standard', args.threat_model ?? '', args.path !== undefined, config.stateDir, false); await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan); return { scanId: scan.id, findings: scan.findings.length, reviewedFiles: scan.coverage.reviewedFiles, complete: scan.coverage.complete } },
   }))
 
   ctx.tools.register(defineTool({

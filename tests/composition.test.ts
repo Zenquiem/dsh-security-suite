@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -42,6 +42,8 @@ test('the suite composes with DSH registries and cleans up its native tool surfa
   assert.equal(ctx.tools.get('security_scan')?.output.schema.type, 'object')
   assert.match(ctx.tools.get('security_review_diff')?.description ?? '', /GitHub Actions pull_request_target shell interpolation/)
   assert.deepEqual(ctx.tools.get('security_scan')?.output.schema.required, ['scanId', 'findings', 'reviewedFiles', 'complete'])
+  assert.deepEqual(ctx.tools.get('security_assess')?.output.schema.required, ['scanId', 'filesScanned', 'filesSkipped', 'candidates'])
+  assert.deepEqual(ctx.tools.get('security_review_diff')?.output.schema.required, ['scanId', 'mode', 'diff', 'truncated'])
   const assembled = await ctx.systemPrompt.assemble()
   assert.equal(assembled.sections.some(section => section.name === 'dsh-security-suite:workflow'), true)
   await fiber.dispose()
@@ -52,6 +54,35 @@ test('the suite composes with DSH registries and cleans up its native tool surfa
   assert.equal(ctx.tools.get('security_start_deep_closure'), undefined)
   const afterUnload = await ctx.systemPrompt.assemble()
   assert.equal(afterUnload.sections.some(section => section.name === 'dsh-security-suite:workflow'), false)
+})
+
+test('public scan entry points create an investigation instead of auto-confirming static candidates', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-security-suite-public-scan-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-public-scan-state-'))
+  const previousDirectory = process.cwd()
+  const ctx = new Context()
+  new SystemPrompt(ctx, {})
+  new ToolRegistry(ctx, {})
+  const fiber = await ctx.plugin({ name, inject, apply }, { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state })
+  try {
+    await writeFile(join(workspace, 'app.ts'), 'function route(req) { return eval(req.query.code) }\n')
+    process.chdir(workspace)
+    const result = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'public-scan' as never, name: 'security_scan', arguments: {}, agent: {} as never })
+    assert.equal(result.isError, false, result.isError ? result.error.message : '')
+    const value = result.value as { scanId: string; findings: number; complete: boolean }
+    assert.equal(value.findings, 1)
+    assert.equal(value.complete, true)
+    const scan = await (await import('../src/state.ts')).loadScan(state, value.scanId)
+    assert.equal(scan.lifecycle, 'validation')
+    assert.equal(scan.findings[0]?.disposition, 'discovered')
+    assert.equal(scan.findings[0]?.ledger.some(row => row.phase === 'validation'), false)
+    assert.equal(scan.tasks.filter(task => task.phase === 'validation').length, 1)
+  } finally {
+    process.chdir(previousDirectory)
+    await fiber.dispose()
+    await rm(workspace, { recursive: true, force: true })
+    await rm(state, { recursive: true, force: true })
+  }
 })
 
 test('the built npm entrypoint registers and executes through the real DSH tool pipeline', async () => {
