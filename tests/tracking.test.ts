@@ -3,7 +3,7 @@ import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { createTracking, previewTracking } from '../src/tracking.ts'
+import { createGitHubAdvisory, createTracking, previewGitHubAdvisory, previewTracking } from '../src/tracking.ts'
 import { runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan } from '../src/state.ts'
 
@@ -158,5 +158,70 @@ test('Jira and Linear issue writes are read back and verified', async () => {
     assert.equal(jira.status, 'created')
     const linear = await createTracking(fixture.config, { provider: 'linear', scanId: fixture.scan.id, findingId: fixture.finding.id, token, endpoint: 'https://linear.example/graphql', project: 'team-1', approved: true })
     assert.equal(linear.status, 'created')
+  } finally { restore(); await fixture.dispose() }
+})
+
+test('GitHub advisory refuses scans without a verified clean GitHub revision', async () => {
+  const fixture = await setup()
+  try {
+    await assert.rejects(() => previewGitHubAdvisory(fixture.config, { scanId: fixture.scan.id, findingId: fixture.finding.id }), /clean GitHub worktree/)
+    await assert.rejects(() => createGitHubAdvisory(fixture.config, { scanId: fixture.scan.id, findingId: fixture.finding.id, token, approved: true }), /clean GitHub worktree/)
+  } finally { await fixture.dispose() }
+})
+
+test('GitHub advisory creates one private draft, verifies it, and never calls an Issue endpoint', async () => {
+  const fixture = await setup()
+  fixture.scan.targetSnapshot = { kind: 'git_revision', targetId: 'verified-source', displayName: 'repo', sourceRepository: 'owner/repo', revision: 'a'.repeat(40), snapshotDigest: fixture.scan.targetSnapshot.snapshotDigest }
+  await finalizeAndSaveScan(fixture.state, fixture.scan)
+  let posts = 0
+  const restore = mockFetch((url, init) => {
+    assert.doesNotMatch(url, /\/issues(?:\?|$)/)
+    if (url.includes('?per_page=100')) return Response.json([])
+    if (init?.method === 'POST') {
+      posts++
+      assert.match(url, /\/security-advisories$/)
+      const body = JSON.parse(String(init.body)) as { summary: string; description: string; severity: string; vulnerabilities: unknown[]; start_private_fork: boolean }
+      assert.equal(body.severity, 'high')
+      assert.equal(body.start_private_fork, false)
+      assert.equal(body.vulnerabilities.length, 1)
+      assert.match(body.description, /Verified revision: a{40}/)
+      return Response.json({ ghsa_id: 'GHSA-test-1234', html_url: 'https://github.com/owner/repo/security/advisories/GHSA-test-1234', url: 'https://api.github.com/repos/owner/repo/security-advisories/GHSA-test-1234' }, { status: 201 })
+    }
+    assert.match(url, /\/security-advisories\/GHSA-test-1234$/)
+    return Response.json({ ghsa_id: 'GHSA-test-1234', summary: `[HIGH] ${fixture.finding.title}`, description: `saved\n<!-- dsh-security-suite advisory finding:${fixture.finding.id} fingerprint:${fixture.finding.fingerprint} source:owner/repo@${'a'.repeat(40)} -->`, state: 'draft' })
+  })
+  try {
+    const preview = await previewGitHubAdvisory(fixture.config, { scanId: fixture.scan.id, findingId: fixture.finding.id, token })
+    assert.equal(preview.repository, 'owner/repo')
+    assert.equal(preview.sourceRevision, 'a'.repeat(40))
+    assert.equal(preview.lookup.status, 'succeeded')
+    const receipt = await createGitHubAdvisory(fixture.config, { scanId: fixture.scan.id, findingId: fixture.finding.id, token, approved: true })
+    assert.equal(receipt.status, 'created')
+    assert.equal(receipt.provider, 'github_advisory')
+    assert.equal(receipt.readback?.draftMatched, true)
+    assert.equal(posts, 1)
+    const repeated = await createGitHubAdvisory(fixture.config, { scanId: fixture.scan.id, findingId: fixture.finding.id, token, approved: true })
+    assert.equal(repeated.id, receipt.id)
+    assert.equal(posts, 1)
+    const files = await readdir(join(fixture.state, 'tracking'))
+    assert.doesNotMatch(await readFile(join(fixture.state, 'tracking', files[0]), 'utf8'), /private-test-token/)
+  } finally { restore(); await fixture.dispose() }
+})
+
+test('GitHub advisory retains an unverified create after failed readback without retrying', async () => {
+  const fixture = await setup()
+  fixture.scan.targetSnapshot = { kind: 'git_revision', targetId: 'verified-source', displayName: 'repo', sourceRepository: 'owner/repo', revision: 'b'.repeat(40), snapshotDigest: fixture.scan.targetSnapshot.snapshotDigest }
+  await finalizeAndSaveScan(fixture.state, fixture.scan)
+  let posts = 0
+  const restore = mockFetch((url, init) => {
+    if (url.includes('?per_page=100')) return Response.json([])
+    if (init?.method === 'POST') { posts++; return Response.json({ ghsa_id: 'GHSA-unverified', url: 'https://api.github.com/repos/owner/repo/security-advisories/GHSA-unverified' }, { status: 201 }) }
+    return Response.json({ message: 'unavailable' }, { status: 503 })
+  })
+  try {
+    const receipt = await createGitHubAdvisory(fixture.config, { scanId: fixture.scan.id, findingId: fixture.finding.id, token, approved: true })
+    assert.equal(receipt.status, 'created_unverified')
+    assert.equal(receipt.readback?.status, 'failed')
+    assert.equal(posts, 1)
   } finally { restore(); await fixture.dispose() }
 })

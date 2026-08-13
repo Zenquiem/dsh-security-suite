@@ -28,6 +28,8 @@ test('the suite composes with DSH registries and cleans up its native tool surfa
   assert.equal(names.includes('security_plan_candidate_validation'), true)
   assert.equal(names.includes('security_run_candidate_validation_plan'), true)
   assert.equal(names.includes('security_rollback_remediation'), true)
+  assert.equal(names.includes('security_tracking_advisory_preview'), true)
+  assert.equal(names.includes('security_create_github_security_advisory'), true)
   assert.equal(names.includes('security_deep_read_source'), true)
   assert.equal(ctx.tools.get('security_scan')?.output.schema.type, 'object')
   assert.match(ctx.tools.get('security_review_diff')?.description ?? '', /GitHub Actions pull_request_target shell interpolation/)
@@ -111,4 +113,22 @@ test('write tools fail closed when their DSH approval route is unavailable', asy
     await fiber.dispose()
     await rm(workspace, { recursive: true, force: true })
   }
+})
+
+test('GitHub advisory creation is an approval-gated DSH write tool', async () => {
+  const ctx = new Context()
+  new SystemPrompt(ctx, {})
+  new ToolRegistry(ctx, {})
+  let approvalRequests = 0
+  ctx.provide('approval', { async request() { approvalRequests++; return 'allowed-once' } })
+  const fiber = await ctx.plugin({ name, inject, apply }, { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: '' })
+  try {
+    const result = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'advisory-approval' as never, name: 'security_create_github_security_advisory', arguments: { scan_id: 'missing', finding_id: 'missing', token: 'test-token', approved: false }, agent: {} as never })
+    assert.equal(result.isError, true)
+    assert.match(result.isError ? result.error.message : '', /requires approved: true/)
+    assert.equal(approvalRequests, 0)
+    const approved = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'advisory-approved' as never, name: 'security_create_github_security_advisory', arguments: { scan_id: 'missing', finding_id: 'missing', token: 'test-token', approved: true }, agent: {} as never })
+    assert.equal(approved.isError, true)
+    assert.equal(approvalRequests, 1)
+  } finally { await fiber.dispose() }
 })

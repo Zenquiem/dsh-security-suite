@@ -88,6 +88,28 @@ test('resolveSafeTarget rejects paths outside the workspace', () => {
   assert.throws(() => resolveSafeTarget('/workspace', '../outside'), /inside the current workspace/)
 })
 
+test('a clean GitHub worktree scan records an immutable advisory-eligible source revision', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-git-source-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await execFileAsync('git', ['remote', 'add', 'origin', 'git@github.com:owner/repo.git'], { cwd: root })
+    await writeFile(join(root, 'client.ts'), 'request({ rejectUnauthorized: false })\n')
+    await execFileAsync('git', ['add', 'client.ts'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    const clean = await runScan(root, { maxFiles: 10, maxFileBytes: 4096 }, 'standard', '', false, state)
+    assert.equal(clean.targetSnapshot.kind, 'git_revision')
+    assert.equal(clean.targetSnapshot.sourceRepository, 'owner/repo')
+    assert.match(clean.targetSnapshot.revision ?? '', /^[0-9a-f]{40}$/)
+    await writeFile(join(root, 'client.ts'), 'request({ rejectUnauthorized: false })\n// dirty\n')
+    const dirty = await runScan(root, { maxFiles: 10, maxFileBytes: 4096 }, 'standard', '', false, state)
+    assert.equal(dirty.targetSnapshot.kind, 'git_worktree')
+    assert.equal(dirty.targetSnapshot.sourceRepository, undefined)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
 test('diff scan distinguishes added risks from deleted authorization and input controls', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))

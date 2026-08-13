@@ -90,10 +90,12 @@ export interface AuditTask {
 }
 
 export interface TargetSnapshot {
-  kind: 'git_worktree' | 'directory_snapshot' | 'git_diff'
+  kind: 'git_worktree' | 'git_revision' | 'directory_snapshot' | 'git_diff'
   targetId: string
   displayName: string
   revision?: string
+  /** Canonical GitHub owner/repository for a clean immutable source revision. */
+  sourceRepository?: string
   baseRevision?: string
   headRevision?: string
   snapshotDigest: string

@@ -227,12 +227,18 @@ async function targetSnapshot(root: string, receipts: FileReceipt[]): Promise<Ta
   const inventory = receipts.slice().sort((a, b) => a.path.localeCompare(b.path)).map(receipt => `${receipt.path}\0${receipt.sha256}`).join('\n')
   const digest = `dsh-security-suite-snapshot/v1:sha256:${sha256(inventory)}`
   try {
-    const [{ stdout: gitRoot }, { stdout: revision }, remote] = await Promise.all([
+    const [{ stdout: gitRoot }, { stdout: revision }, remote, status] = await Promise.all([
       execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd: root, encoding: 'utf8' }),
       execFileAsync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: root, encoding: 'utf8' }),
       execFileAsync('git', ['config', '--get', 'remote.origin.url'], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' })),
+      execFileAsync('git', ['status', '--porcelain'], { cwd: root, encoding: 'utf8' }),
     ])
-    const repository = resolve(gitRoot.trim()); const cleanRemote = remote.stdout.trim().replace(/^[^@]+@/, '').replace(/[?#].*$/, '')
+    const repository = resolve(gitRoot.trim()); const cleanRemote = remote.stdout.trim().replace(/[?#].*$/, '')
+    const github = /^(?:git@github\.com:|ssh:\/\/git@github\.com\/|https:\/\/github\.com\/)([^/\s]+)\/([^/\s]+?)(?:\.git)?\/?$/i.exec(cleanRemote)
+    if (!status.stdout.trim() && github) {
+      const sourceRepository = `${github[1]}/${github[2]}`
+      return { kind: 'git_revision', targetId: `dsh-security-suite-target/v1:sha256:${sha256(sourceRepository)}`, displayName: basename(repository) || repository, revision: revision.trim(), sourceRepository, snapshotDigest: digest }
+    }
     return { kind: 'git_worktree', targetId: `dsh-security-suite-target/v1:sha256:${sha256(cleanRemote || repository)}`, displayName: basename(repository) || repository, revision: revision.trim(), snapshotDigest: digest }
   } catch {
     return { kind: 'directory_snapshot', targetId: `dsh-security-suite-target/v1:sha256:${sha256(resolve(root))}`, displayName: basename(root) || root, snapshotDigest: digest }

@@ -20,7 +20,8 @@ Deep workers are DSH-native child agents. Their scoped tool view is restricted t
 | Candidate validation and remediation | Isolated command evidence plus snapshot-checked, user-approved patch and verification workflow |
 | Bulk scans and pre-commit hook | Native bounded scheduler and Git hook installer |
 | Threat model, attack-path write-up, DSH-local reports | `security_threat_model_template`, `security_finding_writeup`, and state tools |
-| GitHub, Jira, Linear tracking | Exact preview, GitHub duplicate lookup, and explicit one-at-a-time creation with durable receipts |
+| GitHub, Jira, Linear tracking | Exact preview, provider-scoped duplicate lookup, and explicit one-at-a-time creation with durable receipts |
+| GitHub private draft advisories | Immutable-revision-bound draft creation, advisory-specific duplicate lookup, exact readback, and durable receipts |
 
 The plugin does not require an external security vendor credential. Any GitHub, Jira, or Linear write integration is gated by DSH's native one-shot user-approval service and must use the user-configured provider credentials. The model-facing `approved: true` field is only an acknowledgement that the proposed action was reviewed; it is never an authorization grant. Profiles without a DSH approval route fail closed for every source, hook, command-plan, and third-party write.
 
@@ -45,6 +46,7 @@ SARIF imports retain their rule id, CWE, message, severity, and physical file/li
 - `security_plan_candidate_validation` previews preflight-derived commands; `security_run_candidate_validation_plan` requires both reviewed acknowledgement and DSH one-shot user approval before isolated execution, then preserves every per-command receipt.
 - `security_install_precommit_hook`, `security_apply_remediation`, and `security_rollback_remediation` require both reviewed acknowledgement and DSH one-shot user approval for each write; a missing approval route fails closed.
 - `security_tracking_preview` builds the exact GitHub, Jira, or Linear issue and can perform provider-scoped, read-only duplicate lookup. `security_create_tracking_issue` requires reviewed acknowledgement plus DSH one-shot user approval, blocks duplicate local writes, verifies every successful provider write by readback, and saves a token-free receipt.
+- `security_tracking_advisory_preview` and `security_create_github_security_advisory` are a separate GitHub private-draft advisory flow. They require a completed clean GitHub-worktree scan with an immutable verified source revision, never fall back to Issues, never update or publish, use only GitHub's repository-advisory REST endpoints, and fail closed when duplicate lookup or exact draft readback cannot establish the required state.
 
 ## Install
 

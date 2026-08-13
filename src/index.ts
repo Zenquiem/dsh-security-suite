@@ -9,7 +9,7 @@ import { finalizeAndSaveScan, getStateDir, listScans, loadScan, persistInvestiga
 import { applyRemediationProposal, bulkScan, installPreCommitHook, planCandidateValidation, remediationPlan, rerunSavedScan, resumeBulkJob, rollbackRemediationProposal, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, startBulkCsvJob } from './operations.js'
 import { cancelInvestigation, claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation, resumeInvestigation } from './workbench.js'
 import { generateHardeningPortfolio, importFindings, triageImportedFinding } from './analysis.js'
-import { createTracking, previewTracking } from './tracking.js'
+import { createGitHubAdvisory, createTracking, previewGitHubAdvisory, previewTracking } from './tracking.js'
 import { createDeepDiscoveryJob, deepDiscoveryCapability, getDeepWorklist, readDeepSource, reportDeepCandidate, reportDeepWorker, runDeepDiscovery } from './deep-discovery.js'
 
 export const name = 'dsh-security-suite'
@@ -22,6 +22,7 @@ const WRITE_ACTION_APPROVALS: Readonly<Record<string, string>> = {
   security_rollback_remediation: 'Restore the recorded source bytes for the reviewed remediation and create a verification scan.',
   security_install_precommit_hook: 'Install the suite pre-commit hook in this repository.',
   security_create_tracking_issue: 'Create one external security tracking issue using the supplied provider credentials.',
+  security_create_github_security_advisory: 'Create one private GitHub draft security advisory for a verified immutable source revision.',
 }
 
 function hasExplicitApproval(argumentsValue: unknown): boolean {
@@ -78,6 +79,18 @@ export function apply(ctx: Context, config: PluginConfig): void {
     name: 'security_deep_discovery_capability', description: 'Report whether this DSH profile exposes the native agent runtime required for six-worker delegated deep discovery. This performs no scan and creates no agent.', parameters: {},
     output: { schema: { type: 'object', properties: { available: { type: 'boolean' }, workersPerRound: { type: 'number' }, reason: { type: 'string' } }, required: ['available', 'workersPerRound'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute() { return deepDiscoveryCapability(ctx) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_tracking_advisory_preview', description: 'Build the exact private GitHub draft security-advisory payload for one reportable finding. It requires a clean GitHub worktree scan with a verified immutable revision. With a token it performs read-only advisory-specific duplicate lookup; it never creates, updates, or publishes an advisory.', parameters: { scan_id: { type: 'string', required: true, description: 'Completed scan identifier from a clean GitHub worktree.' }, finding_id: { type: 'string', required: true, description: 'One reportable finding identifier.' }, token: { type: 'string', description: 'Optional GitHub credential used only for the read-only duplicate lookup.' } },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: `${(value as { summary?: string }).summary ?? ''}\n\n${(value as { description?: string }).description ?? ''}` }] },
+    async execute(args) { return JSON.parse(JSON.stringify(await previewGitHubAdvisory(config, { scanId: args.scan_id, findingId: args.finding_id, token: args.token }))) as Record<string, JsonValue> },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_create_github_security_advisory', description: 'Create exactly one private GitHub draft security advisory after reviewed acknowledgement plus DSH one-shot user approval. It accepts only a clean GitHub worktree scan with a verified immutable revision, performs advisory-specific duplicate lookup, never falls back to an Issue, never updates or publishes, reads back the created draft exactly once, and saves a token-free receipt.', parameters: { scan_id: { type: 'string', required: true, description: 'Completed scan identifier from a clean GitHub worktree.' }, finding_id: { type: 'string', required: true, description: 'One reportable finding identifier.' }, token: { type: 'string', required: true, description: 'GitHub credential used only for this request.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing security_tracking_advisory_preview; this does not replace DSH user approval.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, provider: { type: 'string' }, status: { type: 'string' }, externalId: { type: 'string' }, url: { type: 'string' }, error: { type: 'string' } }, required: ['id', 'provider', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return createGitHubAdvisory(config, { scanId: args.scan_id, findingId: args.finding_id, token: args.token, approved: args.approved }) },
   }))
 
   ctx.tools.register(defineTool({
