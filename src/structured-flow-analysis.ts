@@ -26,6 +26,7 @@ const RULES: Record<Language, Rule[]> = {
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a .NET filesystem API.', sink: /\b(?:File\.(?:ReadAllText|ReadAllBytes|WriteAllText|Open)|Directory\.(?:GetFiles|Delete))\s*\(/ },
     { id: 'ssrf-request-sink', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data reaches a .NET outbound request API.', sink: /\b(?:HttpClient\.)?(?:GetAsync|GetStringAsync|PostAsync|SendAsync)\s*\(/ },
     { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a .NET SQL query-text API.', sink: /\b(?:command|connection|db|context)\.(?:Execute|ExecuteNonQuery|ExecuteScalar|Query|SqlQuery)\s*\(/i },
+    { id: 'unsafe-deserialization', cwe: 'CWE-502', severity: 'high', rationale: 'Request-derived data reaches BinaryFormatter.Deserialize() without a proven safe serialization boundary.', sink: /\b[A-Za-z_]\w*\.Deserialize\s*\(/ },
   ],
   php: [
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a PHP command execution API.', sink: /\b(?:system|exec|shell_exec|passthru|popen|proc_open)\s*\(/ },
@@ -92,7 +93,7 @@ function calls(value: string): Array<{ name: string; qualified: string; args: st
   return results
 }
 
-function sinkTainted(value: string, rule: Rule, tainted: Set<string>, source: RegExp, language: Language, deserializers = new Set<string>()): boolean {
+function sinkTainted(value: string, rule: Rule, tainted: Set<string>, source: RegExp, language: Language, deserializers = new Set<string>(), binaryFormatters = new Set<string>()): boolean {
   if (rule.id === 'unsafe-deserialization') {
     if (language === 'java') {
       const reader = /\b([A-Za-z_]\w*)\.readObject\s*\(/.exec(value)?.[1]
@@ -110,6 +111,10 @@ function sinkTainted(value: string, rule: Rule, tainted: Set<string>, source: Re
         && Boolean(call.args[0])
         && sourceTainted(call.args[0], tainted, source)
         && !/['"]allowed_classes['"]\s*=>\s*false/i.test(call.args[1] ?? ''))
+    }
+    if (language === 'csharp') {
+      const receiver = /\b([A-Za-z_]\w*)\.Deserialize\s*\(/.exec(value)?.[1]
+      return Boolean(receiver && binaryFormatters.has(receiver) && calls(value).some(call => call.name === 'Deserialize' && Boolean(call.args[0]) && sourceTainted(call.args[0], tainted, source)))
     }
     return false
   }
@@ -213,6 +218,31 @@ function javaRequestDeserializers(fn: FunctionRecord, source: RegExp, parameterT
   return values
 }
 
+function csharpBinaryFormatters(fn: FunctionRecord): Set<string> {
+  const formatters = new Set<string>()
+  for (const value of fn.lines) {
+    const assignment = variableAssignment(value, 'csharp')
+    if (assignment && /\bnew\s+(?:System\.Runtime\.Serialization\.Formatters\.Binary\.)?BinaryFormatter\s*\(/.test(assignment.expression)) formatters.add(assignment.name)
+  }
+  return formatters
+}
+
+function directCsharpDeserializationCandidate(rule: Rule, fn: FunctionRecord, line: number, excerpt: string, entrypoint: { line: number; excerpt: string }): Candidate {
+  return {
+    rule: rule.id,
+    severity: rule.severity,
+    file: fn.file,
+    line,
+    excerpt,
+    rationale: rule.rationale,
+    cwe: rule.cwe,
+    evidence: [
+      { kind: 'pattern', detail: 'C# structured deserialization analysis resolved BinaryFormatter.Deserialize().', location: { file: fn.file, line, excerpt, role: 'sink' } },
+      { kind: 'context', detail: 'C# structured deserialization analysis resolved request-derived data passed to this BinaryFormatter.', location: { file: fn.file, line: entrypoint.line, excerpt: entrypoint.excerpt, role: 'entrypoint' } },
+    ],
+  }
+}
+
 /** Trace parameter-to-sink flows through local functions of one language and directory. */
 export function analyzeStructuredFlow(inputs: ModuleInput[], language: Language): StructuredFlowAnalysis {
   const allowed = new Set(EXTENSIONS[language]); const modules = new Map<string, ModuleRecord>(); for (const input of inputs.filter(item => allowed.has(item.file.slice(item.file.lastIndexOf('.'))))) { const file = normalize(input.file); const lines = input.source.split(/\r?\n/); modules.set(file, { file, lines, functions: functions(file, input.source, language) }) }
@@ -231,8 +261,9 @@ export function analyzeStructuredFlow(inputs: ModuleInput[], language: Language)
         if (!propagated) break
       }
       const deserializers = new Set([...javaRequestDeserializers(fn, source, true).keys()])
+      const binaryFormatters = csharpBinaryFormatters(fn)
       for (const [offset, value] of fn.lines.entries()) {
-        for (const rule of rules) if (sinkTainted(value, rule, tainted, source, language, deserializers)) changed = add(fn, parameterIndex, { rule, line: fn.start + offset + 1, excerpt: value.trim().slice(0, 240) }) || changed
+        for (const rule of rules) if (sinkTainted(value, rule, tainted, source, language, deserializers, binaryFormatters)) changed = add(fn, parameterIndex, { rule, line: fn.start + offset + 1, excerpt: value.trim().slice(0, 240) }) || changed
         for (const call of calls(value)) {
           const target = lookup(fn.file, call.name); if (!target) continue
           for (const [targetIndex] of target.params.entries()) if (call.args[targetIndex] && sourceTainted(call.args[targetIndex], tainted, source)) for (const sink of summaries.get(target.id)?.get(targetIndex) ?? []) changed = add(fn, parameterIndex, sink) || changed
@@ -251,6 +282,22 @@ export function analyzeStructuredFlow(inputs: ModuleInput[], language: Language)
         const entrypoint = reader ? deserializers.get(reader) : undefined
         if (entrypoint) candidates.push(directJavaDeserializationCandidate(rule, fn.file, fn.start + offset + 1, value.trim().slice(0, 240), entrypoint))
       }
+    }
+  }
+  if (language === 'csharp') {
+    const rule = rules.find(item => item.id === 'unsafe-deserialization')
+    if (rule) for (const module of modules.values()) for (const fn of module.functions) {
+      const assignments = fn.lines.map((value, index) => ({ assignment: variableAssignment(value, language), index, value })).filter((item): item is { assignment: { name: string; expression: string }; index: number; value: string } => Boolean(item.assignment))
+      const tainted = new Set<string>()
+      for (let round = 0; round <= assignments.length; round++) {
+        let changed = false
+        for (const item of assignments) if (!tainted.has(item.assignment.name) && sourceTainted(item.assignment.expression, tainted, source)) { tainted.add(item.assignment.name); changed = true }
+        if (!changed) break
+      }
+      const entrypoint = fn.lines.findIndex(value => sourceTainted(value, new Set(), source))
+      const binaryFormatters = csharpBinaryFormatters(fn)
+      if (entrypoint < 0) continue
+      for (const [offset, value] of fn.lines.entries()) if (sinkTainted(value, rule, tainted, source, language, new Set(), binaryFormatters)) candidates.push(directCsharpDeserializationCandidate(rule, fn, fn.start + offset + 1, value.trim().slice(0, 240), { line: fn.start + entrypoint + 1, excerpt: fn.lines[entrypoint]!.trim().slice(0, 240) }))
     }
   }
   for (const module of modules.values()) { const tainted = new Set<string>(); const assignments = module.lines.map(value => variableAssignment(value, language)).filter((item): item is { name: string; expression: string } => Boolean(item)); for (let round = 0; round <= assignments.length; round++) { let propagated = false; for (const item of assignments) if (!tainted.has(item.name) && sourceTainted(item.expression, tainted, source)) { tainted.add(item.name); propagated = true }; if (!propagated) break }

@@ -168,6 +168,20 @@ test('PHP structured analysis traces request data into unserialize and excludes 
   assert.equal(result.candidates[0]?.evidence.some(evidence => evidence.detail.includes('structured function data-flow')), true)
 })
 
+test('C# structured analysis traces request data into BinaryFormatter Deserialize directly and through local wrappers', () => {
+  const direct = analyzeStructuredFlow([{ file: 'Direct.cs', source: 'class Direct {\n object Route(HttpRequest Request) {\n  var formatter = new BinaryFormatter();\n  return formatter.Deserialize(Request.Body);\n }\n}' }], 'csharp')
+  const wrapped = analyzeStructuredFlow([{ file: 'Wrapped.cs', source: 'class Wrapped {\n object Load(Stream payload) {\n  var formatter = new BinaryFormatter();\n  return formatter.Deserialize(payload);\n }\n object Route(HttpRequest Request) {\n  return Load(Request.Body);\n }\n}' }], 'csharp')
+  assert.deepEqual(direct.candidates.map(item => item.rule), ['unsafe-deserialization'])
+  assert.equal(direct.candidates[0]?.evidence.some(item => item.location?.role === 'entrypoint' && item.location.line === 4), true)
+  assert.deepEqual(wrapped.candidates.map(item => item.rule), ['unsafe-deserialization'])
+  assert.equal(wrapped.candidates[0]?.evidence.some(item => item.detail.includes('structured function data-flow') && item.location?.role === 'propagation'), true)
+})
+
+test('C# structured deserialization analysis excludes non-BinaryFormatter Deserialize calls and trusted streams', () => {
+  const result = analyzeStructuredFlow([{ file: 'Trusted.cs', source: 'class Trusted {\n object Parse(HttpRequest Request) {\n  var json = new JsonSerializer();\n  return json.Deserialize(Request.Body);\n }\n object Fixture() {\n  var formatter = new BinaryFormatter();\n  return formatter.Deserialize(FIXTURE);\n }\n}' }], 'csharp')
+  assert.equal(result.candidates.some(item => item.rule === 'unsafe-deserialization'), false)
+})
+
 test('C# structured SSRF analysis does not treat a request body sent to a fixed destination as SSRF', () => {
   const result = analyzeStructuredFlow([{ file: 'Handler.cs', source: 'class Handler {\n void outbound(string body) { client.PostAsync("https://api.example.test/events", body); }\n void route(HttpRequest Request) { outbound(Request.Body); }\n}' }], 'csharp')
   assert.equal(result.candidates.some(item => item.rule === 'ssrf-request-sink'), false)

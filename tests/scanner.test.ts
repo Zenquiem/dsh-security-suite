@@ -333,6 +333,20 @@ test('directory assessment records request-derived PHP unserialize evidence and 
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment records request-derived C# BinaryFormatter evidence and excludes non-BinaryFormatter calls', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'Handler.cs'), 'class Handler {\n object Load(Stream payload) {\n  var formatter = new BinaryFormatter();\n  return formatter.Deserialize(payload);\n }\n object Route(HttpRequest Request) {\n  return Load(Request.Body);\n }\n object Json(HttpRequest Request) {\n  var json = new JsonSerializer();\n  return json.Deserialize(Request.Body);\n }\n}\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'unsafe-deserialization')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.file, 'Handler.cs')
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink' && item.location.line === 4), true)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'propagation' && item.location.line === 7), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'csharp.structured-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment traces Go data flow through a static local-module import', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -601,6 +615,24 @@ test('diff scan traces an added PHP request value into an unchanged unserialize 
     assert.equal(findings[0]?.locations[0]?.line, 2)
     assert.equal(findings[0]?.evidence.some(item => item.location?.line === 5 && item.location.role === 'propagation'), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'php.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces an added C# request body into an unchanged BinaryFormatter wrapper', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'Handler.cs'), 'class Handler {\n object Load(Stream payload) {\n  var formatter = new BinaryFormatter();\n  return formatter.Deserialize(payload);\n }\n object Route() { return null; }\n}\n')
+    await execFileAsync('git', ['add', 'Handler.cs'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'Handler.cs'), 'class Handler {\n object Load(Stream payload) {\n  var formatter = new BinaryFormatter();\n  return formatter.Deserialize(payload);\n }\n object Route(HttpRequest Request) { return Load(Request.Body); }\n}\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const findings = scan.findings.filter(item => item.ruleId === 'unsafe.deserialization')
+    assert.equal(findings.length, 1)
+    assert.equal(findings[0]?.locations[0]?.line, 4)
+    assert.equal(findings[0]?.evidence.some(item => item.location?.line === 6 && item.location.role === 'propagation'), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'csharp.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

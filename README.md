@@ -41,6 +41,8 @@ Ruby deserialization analysis follows request-derived values through same-direct
 
 PHP deserialization analysis follows request-derived values through same-directory local wrappers into `unserialize()`. It recognizes the explicit `allowed_classes => false` control; other allowlists, wrappers, and parser APIs remain validation-required.
 
+.NET deserialization analysis follows request-derived values through same-directory local wrappers into an instance constructed with `new BinaryFormatter()` and then used for `Deserialize(...)`. Other `Deserialize` methods, serializer types, and dynamic formatter construction remain unproven.
+
 ## Tool Surface
 
 SARIF imports retain their rule id, CWE, message, severity, and physical file/line. Imported triage returns `affected` only when a compatible native local-analysis candidate matches that cited location; a readable file alone is never confirmation. Every completed scan with reportable findings also generates a derived `hardening/hardening.md` and `hardening/hardening.json` portfolio from those findings and their detailed reports; the main report links the portfolio and bundle verification rejects a missing or stale portfolio.
