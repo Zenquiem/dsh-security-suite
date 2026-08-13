@@ -7,6 +7,7 @@ import { promisify } from 'node:util'
 import test from 'node:test'
 import { assessDirectory, resolveSafeTarget, runDiffScan, runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan, loadScan, renderCsv, saveScan, saveTriageAnnotation, toSarif, verifyScanBundle, verifySeal } from '../src/state.ts'
+import { claimAuditTask, completeScan, recordAttackPath, recordValidation } from '../src/workbench.ts'
 
 const execFileAsync = promisify(execFile)
 
@@ -541,7 +542,8 @@ test('diff scan distinguishes added risks from deleted authorization and input c
     const scan = await runDiffScan(root, undefined, '', state)
     const rules = scan.findings.map(finding => finding.ruleId).sort()
     assert.deepEqual(rules, ['dangerous.dynamic.code', 'missing.authorization.route', 'removed.authorization.control', 'removed.input.validation.control'])
-    assert.equal(scan.findings.filter(finding => finding.disposition === 'reportable').length, 3)
+    assert.equal(scan.findings.every(finding => finding.disposition === 'discovered'), true)
+    assert.equal(scan.tasks.length, 4)
     const route = scan.findings.find(finding => finding.ruleId === 'missing.authorization.route')
     assert.ok(route)
     assert.equal(route.locations[0]?.line, 1)
@@ -982,7 +984,7 @@ test('diff scan reports new GitHub Actions trust-boundary regressions', async ()
     const scan = await runDiffScan(root, undefined, '')
     const rules = scan.findings.map(item => item.ruleId).sort()
     assert.deepEqual(rules, ['ci.mutable.action.ref', 'ci.pull.request.target.write.permissions', 'ci.untrusted.event.shell'])
-    assert.equal(scan.findings.every(item => item.disposition === 'reportable'), true)
+    assert.equal(scan.findings.every(item => item.disposition === 'discovered'), true)
     assert.equal(scan.findings.every(item => item.locations[0]?.file === '.github/workflows/review.yml'), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ci-untrusted-event-shell')?.matches, 1)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ci-pull-request-target-write-permissions')?.matches, 1)
@@ -1125,7 +1127,7 @@ test('diff scan traces added pull-request head checkout into a later command wit
     assert.deepEqual(scan.findings.map(item => item.ruleId), ['ci.pull.request.target.untrusted.checkout'])
     const finding = scan.findings[0]
     assert.equal(finding?.locations[0]?.line, 10)
-    assert.equal(finding?.disposition, 'reportable')
+    assert.equal(finding?.disposition, 'discovered')
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ci-pull-request-target-untrusted-checkout')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
@@ -1185,6 +1187,18 @@ test('scan records persist canonical findings and export SARIF', async () => {
   }
 })
 
+test('scanner library defaults to a validation investigation rather than auto-confirming static candidates', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'app.ts'), 'function route(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, { maxFiles: 10, maxFileBytes: 4096 }, 'standard', '')
+    assert.equal(scan.lifecycle, 'validation')
+    assert.equal(scan.findings[0]?.disposition, 'discovered')
+    assert.equal(scan.findings[0]?.ledger.some(item => item.phase === 'validation'), false)
+    assert.equal(scan.tasks.length, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('integrity seal detects an in-memory scan mutation', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -1201,8 +1215,15 @@ test('completed scan persists canonical artifacts and candidate-ledger phase rec
   try {
     await writeFile(join(root, 'SECURITY.md'), 'Use explicit authorization checks.\n')
     await writeFile(join(root, 'app.ts'), 'app.get("/x", (req) => eval(req.query.code))\n')
-    const scan = await runScan(root, { maxFiles: 10, maxFileBytes: 4096 }, 'deep', '', false, state)
-    await finalizeAndSaveScan(state, scan)
+    const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+    const scan = await runScan(root, config, 'deep', '', false, state)
+    await saveScan(state, scan)
+    const candidate = scan.findings[0]!; const references = candidate.locations.map(location => ({ file: location.file, line: location.line, role: location.role ?? 'root_control' })) as Array<{ file: string; line: number; role: 'entrypoint' | 'wrapper' | 'propagation' | 'root_control' | 'sink' | 'outcome' | 'expected_control' }>
+    const validation = await claimAuditTask(config, scan.id, 'validator', 'validation'); assert.ok(validation)
+    await recordValidation(config, scan.id, candidate.candidateId, { conclusion: 'reportable', method: 'static', attacker: 'Remote caller.', entryPoint: 'Request-derived route value.', trustBoundary: 'HTTP request boundary.', rootControl: 'Dynamic code evaluation.', sink: 'eval.', impact: 'Attacker-controlled execution.', directEvidence: 'Retained AST source-to-sink evidence reaches eval.', counterevidence: 'No local containment was retained.', limitations: 'No runtime execution was performed.', confidence: 'medium', sourceReferences: references }, validation.claimToken)
+    const attack = await claimAuditTask(config, scan.id, 'path-reviewer', 'attack_path'); assert.ok(attack)
+    await recordAttackPath(config, scan.id, candidate.candidateId, { attacker: 'Remote caller.', entryPoint: 'Request route parameter.', preconditions: 'The route is deployed and reachable.', dataflow: 'Request value -> eval.', outcome: 'Arbitrary code evaluation.', severityRationale: 'High impact sensitive sink with source-backed caller path.', changeConditions: 'Runtime route evidence can increase confidence.', sourceReferences: references }, attack.claimToken)
+    await completeScan(config, scan.id)
     const loaded = await loadScan(state, scan.id)
     const verified = await verifyScanBundle(loaded)
     assert.equal(verified.valid, true, verified.errors.join('\n'))

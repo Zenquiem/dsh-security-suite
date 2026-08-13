@@ -295,8 +295,8 @@ export async function applyRemediationProposal(workspace: string, config: Config
   if (!proposal.safeToApply || !content || content === current) throw new Error('No mechanically safe replacement is available for this proposal.')
   await writeFile(file, content, 'utf8'); const appliedSnapshotDigest = await snapshotDigestForDirectory(scan.target, config); const rollback: RemediationRollback = { id: `rollback_${randomUUID()}`, remediationId: proposal.id, scanId, file: proposal.file, beforeContent: current, beforeSha256: sha256(current), appliedSha256: sha256(content), appliedSnapshotDigest, createdAt: new Date().toISOString(), status: 'available' }
   await saveRollback(getStateDir(config.stateDir), rollback); proposal.status = 'applied'; proposal.appliedAt = new Date().toISOString(); proposal.rollbackId = rollback.id
-  const verification = await runScan(scan.target, config, 'standard', scan.threatModel, scan.recipe.scopeRequested, config.stateDir)
-  await finalizeAndSaveScan(getStateDir(config.stateDir), verification); proposal.verificationScanId = verification.id; proposal.verification = remediationVerification(verification, finding); await saveProposal(getStateDir(config.stateDir), proposal)
+  const verification = await runScan(scan.target, config, 'standard', scan.threatModel, scan.recipe.scopeRequested, config.stateDir, false)
+  await persistInvestigationArtifacts(getStateDir(config.stateDir), verification); await saveScan(getStateDir(config.stateDir), verification); proposal.verificationScanId = verification.id; proposal.verification = remediationVerification(verification, finding); await saveProposal(getStateDir(config.stateDir), proposal)
   return proposal
 }
 
@@ -310,6 +310,6 @@ export async function rollbackRemediationProposal(workspace: string, config: Con
   const [current, snapshot] = await Promise.all([readFile(file, 'utf8'), snapshotDigestForDirectory(scan.target, config)])
   if (sha256(current) !== rollback.appliedSha256 || snapshot !== rollback.appliedSnapshotDigest) { rollback.status = 'stale'; await saveRollback(state, rollback); throw new Error('Rollback record is stale because the applied file or target snapshot changed.') }
   await writeFile(file, rollback.beforeContent, 'utf8'); rollback.status = 'rolled_back'; rollback.rolledBackAt = new Date().toISOString()
-  const verification = await runScan(scan.target, config, 'standard', scan.threatModel, scan.recipe.scopeRequested, config.stateDir); await finalizeAndSaveScan(state, verification); rollback.verificationScanId = verification.id; proposal.status = 'rolled_back'; await saveRollback(state, rollback); await saveProposal(state, proposal)
+  const verification = await runScan(scan.target, config, 'standard', scan.threatModel, scan.recipe.scopeRequested, config.stateDir, false); await persistInvestigationArtifacts(state, verification); await saveScan(state, verification); rollback.verificationScanId = verification.id; proposal.status = 'rolled_back'; await saveRollback(state, rollback); await saveProposal(state, proposal)
   return rollback
 }

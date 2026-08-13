@@ -6,6 +6,8 @@
 
 The plugin owns its scan orchestration, evidence model, persistent workbench, export formats, remediation workflow, and DSH tool surface. It has no external security-engine SDK, CLI, credential, or hosted runtime dependency.
 
+Every scan entry point, including the exported library functions, creates an open investigation by default. Static analysis can only create discovery candidates and durable validation tasks; a reportable finding requires a claim-token-bound validation receipt and then a separately claimed attack-path receipt before finalization. Post-remediation detection scans are likewise open investigations, not automatic resolution proof.
+
 TLS configuration candidates require a client-use evidence chain. Python must pass `verify=False` or an expanded local `{"verify": False}` map to a supported `requests` or `httpx` call. Go must bind local `tls.Config{InsecureSkipVerify: true}` through `http.Transport` and `http.Client`, then invoke that client. Standalone settings, unconsumed maps, opaque construction, and unrelated functions remain unproven.
 
 Embedded-credential candidates require a direct assignment of a non-placeholder string literal to a credential-named field. Environment or secret-manager lookups, comments, examples, placeholder values, and ordinary strings are excluded. As with every static candidate, this records source exposure for validation; it does not claim the literal is active, privileged, or reachable in production.

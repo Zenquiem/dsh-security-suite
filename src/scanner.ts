@@ -945,7 +945,7 @@ async function semanticDiffCandidates(root: string, addedLines: Map<string, Set<
   return { candidates, counts, parseErrors: javascriptGraph.parseErrors.length + javascriptLocal.filter(result => result.parseError).length }
 }
 
-export async function runScan(directory: string, limits: ScanLimits, mode: 'standard' | 'deep', threatModel: string, scopeRequested = false, stateDirectory = '', automaticValidation = true): Promise<ScanRecord> {
+export async function runScan(directory: string, limits: ScanLimits, mode: 'standard' | 'deep', threatModel: string, scopeRequested = false, stateDirectory = '', automaticValidation = false): Promise<ScanRecord> {
   const deep = mode === 'deep'; const now = new Date().toISOString(); const result = await assessDirectory(directory, limits, deep); const [policy, preflight, generatedThreatModel] = await Promise.all([resolvePolicyGuidance(result.root), nativePreflight(result.root, result.receipts, result.complete, stateDirectory), threatModel.trim() ? Promise.resolve('') : generateSourceThreatModel(result.root, limits)])
   const findings = reduceCandidates(result.candidates); if (automaticValidation) { for (const finding of findings) validateCandidate(finding); for (const finding of findings) analyzeAttackPath(finding) }
   const snapshot = await targetSnapshot(result.root, result.receipts); const id = createScanId(); const closed = findings.every(finding => finding.ledger.some(row => row.phase === 'validation') && (finding.disposition !== 'reportable' || finding.ledger.some(row => row.phase === 'attack_path'))); const complete = result.complete && closed
@@ -961,7 +961,7 @@ export async function reviewGitDiff(workspace: string, base: string | undefined)
   const { stdout } = await execFileAsync('git', args, { cwd: resolve(workspace), encoding: 'utf8', maxBuffer: MAX_DIFF_BYTES + 1 }); return { mode, diff: stdout.slice(0, MAX_DIFF_BYTES), truncated: Buffer.byteLength(stdout, 'utf8') > MAX_DIFF_BYTES }
 }
 
-export async function runDiffScan(workspace: string, base: string | undefined, threatModel: string, stateDirectory = '', automaticValidation = true): Promise<ScanRecord> {
+export async function runDiffScan(workspace: string, base: string | undefined, threatModel: string, stateDirectory = '', automaticValidation = false): Promise<ScanRecord> {
   const review = await reviewGitDiff(workspace, base); const candidates: Candidate[] = []; const receipts: FileReceipt[] = []; const ruleReceipts: RuleReceipt[] = []; const changedPaths = new Set<string>(); const addedLineMap = new Map<string, Set<number>>(); const addedSourceMap = new Map<string, Array<{ line: number; source: string }>>(); let currentFile = ''; let oldLine = 0; let newLine = 0; let addedLines: Array<{ line: number; source: string }> = []
   const flushAddedLines = (): void => {
     if (!addedLines.length) return
