@@ -20,6 +20,7 @@ Deep workers are DSH-native child agents. Their scoped tool view is restricted t
 | Candidate validation and remediation | Isolated command evidence plus snapshot-checked, user-approved patch and verification workflow |
 | Bulk scans and pre-commit hook | Native bounded scheduler and Git hook installer |
 | Threat model, attack-path write-up, DSH-local reports | `security_threat_model_template`, `security_finding_writeup`, and state tools |
+| Vulnerability disclosure campaign | Frozen notes/source receipts, one restricted DSH writer per vulnerability, standalone source-cited reports, and explicit experiment status |
 | External security backlog triage | GitHub REST plus caller-scoped Jira/Linear ticket intake, local evidence triage, per-input audit retention, and separate exploitability queues |
 | GitHub, Jira, Linear tracking | Exact preview, provider-scoped duplicate lookup, and explicit one-at-a-time creation with durable receipts |
 | GitHub private draft advisories | Immutable-revision-bound draft creation, advisory-specific duplicate lookup, exact readback, and durable receipts |
@@ -41,6 +42,7 @@ SARIF imports retain their rule id, CWE, message, severity, and physical file/li
 - `security_scan`, `security_assess`, `security_review_diff`, `security_bulk_scan`, `security_bulk_scan_csv`, `security_resume_bulk_scan`, `security_rerun_scan`
 - `security_scan_history`, `security_get_scan`, `security_compare_scans`, `security_export_scan`
 - `security_threat_model_template`, `security_import_findings`, `security_triage_imported_finding`, `security_finding_writeup`, `security_hardening_proposal`; completed reportable findings also persist an evidence-bound report under `findings/<candidate-id>/`.
+- `security_start_disclosure_campaign` turns supplied vulnerability notes and a selected local source snapshot into one isolated DSH writer assignment per vulnerability. Writers can read only their assigned receipt-bound source, must submit a source-cited report with counterevidence, limitations, remediation, and reproduction status, and cannot claim executed reproduction unless the campaign explicitly authorizes controlled experiments. The campaign never generates an executable PoC by itself.
 - `security_cancel_investigation` and `security_resume_investigation` preserve task recovery; claims use expiring leases.
 - `security_start_deep_closure`, `security_resume_deep_closure`, and `security_read_scan_source` close a deep investigation through centralized, restricted DSH validation and attack-path workers. They preserve source receipts, task claims, cancellation state, and completed evidence across recovery.
 - `security_run_validation` executes a simple command in a disposable copy and saves its receipt; `security_remediation_plan`, `security_apply_remediation`, and `security_rollback_remediation` provide an approval-gated, stale-safe and reversible repair lifecycle.

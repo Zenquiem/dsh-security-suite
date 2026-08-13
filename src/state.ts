@@ -156,7 +156,7 @@ function coverageDocument(scan: ScanRecord): Record<string, unknown> {
 function manifestDocument(scan: ScanRecord, artifacts: Array<{ path: string; sha256: string; mediaType: string }>): Record<string, unknown> {
   return {
     documentType: 'dsh-security-suite.scan-manifest', schemaVersion: '1.0',
-    scan: { id: scan.id, producer: { name: 'dsh-security-suite', version: '0.33.0' }, status: 'completed', startedAt: scan.createdAt, completedAt: scan.completedAt, sealedAt: scan.completedAt, target: scan.targetSnapshot,
+    scan: { id: scan.id, producer: { name: 'dsh-security-suite', version: '0.34.0' }, status: 'completed', startedAt: scan.createdAt, completedAt: scan.completedAt, sealedAt: scan.completedAt, target: scan.targetSnapshot,
       scope: { includePaths: ['.'], excludePaths: scan.coverage.exclusions, summary: `${scan.coverage.reviewedFiles} source files reviewed.`, limitations: scan.coverage.deferred.map(item => item.reason) },
       threatModel: { summary: scan.threatModel }, coverageRef: 'coverage.json', findingsRef: 'findings.json', artifacts },
   }
