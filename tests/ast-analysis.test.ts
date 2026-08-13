@@ -59,6 +59,34 @@ test('AST analysis follows request input through named local helper calls to a s
   assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('call-chain analysis')), true)
 })
 
+test('AST analysis follows destructured request aliases into sensitive calls', () => {
+  const result = analyzeJavaScriptAst(`
+    function route(req) {
+      const { body, query: q } = req
+      eval(body.code)
+      exec(q.command)
+    }
+  `, 'destructured.ts')
+  assert.deepEqual(result.candidates.map(candidate => candidate.rule).sort(), ['dangerous-dynamic-code', 'shell-command-construction'])
+})
+
+test('AST analysis does not treat destructuring from a non-request object as a source', () => {
+  const result = analyzeJavaScriptAst(`
+    const trusted = { body: { code: '1 + 1' } }
+    const { body } = trusted
+    eval(body.code)
+  `, 'destructured-negative.ts')
+  assert.equal(result.candidates.some(candidate => candidate.rule === 'dangerous-dynamic-code'), false)
+})
+
+test('AST analysis does not treat a static argument to a helper parameter named req as request data', () => {
+  const result = analyzeJavaScriptAst(`
+    function execute(req) { eval(req) }
+    execute('1 + 1')
+  `, 'parameter-name-negative.ts')
+  assert.equal(result.candidates.some(candidate => candidate.rule === 'dangerous-dynamic-code'), false)
+})
+
 test('AST analysis follows named local wrapper chains without treating static helper calls as tainted', () => {
   const result = analyzeJavaScriptAst(`
     const executeTemplate = (command) => exec(command)
@@ -79,6 +107,16 @@ test('AST module analysis follows request input through relative named imports i
   assert.equal(result.candidates.length, 1)
   assert.equal(result.candidates[0]?.rule, 'shell-command-construction')
   assert.equal(result.candidates[0]?.file, 'lib/runner.ts')
+  assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
+})
+
+test('AST module analysis preserves destructured request aliases through local imports', () => {
+  const result = analyzeJavaScriptModuleGraph([
+    { file: 'route.ts', source: "import { execute } from './runner'\nexport function route(request) { const { query: q } = request; execute(q.command) }\n" },
+    { file: 'runner.ts', source: 'export function execute(command) { exec(command) }\n' },
+  ])
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.rule, 'shell-command-construction')
   assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
 })
 

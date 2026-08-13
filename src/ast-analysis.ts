@@ -99,6 +99,22 @@ function localFunctions(program: AstNode): FunctionRecord[] {
   return records
 }
 
+function assignmentNames(pattern: AstNode | undefined): string[] {
+  const direct = id(pattern)
+  if (direct) return [direct]
+  if (pattern?.type === 'ObjectPattern') return ((pattern.properties ?? []) as AstNode[]).flatMap(property => property.type === 'Property' ? assignmentNames(property.value as AstNode) : property.type === 'RestElement' ? assignmentNames(property.argument as AstNode) : [])
+  if (pattern?.type === 'ArrayPattern') return ((pattern.elements ?? []) as Array<AstNode | null>).flatMap(element => assignmentNames(element ?? undefined))
+  if (pattern?.type === 'AssignmentPattern') return assignmentNames(pattern.left as AstNode)
+  if (pattern?.type === 'RestElement') return assignmentNames(pattern.argument as AstNode)
+  return []
+}
+
+function destructuresRequestObject(pattern: AstNode | undefined, value: AstNode | undefined): boolean {
+  if (pattern?.type !== 'ObjectPattern' && pattern?.type !== 'ArrayPattern') return false
+  const name = memberName(value).toLowerCase()
+  return /^(?:req|request|event)(?:\.|$)/.test(name)
+}
+
 function propertyName(node: AstNode | undefined): string { return node?.computed ? literal(node.key as AstNode).toLowerCase() : id(node?.key as AstNode)?.toLowerCase() ?? '' }
 
 function outboundDestinationArguments(argumentsList: AstNode[]): AstNode[] {
@@ -152,12 +168,12 @@ function localFunctionSinks(program: AstNode): Map<string, Map<number, FunctionS
 export function analyzeJavaScriptAst(source: string, file: string): { candidates: Candidate[]; parseError?: string } {
   let program: AstNode
   try { program = parse(source, { loc: true, range: true, jsx: true, comment: false }) as unknown as AstNode } catch (error) { return { candidates: [], parseError: error instanceof Error ? error.message : String(error) } }
-  const tainted = new Set<string>(); const assignments: Array<{ name: string; value: AstNode }> = []
+  const tainted = new Set<string>(); const assignments: Array<{ name: string; value: AstNode; requestDestructure: boolean }> = []
   walk(program, node => {
-    if (node.type === 'VariableDeclarator') { const name = id(node.id as AstNode); const value = node.init as AstNode | undefined; if (name && value) assignments.push({ name, value }) }
-    if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value }) }
+    if (node.type === 'VariableDeclarator') { const pattern = node.id as AstNode; const value = node.init as AstNode | undefined; if (value) for (const name of assignmentNames(pattern)) assignments.push({ name, value, requestDestructure: destructuresRequestObject(pattern, value) }) }
+    if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value, requestDestructure: false }) }
   })
-  for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && sourceExpression(assignment.value, tainted)) { tainted.add(assignment.name); changed = true } if (!changed) break }
+  for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && (assignment.requestDestructure || sourceExpression(assignment.value, tainted))) { tainted.add(assignment.name); changed = true } if (!changed) break }
   const candidates: Candidate[] = []; const functions = new Map(localFunctions(program).map(item => [item.name, item])); const summaries = localFunctionSinks(program)
   walk(program, node => {
     if (node.type !== 'CallExpression') return
@@ -331,9 +347,9 @@ export function analyzeJavaScriptModuleGraph(inputs: JavaScriptModule[]): Module
   const functions = new Map<string, ModuleFunction>(); for (const module of modules.values()) for (const record of module.functions.values()) functions.set(record.id, record)
   const summaries = moduleFunctionSinks(modules, functions); const candidates: Candidate[] = []
   for (const module of modules.values()) {
-    const tainted = new Set<string>(); const assignments: Array<{ name: string; value: AstNode }> = []
-    walk(module.program, node => { if (node.type === 'VariableDeclarator') { const name = id(node.id as AstNode); const value = node.init as AstNode | undefined; if (name && value) assignments.push({ name, value }) }; if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value }) } })
-    for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && sourceExpression(assignment.value, tainted)) { tainted.add(assignment.name); changed = true }; if (!changed) break }
+    const tainted = new Set<string>(); const assignments: Array<{ name: string; value: AstNode; requestDestructure: boolean }> = []
+    walk(module.program, node => { if (node.type === 'VariableDeclarator') { const pattern = node.id as AstNode; const value = node.init as AstNode | undefined; if (value) for (const name of assignmentNames(pattern)) assignments.push({ name, value, requestDestructure: destructuresRequestObject(pattern, value) }) }; if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value, requestDestructure: false }) } })
+    for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && (assignment.requestDestructure || sourceExpression(assignment.value, tainted))) { tainted.add(assignment.name); changed = true }; if (!changed) break }
     walk(module.program, node => {
       if (node.type !== 'CallExpression') return
       const target = targetForCall(module, node, modules, functions); if (!target) return

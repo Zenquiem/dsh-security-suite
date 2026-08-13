@@ -198,6 +198,20 @@ test('directory assessment records cross-module JavaScript data-flow evidence', 
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment traces destructured request aliases into a local JavaScript sink wrapper', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await mkdir(join(root, 'lib'))
+    await writeFile(join(root, 'route.ts'), "import { execute } from './lib/runner'\nexport function route(request) { const { query: q } = request; execute(q.command) }\n")
+    await writeFile(join(root, 'lib', 'runner.ts'), 'export function execute(command) { exec(command) }\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidate = result.candidates.find(item => item.rule === 'shell-command-construction' && item.file === 'lib/runner.ts')
+    assert.ok(candidate)
+    assert.equal(candidate.evidence.some(item => item.location?.file === 'route.ts' && item.location.role === 'propagation'), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'ast.cross-module-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment records cross-module CommonJS data-flow evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -445,6 +459,25 @@ test('diff scan traces an added request path into an unchanged local JavaScript 
     assert.equal(finding.evidence.some(item => item.detail.includes('cross-module call-chain') && item.location?.file === 'route.ts' && item.location.line === 2), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
     assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-semantic-multilanguage', 'diff-ci-workflows', 'diff-removed-controls'])
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces an added destructured request alias into an unchanged local JavaScript sink wrapper', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, 'lib'))
+    await writeFile(join(root, 'lib', 'runner.ts'), 'export function execute(command: string) { exec(command) }\n')
+    await writeFile(join(root, 'route.ts'), "import { execute } from './lib/runner'\nexport function route() { return 'ok' }\n")
+    await execFileAsync('git', ['add', '.'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'route.ts'), "import { execute } from './lib/runner'\nexport function route(request: Request) { const { query: q } = request; execute(q.command) }\n")
+    const scan = await runDiffScan(root, undefined, '')
+    const finding = scan.findings.find(item => item.ruleId === 'shell.command.construction')
+    assert.ok(finding)
+    assert.equal(finding.evidence.some(item => item.location?.file === 'route.ts' && item.location?.line === 2 && item.location.role === 'propagation'), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
