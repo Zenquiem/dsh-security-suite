@@ -72,6 +72,75 @@ test('directory assessment relates Express state-changing routes to local and pr
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment propagates explicit parent-router authorization mounts without masking unprotected routers', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'routes.ts'), `
+      const admin = Router()
+      const sessions = Router()
+      const publicApi = Router()
+      const late = Router()
+      app.use('/admin', requireAuthorization, admin)
+      app.use('/public', publicApi)
+      app.use(requireSession, sessions)
+      admin.post('/users', createUser)
+      sessions.delete('/current', sessionController.destroy)
+      publicApi.post('/signup', signup)
+      late.post('/early', removeDraft)
+      late.use(requireRole)
+      late.post('/late', removeDraft)
+    `)
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const routes = result.candidates.filter(item => item.rule === 'missing-authorization-route')
+    assert.deepEqual(routes.map(item => item.line), [11, 12])
+    assert.equal(routes.every(item => item.evidence[0]?.detail.includes('protected parent-mount')), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('directory assessment relates FastAPI and Spring write routes to explicit authorization declarations', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'api.py'), `
+@app.post('/public')
+def publish(payload: Payload):
+    return payload
+
+@app.delete('/private', dependencies=[Depends(require_authorization)])
+def remove(payload: Payload):
+    return payload
+
+@router.patch('/account')
+async def update(current_user: User = Depends(require_session)):
+    return current_user
+`)
+    await writeFile(join(root, 'Controller.java'), `
+class Controller {
+  @PostMapping("/public")
+  public void create() {}
+
+  @PreAuthorize("hasRole('ADMIN')")
+  @DeleteMapping("/private")
+  public void remove() {}
+
+  @PreAuthorize("hasRole('ADMIN')")
+  public void unrelated() {}
+
+  @PostMapping("/still-public")
+  public void stillPublic() {}
+
+  @RequestMapping(value = "/account", method = RequestMethod.PATCH)
+  @RolesAllowed("USER")
+  public void update() {}
+}
+`)
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const routes = result.candidates.filter(item => item.rule === 'missing-authorization-route')
+    assert.deepEqual(routes.map(item => `${item.file}:${item.line}`).sort(), ['Controller.java:13', 'Controller.java:3', 'api.py:2'])
+    assert.equal(routes.some(item => item.evidence[0]?.detail.includes('FastAPI-style')), true)
+    assert.equal(routes.some(item => item.evidence[0]?.detail.includes('Spring-style')), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment records cross-module JavaScript data-flow evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -232,8 +301,11 @@ test('diff scan distinguishes added risks from deleted authorization and input c
     await writeFile(join(root, 'route.ts'), 'app.post("/admin", handler)\nconst script = req.query.code\neval(script)\n')
     const scan = await runDiffScan(root, undefined, '', state)
     const rules = scan.findings.map(finding => finding.ruleId).sort()
-    assert.deepEqual(rules, ['dangerous.dynamic.code', 'removed.authorization.control', 'removed.input.validation.control'])
+    assert.deepEqual(rules, ['dangerous.dynamic.code', 'missing.authorization.route', 'removed.authorization.control', 'removed.input.validation.control'])
     assert.equal(scan.findings.filter(finding => finding.disposition === 'reportable').length, 3)
+    const route = scan.findings.find(finding => finding.ruleId === 'missing.authorization.route')
+    assert.ok(route)
+    assert.equal(route.locations[0]?.line, 1)
     const authorization = scan.findings.find(finding => finding.ruleId === 'removed.authorization.control')
     assert.ok(authorization)
     assert.equal(authorization.locations[0]?.line, 1)

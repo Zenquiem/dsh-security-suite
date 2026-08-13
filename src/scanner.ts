@@ -79,7 +79,8 @@ function configurationCandidate(rule: ConfigurationRule, file: string, lines: st
 }
 
 const ROUTE_AUTHORIZATION_RULE = { id: 'missing-authorization-route', cwe: 'CWE-862', severity: 'medium' as const, rationale: 'A state-changing route accepts a request handler without a local or previously registered explicit authorization middleware.' }
-const AUTHORIZATION_MIDDLEWARE = /(?:auth(?:enticate|orize|entication|orization)?|permission|role|rbac|access(?:control)?|guard|csrf)/i
+const AUTHORIZATION_MIDDLEWARE = /(?:auth(?:enticate|orize|entication|orization)?|permission|role|rbac|access(?:control)?|guard|csrf|(?:require|ensure|verify|check)Session)/i
+interface RouteCall { receiver: string; method: string; start: number; args: Array<{ text: string; start: number }> }
 
 function closingParenthesis(source: string, open: number): number | undefined {
   let depth = 0; let quote = ''
@@ -110,25 +111,116 @@ function topLevelArguments(source: string, start: number, end: number): Array<{ 
   return values
 }
 
+function memberCalls(source: string, methods: readonly string[]): RouteCall[] {
+  const escaped = methods.map(method => method.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')).join('|')
+  const expression = new RegExp(`\\b([A-Za-z_$][\\w$]*)\\.(${escaped})\\s*\\(`, 'gi'); const calls: RouteCall[] = []
+  for (const match of source.matchAll(expression)) {
+    const start = match.index ?? 0; const open = start + match[0].lastIndexOf('('); const close = closingParenthesis(source, open)
+    if (close === undefined) continue
+    calls.push({ receiver: match[1]!, method: match[2]!.toLowerCase(), start, args: topLevelArguments(source, open + 1, close) })
+  }
+  return calls
+}
+
+function routerVariables(source: string): Set<string> {
+  const result = new Set<string>()
+  for (const match of source.matchAll(/\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:(?:[A-Za-z_$][\w$]*\.)?Router)\s*\(/g)) result.add(match[1]!)
+  return result
+}
+
+function literalRoute(argument: string | undefined): boolean {
+  return Boolean(argument && (/^['"][\s\S]*['"]$/.test(argument) || /^`[^$]*`$/.test(argument)))
+}
+
+function explicitHandler(argument: string | undefined): boolean {
+  if (!argument || AUTHORIZATION_MIDDLEWARE.test(argument)) return false
+  return /^(?:async\s+)?(?:function\b|\(?\s*(?:req|request|ctx)\b)|^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$|^\[/.test(argument)
+}
+
+function explicitAuthorization(value: string): boolean {
+  return AUTHORIZATION_MIDDLEWARE.test(value) || /(?:PreAuthorize|Secured|RolesAllowed|PermitAll|DenyAll|Depends\s*\([^)]*(?:current[_-]?user|authenticated|require[_-]?(?:auth|role|permission|session)|authorize|guard))/i.test(value)
+}
+
 function analyzeRouteAuthorization(file: string, content: string, onlyRules?: Set<string>): Candidate[] {
   if (onlyRules && !onlyRules.has(ROUTE_AUTHORIZATION_RULE.id)) return []
-  const lines = content.split(/\r?\n/); const candidates: Candidate[] = []; const globallyProtected = new Map<string, number[]>()
-  for (const match of content.matchAll(/\b([A-Za-z_$][\w$]*)\.use\s*\(([^)]*)\)/g)) if (AUTHORIZATION_MIDDLEWARE.test(match[2])) {
-    const receiver = match[1]; const positions = globallyProtected.get(receiver) ?? []; positions.push(match.index ?? 0); globallyProtected.set(receiver, positions)
+  const lines = content.split(/\r?\n/); const candidates: Candidate[] = []; const uses = memberCalls(content, ['use']); const routers = routerVariables(content); const globallyProtected = new Map<string, number[]>()
+  for (const use of uses) if (!literalRoute(use.args[0]?.text) && use.args.some(argument => AUTHORIZATION_MIDDLEWARE.test(argument.text))) {
+    const positions = globallyProtected.get(use.receiver) ?? []; positions.push(use.start); globallyProtected.set(use.receiver, positions)
   }
-  for (const match of content.matchAll(/\b([A-Za-z_$][\w$]*)\.(?:post|put|patch|delete)\s*\(/gi)) {
-    const receiver = match[1]; const open = (match.index ?? 0) + match[0].lastIndexOf('('); const close = closingParenthesis(content, open)
-    if (close === undefined) continue
-    const args = topLevelArguments(content, open + 1, close)
-    if (args.length < 2 || !/^['"`]/.test(args[0]?.text ?? '')) continue
-    const handler = args.slice(1).findIndex(argument => /^(?:async\s+)?(?:function\b|\(?\s*(?:req|request|ctx)\b)/.test(argument.text))
-    if (handler < 0) continue
-    const handlerIndex = handler + 1; const protectedByRoute = args.slice(1, handlerIndex).some(argument => AUTHORIZATION_MIDDLEWARE.test(argument.text))
-    if (globallyProtected.get(receiver)?.some(position => position < (match.index ?? 0)) || protectedByRoute) continue
-    const anchor = args[handlerIndex]!; const line = lineAt(content, anchor.start)
-    candidates.push({ rule: ROUTE_AUTHORIZATION_RULE.id, severity: ROUTE_AUTHORIZATION_RULE.severity, file, line, excerpt: sourceLine(lines, line), rationale: ROUTE_AUTHORIZATION_RULE.rationale, cwe: ROUTE_AUTHORIZATION_RULE.cwe, evidence: [{ kind: 'pattern', detail: 'Route authorization analysis found a state-changing request handler without an explicit local or preceding global authorization middleware.', location: { file, line, excerpt: sourceLine(lines, line), role: 'root_control' } }] })
+  const hasPriorGlobalControl = (receiver: string, position: number): boolean => globallyProtected.get(receiver)?.some(control => control < position) ?? false
+  // A protected parent mount protects a child router independently of where its routes are declared.
+  const protectedByMount = new Set<string>()
+  for (let pass = 0; pass < Math.max(1, routers.size); pass++) {
+    let changed = false
+    for (const use of uses) {
+      const mounted = use.args.map(argument => argument.text).filter(argument => routers.has(argument))
+      const control = protectedByMount.has(use.receiver) || hasPriorGlobalControl(use.receiver, use.start) || use.args.some(argument => AUTHORIZATION_MIDDLEWARE.test(argument.text))
+      if (!control) continue
+      for (const target of mounted) if (!protectedByMount.has(target)) { protectedByMount.add(target); changed = true }
+    }
+    if (!changed) break
+  }
+  for (const route of memberCalls(content, ['post', 'put', 'patch', 'delete'])) {
+    const handler = route.args.at(-1)
+    if (route.args.length < 2 || !literalRoute(route.args[0]?.text) || !explicitHandler(handler?.text)) continue
+    const protectedByRoute = route.args.slice(1, -1).some(argument => AUTHORIZATION_MIDDLEWARE.test(argument.text))
+    if (protectedByMount.has(route.receiver) || hasPriorGlobalControl(route.receiver, route.start) || protectedByRoute) continue
+    const line = lineAt(content, route.start); const excerpt = sourceLine(lines, line)
+    candidates.push({ rule: ROUTE_AUTHORIZATION_RULE.id, severity: ROUTE_AUTHORIZATION_RULE.severity, file, line, excerpt, rationale: ROUTE_AUTHORIZATION_RULE.rationale, cwe: ROUTE_AUTHORIZATION_RULE.cwe, evidence: [{ kind: 'pattern', detail: 'Route authorization analysis found a state-changing request handler without an explicit local, preceding global, or protected parent-mount authorization middleware.', location: { file, line, excerpt, role: 'root_control' } }] })
   }
   return candidates
+}
+
+function frameworkRouteCandidate(file: string, lines: string[], offset: number, detail: string): Candidate {
+  const line = lineAt(lines.join('\n'), offset); const excerpt = sourceLine(lines, line)
+  return { rule: ROUTE_AUTHORIZATION_RULE.id, severity: ROUTE_AUTHORIZATION_RULE.severity, file, line, excerpt, rationale: ROUTE_AUTHORIZATION_RULE.rationale, cwe: ROUTE_AUTHORIZATION_RULE.cwe, evidence: [{ kind: 'pattern', detail, location: { file, line, excerpt, role: 'root_control' } }] }
+}
+
+function analyzePythonRouteAuthorization(file: string, content: string): Candidate[] {
+  const lines = content.split(/\r?\n/); const candidates: Candidate[] = []
+  for (const match of content.matchAll(/@([A-Za-z_]\w*)\.(?:post|put|patch|delete)\s*\(/gi)) {
+    const start = match.index ?? 0; const open = start + match[0].lastIndexOf('('); const close = closingParenthesis(content, open); if (close === undefined) continue
+    const routeArguments = content.slice(open + 1, close); if (!/^\s*['"]/.test(routeArguments)) continue
+    const following = content.slice(close + 1, close + 1 + 2_000); const header = /(?:^|\n)\s*(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(([\s\S]{0,1200}?)\)\s*(?:->[^:\n]+)?\s*:/.exec(following)
+    if (!header) continue
+    const decorators = following.slice(0, header.index); const protectedRoute = explicitAuthorization(routeArguments) || explicitAuthorization(decorators) || explicitAuthorization(header[1] ?? '')
+    if (!protectedRoute) candidates.push(frameworkRouteCandidate(file, lines, start, 'FastAPI-style route analysis found a state-changing handler without an explicit route, decorator, or parameter dependency authorization control.'))
+  }
+  return candidates
+}
+
+function contiguousLeadingAnnotations(content: string, position: number): string {
+  const lines = content.slice(0, position).split(/\r?\n/); const values: string[] = []
+  for (let index = lines.length - 1; index >= 0; index--) {
+    const value = lines[index]!.trim()
+    if (!value) continue
+    if (!value.startsWith('@')) break
+    values.unshift(value)
+  }
+  return values.join('\n')
+}
+
+function analyzeJavaRouteAuthorization(file: string, content: string): Candidate[] {
+  const lines = content.split(/\r?\n/); const candidates: Candidate[] = []
+  const mapping = /@(PostMapping|PutMapping|PatchMapping|DeleteMapping|RequestMapping)\b(?:\s*\(([^)]*)\))?/gi
+  for (const match of content.matchAll(mapping)) {
+    const method = match[1]!.toLowerCase(); const argumentsText = match[2] ?? ''
+    if (method === 'requestmapping' && !/RequestMethod\.(?:POST|PUT|PATCH|DELETE)\b/i.test(argumentsText)) continue
+    const start = match.index ?? 0; const following = content.slice(start + match[0].length, start + match[0].length + 2_000)
+    const header = /(?:^|\n)\s*(?:public|protected|private)?\s*(?:static\s+)?[\w<>\[\],? ]+\s+[A-Za-z_]\w*\s*\([^)]*\)\s*(?:throws\s+[\w,. ]+)?\{/.exec(following)
+    if (!header) continue
+    const annotations = `${contiguousLeadingAnnotations(content, start)}\n${following.slice(0, header.index)}`
+    if (!explicitAuthorization(annotations)) candidates.push(frameworkRouteCandidate(file, lines, start, 'Spring-style route analysis found a state-changing handler without an explicit method authorization annotation.'))
+  }
+  return candidates
+}
+
+function analyzeFrameworkRouteAuthorization(file: string, content: string, onlyRules?: Set<string>): Candidate[] {
+  if (onlyRules && !onlyRules.has(ROUTE_AUTHORIZATION_RULE.id)) return []
+  const language = languageFor(file)
+  if (language === 'python') return analyzePythonRouteAuthorization(file, content)
+  if (language === 'java') return analyzeJavaRouteAuthorization(file, content)
+  return []
 }
 
 /** Analyze security-sensitive configuration blocks that require paired controls. */
@@ -231,8 +323,9 @@ function analyzeText(root: string, file: string, content: string, pass: string, 
   candidates.push(...configuration)
   for (const rule of Object.values(CONFIGURATION_RULES)) if (!onlyRules || onlyRules.has(rule.id)) receipts.push({ ruleId: rule.id, pass, matches: configuration.filter(item => item.rule === rule.id).length })
   const routes = analyzeRouteAuthorization(rel, content, onlyRules)
-  candidates.push(...routes)
-  if (!onlyRules || onlyRules.has(ROUTE_AUTHORIZATION_RULE.id)) receipts.push({ ruleId: ROUTE_AUTHORIZATION_RULE.id, pass, matches: routes.length })
+  const frameworkRoutes = analyzeFrameworkRouteAuthorization(rel, content, onlyRules)
+  candidates.push(...routes, ...frameworkRoutes)
+  if (!onlyRules || onlyRules.has(ROUTE_AUTHORIZATION_RULE.id)) receipts.push({ ruleId: ROUTE_AUTHORIZATION_RULE.id, pass, matches: routes.length + frameworkRoutes.length })
   return { candidates, receipts }
 }
 
