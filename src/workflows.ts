@@ -1,6 +1,6 @@
 export const FULL_SECURITY_WORKFLOW = `## DSH Security Suite workflow
 
-Use this workflow for security work. The suite preserves the Codex Security phases in DSH: policy and threat model; standard, diff, or deep scan; candidate discovery; independent validation; attack-path analysis; finding triage; remediation; vulnerability write-up; hardening proposal; and approved external tracking.
+Use this workflow for security work: policy and threat model; standard, diff, or deep scan; candidate discovery; independent validation; attack-path analysis; finding triage; remediation; vulnerability write-up; hardening proposal; and approved external tracking.
 
 1. Select the narrowest scan type that matches the request: repository/path for standard, Git range for diff, or deep for a multi-pass review. Call a scan tool first when it adds evidence.
 2. Treat scan results as candidates. For each candidate, inspect the surrounding source and trace attacker-controlled input through transformations, controls, and the sensitive operation. A keyword match is never a confirmed vulnerability.
