@@ -54,6 +54,17 @@ test('directory assessment does not flag paired configuration controls that rema
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment scopes Java XML hardening controls to the parser creation block', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'Xml.java'), 'class Xml {\n void unsafe() throws Exception {\n  DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();\n  factory.newDocumentBuilder();\n }\n void hardened() throws Exception {\n  DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();\n  factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);\n  factory.newDocumentBuilder();\n }\n}\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'xml-external-entity-risk')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.line, 4)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment ties Python JWT verification disablement to a PyJWT call and excludes unused settings', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {

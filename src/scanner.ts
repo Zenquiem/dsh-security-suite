@@ -298,6 +298,14 @@ function pythonJwtConfigurationCandidates(file: string, content: string, lines: 
   return candidates
 }
 
+function containingJavaBlock(source: string, offset: number): { start: number; end: number } | undefined {
+  for (let open = source.lastIndexOf('{', offset); open >= 0; open = source.lastIndexOf('{', open - 1)) {
+    const end = closingBrace(source, open)
+    if (end !== undefined && end >= offset) return { start: open + 1, end }
+  }
+  return undefined
+}
+
 /** Analyze security-sensitive configuration blocks that require paired controls. */
 function analyzeSecurityConfiguration(file: string, content: string, onlyRules?: Set<string>): Candidate[] {
   const lines = content.split(/\r?\n/); const candidates: Candidate[] = []
@@ -317,7 +325,9 @@ function analyzeSecurityConfiguration(file: string, content: string, onlyRules?:
   }
   if (enabled(CONFIGURATION_RULES.xml) && languageFor(file) === 'java') {
     for (const match of content.matchAll(/\b(?:DocumentBuilderFactory|SAXParserFactory|XMLInputFactory)\s+(\w+)\s*=\s*(?:DocumentBuilderFactory\.newInstance|SAXParserFactory\.newInstance|XMLInputFactory\.newFactory)\s*\(\s*\)/g)) {
-      const variable = match[1]; const start = match.index ?? 0; const window = content.slice(start, start + 8_000)
+      const variable = match[1]; const start = match.index ?? 0; const block = containingJavaBlock(content, start)
+      if (!block) continue
+      const window = content.slice(start, block.end)
       const builder = new RegExp(`\\b${variable}\\.(?:newDocumentBuilder|newSAXParser|createXMLStreamReader)\\s*\\(`).exec(window)
       if (!builder) continue
       const hardening = new RegExp(`\\b${variable}\\.(?:setFeature|setAttribute|setProperty)\\s*\\([\\s\\S]{0,500}?(?:disallow-doctype-decl|external-general-entities|external-parameter-entities|ACCESS_EXTERNAL_(?:DTD|SCHEMA)|SUPPORT_DTD|IS_SUPPORTING_EXTERNAL_ENTITIES)`, 'i').exec(window.slice(0, builder.index))
