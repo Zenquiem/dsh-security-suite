@@ -1,0 +1,4 @@
+dist/
+node_modules/
+*.log
+pyghidra_mcp_projects/

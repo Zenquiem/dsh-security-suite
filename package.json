@@ -1,0 +1,65 @@
+{
+  "name": "dsh-security-suite",
+  "version": "0.1.0",
+  "description": "Security assessment workflows for DeepSeek Harness",
+  "license": "Apache-2.0",
+  "type": "module",
+  "private": false,
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "default": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "test": "node --import tsx --test tests/**/*.test.ts"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0-rc.7",
+    "@deepseek-ai/dsh-system-prompt": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.0.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.0"
+  },
+  "devDependencies": {
+    "@deepseek-ai/cordis": "^4.0.0-rc.7",
+    "@deepseek-ai/dsh-system-prompt": "^0.0.1-rc.1",
+    "@deepseek-ai/dsh-tools": "^0.0.1-rc.1",
+    "@deepseek-ai/schemastery": "^3.18.0",
+    "@types/node": "^22.20.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Zenquiem/dsh-security-suite.git"
+  },
+  "bugs": {
+    "url": "https://github.com/Zenquiem/dsh-security-suite/issues"
+  },
+  "homepage": "https://github.com/Zenquiem/dsh-security-suite#readme",
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "security",
+    "code-review",
+    "appsec"
+  ]
+}
