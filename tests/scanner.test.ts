@@ -40,6 +40,27 @@ test('directory assessment records cross-module JavaScript data-flow evidence', 
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('scan findings preserve structured entrypoint, propagation, and sink locations from native flow evidence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await mkdir(join(root, 'lib'))
+    await writeFile(join(root, 'route.ts'), "import { execute } from './lib/runner'\nexport function route(req) { execute(req.query.command) }\n")
+    await writeFile(join(root, 'lib', 'runner.ts'), 'export function execute(command) { exec(command) }\n')
+    const scan = await runScan(root, { maxFiles: 10, maxFileBytes: 4096, stateDir: state }, 'standard', '', false, state)
+    const finding = scan.findings.find(item => item.ruleId === 'shell.command.construction')
+    assert.ok(finding)
+    assert.equal(finding.locations.some(location => location.file === 'lib/runner.ts' && location.role === 'sink'), true)
+    assert.equal(finding.locations.some(location => location.file === 'route.ts' && location.role === 'propagation'), true)
+    finding.disposition = 'reportable'; finding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition: 'reportable', summary: 'Validated source flow.' }); finding.ledger.push({ at: new Date().toISOString(), phase: 'attack_path', disposition: 'reportable', summary: 'Validated path.' }); scan.lifecycle = 'completed'; scan.completedAt = new Date().toISOString()
+    await finalizeAndSaveScan(state, scan)
+    const saved = await loadScan(state, scan.id); const reportable = saved.findings.find(item => item.id === finding.id)!
+    const report = await readFile(join(saved.artifacts.directory, reportable.writeup!.reportPath), 'utf8')
+    assert.match(report, /route\.ts:2/)
+    assert.match(report, /lib\/runner\.ts:1/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
 test('directory assessment records Python and Go cross-file data-flow evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {

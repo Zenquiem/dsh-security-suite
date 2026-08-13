@@ -147,7 +147,16 @@ function candidateToFinding(candidate: Candidate): Finding {
   const confidence: Confidence = hasContext && candidate.rule === 'tls-verification-disabled' ? 'medium' : 'low'
   const anchor = slug(`${candidate.file}-${candidate.excerpt}`)
   const candidateIdentifier = candidateId(candidate.rule, candidate.file, candidate.line)
-  return { id: findingId(candidate.rule, anchor), candidateId: candidateIdentifier, fingerprint, ruleId: candidate.rule.replaceAll('-', '.'), identity: { anchor, instance: slug(`${candidate.file}-${candidate.line}`) }, title: candidate.rule.replaceAll('-', ' '), severity: candidate.severity, confidence, cwe: candidate.cwe, status: 'open', disposition: 'discovered', locations: [location(candidate.file, candidate.line, candidate.excerpt)], rootCause: candidate.rationale, validation: 'Discovery-only candidate. Static evidence must establish attacker control, a broken control or sensitive sink, and impact before reportability.', attackPath: 'Not established.', impact: 'Not established.', remediation: 'Review the data flow and apply a context-appropriate safe API, validation, authorization, or containment control.', counterevidence: 'No control analysis has been completed.', evidence: candidate.evidence, ledger: [{ at: new Date().toISOString(), phase: 'discovery', disposition: 'discovered', summary: `Native rule ${candidate.rule} matched ${candidate.file}:${candidate.line}.` }] }
+  const locations = [location(candidate.file, candidate.line, candidate.excerpt), ...candidate.evidence.flatMap(item => item.location ? [item.location] : [])]
+  return { id: findingId(candidate.rule, anchor), candidateId: candidateIdentifier, fingerprint, ruleId: candidate.rule.replaceAll('-', '.'), identity: { anchor, instance: slug(`${candidate.file}-${candidate.line}`) }, title: candidate.rule.replaceAll('-', ' '), severity: candidate.severity, confidence, cwe: candidate.cwe, status: 'open', disposition: 'discovered', locations: dedupeLocations(locations), rootCause: candidate.rationale, validation: 'Discovery-only candidate. Static evidence must establish attacker control, a broken control or sensitive sink, and impact before reportability.', attackPath: 'Not established.', impact: 'Not established.', remediation: 'Review the data flow and apply a context-appropriate safe API, validation, authorization, or containment control.', counterevidence: 'No control analysis has been completed.', evidence: candidate.evidence, ledger: [{ at: new Date().toISOString(), phase: 'discovery', disposition: 'discovered', summary: `Native rule ${candidate.rule} matched ${candidate.file}:${candidate.line}.` }] }
+}
+
+function dedupeLocations(locations: Finding['locations']): Finding['locations'] {
+  const unique = new Map<string, Finding['locations'][number]>()
+  for (const item of locations) unique.set(`${item.file}:${item.line}:${item.role ?? 'root_control'}`, item)
+  // The first location is the candidate's primary sink/root-control anchor.
+  // Preserve it for diff semantics while retaining every later flow location.
+  return [...unique.values()]
 }
 
 function reduceCandidates(candidates: Candidate[]): Finding[] {
@@ -156,7 +165,7 @@ function reduceCandidates(candidates: Candidate[]): Finding[] {
     const finding = candidateToFinding(candidate)
     const mergeKey = `${finding.ruleId}:${finding.locations[0].file}:${finding.locations[0].line}`
     const existing = [...byFingerprint.values()].find(item => `${item.ruleId}:${item.locations[0].file}:${item.locations[0].line}` === mergeKey)
-    if (existing) { existing.evidence.push(...finding.evidence); if (finding.evidence.some(item => item.detail.startsWith('AST resolved'))) existing.rootCause = finding.rootCause }
+    if (existing) { existing.evidence.push(...finding.evidence); existing.locations = dedupeLocations([...existing.locations, ...finding.locations]); if (finding.evidence.some(item => item.detail.startsWith('AST resolved'))) existing.rootCause = finding.rootCause }
     else byFingerprint.set(finding.fingerprint, finding)
   }
   return [...byFingerprint.values()].sort((a, b) => a.locations[0].file.localeCompare(b.locations[0].file) || a.locations[0].line - b.locations[0].line)
