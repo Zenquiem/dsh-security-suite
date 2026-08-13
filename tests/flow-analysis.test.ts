@@ -64,6 +64,24 @@ test('Go package analysis does not join matching package names across directorie
   assert.equal(result.candidates.length, 0)
 })
 
+test('Go package analysis follows a static local-module import across package directories', () => {
+  const result = analyzeGoPackageGraph([
+    { file: 'api/route.go', modulePath: 'example.test/service', source: 'package api\nimport runner "example.test/service/internal/runner"\nfunc Route(r Request) { runner.Execute(r.FormValue("cmd")) }\n' },
+    { file: 'internal/runner/runner.go', modulePath: 'example.test/service', source: 'package runner\nfunc Execute(command string) { exec.Command("sh", "-c", command) }\n' },
+  ])
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.file, 'internal/runner/runner.go')
+  assert.equal(result.candidates[0]?.evidence.some(item => item.location?.file === 'api/route.go'), true)
+})
+
+test('Go package analysis does not resolve external imports to a scanned package with the same name', () => {
+  const result = analyzeGoPackageGraph([
+    { file: 'api/route.go', modulePath: 'example.test/service', source: 'package api\nimport runner "github.com/external/runner"\nfunc Route(r Request) { runner.Execute(r.FormValue("cmd")) }\n' },
+    { file: 'internal/runner/runner.go', modulePath: 'example.test/service', source: 'package runner\nfunc Execute(command string) { exec.Command("sh", "-c", command) }\n' },
+  ])
+  assert.equal(result.candidates.length, 0)
+})
+
 const structuredCases: Array<{ language: StructuredLanguage; file: string; source: string }> = [
   { language: 'java', file: 'Handler.java', source: 'class Handler {\n void execute(String command) {\n  Runtime.getRuntime().exec(command);\n }\n void route(Request request) {\n  execute(request.getParameter("cmd"));\n }\n}' },
   { language: 'csharp', file: 'Handler.cs', source: 'class Handler {\n void Execute(string command) {\n  Process.Start(command);\n }\n void Route(HttpRequest Request) {\n  Execute(Request.Query["cmd"]);\n }\n}' },

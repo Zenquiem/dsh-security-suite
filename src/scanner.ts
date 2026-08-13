@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto'
 import { access, mkdir, readdir, readFile, stat } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
-import { basename, extname, join, relative, resolve, sep } from 'node:path'
+import { basename, dirname, extname, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
 import type { CandidateDisposition, Confidence, Evidence, FileReceipt, Finding, Preflight, RuleReceipt, ScanActivity, ScanRecord, Severity, TargetSnapshot } from './contracts.js'
 import { candidateId, createScanId, findingId, getStateDir, scanArtifactDir, sealScan, sha256 } from './state.js'
@@ -81,6 +81,28 @@ async function collectFiles(root: string, limits: ScanLimits): Promise<{ files: 
   return { files, skipped, complete }
 }
 
+async function localGoModulePath(root: string, file: string, cache: Map<string, string | undefined>): Promise<string | undefined> {
+  let directory = dirname(file); const visited: string[] = []
+  while (isContained(root, directory)) {
+    if (cache.has(directory)) {
+      const value = cache.get(directory)
+      for (const path of visited) cache.set(path, value)
+      return value
+    }
+    visited.push(directory)
+    try {
+      const source = await readFile(join(directory, 'go.mod'), 'utf8')
+      const value = /^\s*module\s+([^\s/][^\s]*)\s*$/m.exec(source)?.[1]
+      for (const path of visited) cache.set(path, value)
+      return value
+    } catch { /* Keep searching parent directories inside this scan root. */ }
+    if (directory === root) break
+    directory = dirname(directory)
+  }
+  for (const path of visited) cache.set(path, undefined)
+  return undefined
+}
+
 function analyzeText(root: string, file: string, content: string, pass: string, onlyRules?: Set<string>): { candidates: Candidate[]; receipts: RuleReceipt[] } {
   const rel = relative(root, file); const language = languageFor(file); const lines = content.split(/\r?\n/); const candidates: Candidate[] = []; const receipts: RuleReceipt[] = []
   for (const rule of RULES) {
@@ -102,7 +124,7 @@ function analyzeText(root: string, file: string, content: string, pass: string, 
 }
 
 export async function assessDirectory(directory: string, limits: ScanLimits, deep = false): Promise<ScanResult> {
-  const root = resolve(directory); const { files, skipped, complete } = await collectFiles(root, limits); const candidates: Candidate[] = []; const ruleReceipts: RuleReceipt[] = []; const fileReceipts: FileReceipt[] = []; const policyFiles: string[] = []; const modules: JavaScriptModule[] = []; const pythonModules: Array<{ file: string; source: string }> = []; const goModules: Array<{ file: string; source: string }> = []; const structuredModules: Record<StructuredLanguage, Array<{ file: string; source: string }>> = { java: [], csharp: [], php: [], ruby: [], c: [], cpp: [], rust: [] }; const passes = deep ? [['baseline', undefined], ['injection', new Set(['dangerous-dynamic-code', 'shell-command-construction', 'unsafe-deserialization'])], ['boundaries', new Set(['path-traversal-sink', 'ssrf-request-sink', 'tls-verification-disabled', 'weak-randomness-security', 'hardcoded-secret-marker'])]] as const : [['baseline', undefined]] as const
+  const root = resolve(directory); const { files, skipped, complete } = await collectFiles(root, limits); const candidates: Candidate[] = []; const ruleReceipts: RuleReceipt[] = []; const fileReceipts: FileReceipt[] = []; const policyFiles: string[] = []; const modules: JavaScriptModule[] = []; const pythonModules: Array<{ file: string; source: string }> = []; const goModules: Array<{ file: string; source: string; modulePath?: string }> = []; const goModuleCache = new Map<string, string | undefined>(); const structuredModules: Record<StructuredLanguage, Array<{ file: string; source: string }>> = { java: [], csharp: [], php: [], ruby: [], c: [], cpp: [], rust: [] }; const passes = deep ? [['baseline', undefined], ['injection', new Set(['dangerous-dynamic-code', 'shell-command-construction', 'unsafe-deserialization'])], ['boundaries', new Set(['path-traversal-sink', 'ssrf-request-sink', 'tls-verification-disabled', 'weak-randomness-security', 'hardcoded-secret-marker'])]] as const : [['baseline', undefined]] as const
   for (const file of files) {
     const content = await readFile(file, 'utf8'); const rel = relative(root, file)
     fileReceipts.push({ path: rel, bytes: Buffer.byteLength(content, 'utf8'), sha256: hash(content), language: languageFor(file) })
@@ -116,7 +138,7 @@ export async function assessDirectory(directory: string, limits: ScanLimits, dee
       if (ast.parseError) ruleReceipts.push({ ruleId: 'ast.parse-error', pass: 'semantic', matches: 1 })
     }
     if (extname(file) === '.py') { const semantic = analyzePythonFlow(content, rel); candidates.push(...semantic); pythonModules.push({ file: rel, source: content }); ruleReceipts.push({ ruleId: 'python.local-taint', pass: 'semantic', matches: semantic.length }) }
-    if (extname(file) === '.go') { const semantic = analyzeGoFlow(content, rel); candidates.push(...semantic); goModules.push({ file: rel, source: content }); ruleReceipts.push({ ruleId: 'go.local-taint', pass: 'semantic', matches: semantic.length }) }
+    if (extname(file) === '.go') { const semantic = analyzeGoFlow(content, rel); candidates.push(...semantic); goModules.push({ file: rel, source: content, modulePath: await localGoModulePath(root, file, goModuleCache) }); ruleReceipts.push({ ruleId: 'go.local-taint', pass: 'semantic', matches: semantic.length }) }
     const structured = ({ '.java': 'java', '.cs': 'csharp', '.php': 'php', '.rb': 'ruby', '.c': 'c', '.cc': 'cpp', '.cpp': 'cpp', '.rs': 'rust' } as Record<string, StructuredLanguage>)[extname(file)]
     if (structured) structuredModules[structured].push({ file: rel, source: content })
   }
@@ -399,7 +421,8 @@ function candidateTouchesAddedLine(candidate: Candidate, addedLines: Map<string,
  */
 async function semanticDiffCandidates(root: string, addedLines: Map<string, Set<number>>): Promise<{ candidates: Candidate[]; counts: Record<string, number>; parseErrors: number }> {
   const inventory = await collectFiles(root, { maxFiles: 10_000, maxFileBytes: 1_048_576 })
-  const modules = await Promise.all(inventory.files.map(async file => ({ file: relative(root, file), source: await readFile(file, 'utf8') })))
+  const goModuleCache = new Map<string, string | undefined>()
+  const modules = await Promise.all(inventory.files.map(async file => ({ file: relative(root, file), source: await readFile(file, 'utf8'), modulePath: extname(file) === '.go' ? await localGoModulePath(root, file, goModuleCache) : undefined })))
   const javascript = analyzeJavaScriptModuleGraph(modules.filter(module => ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'].includes(extname(module.file))))
   const python = analyzePythonModuleGraph(modules.filter(module => extname(module.file) === '.py'))
   const go = analyzeGoPackageGraph(modules.filter(module => extname(module.file) === '.go'))

@@ -3,7 +3,7 @@ import type { Evidence, Severity } from './contracts.js'
 import type { Candidate } from './scanner.js'
 
 interface FlowRule { id: string; title: string; cwe: string; severity: Severity; rationale: string; sink: RegExp }
-interface FlowModule { file: string; source: string }
+interface FlowModule { file: string; source: string; modulePath?: string }
 interface FlowFunction { id: string; file: string; name: string; params: string[]; start: number; end: number; lines: string[] }
 interface SinkResult { rule: FlowRule; line: number; excerpt: string }
 interface ImportTarget { file: string; exported: string }
@@ -128,9 +128,43 @@ function pythonImports(file: string, source: string, known: Set<string>): { impo
 
 function goPackage(source: string): string | undefined { return /^\s*package\s+([A-Za-z_]\w*)/m.exec(source)?.[1] }
 
+function goImportReferences(source: string): Array<{ local?: string; path: string }> {
+  const values: Array<{ local?: string; path: string }> = []
+  const add = (line: string): void => {
+    const match = /^\s*(?:(?:[A-Za-z_]\w*)|[._])?\s*"([^"]+)"\s*(?:\/\/.*)?$/.exec(line)
+    if (!match) return
+    const prefix = /^\s*([A-Za-z_]\w*|[._])\s+"/.exec(line)?.[1]
+    if (prefix === '_' || prefix === '.') return
+    values.push({ local: prefix, path: match[1] })
+  }
+  const block = /^\s*import\s*\(([^]*?)^\s*\)/m.exec(source)
+  if (block) for (const line of block[1].split(/\r?\n/)) add(line)
+  for (const line of source.split(/\r?\n/)) {
+    const match = /^\s*import\s+(.+)$/.exec(line)
+    if (match && !match[1].trimStart().startsWith('(')) add(match[1])
+  }
+  return values
+}
+
+function goImports(module: ParsedModule, modulePath: string | undefined, modules: Map<string, ParsedModule>): Map<string, string> {
+  const namespaces = new Map<string, string>()
+  if (!modulePath) return namespaces
+  for (const imported of goImportReferences(module.source)) {
+    if (!imported.path.startsWith(`${modulePath}/`)) continue
+    const directory = normalize(imported.path.slice(modulePath.length + 1))
+    const targets = [...modules.values()].filter(candidate => normalize(dirname(candidate.file)) === directory && Boolean(candidate.packageKey))
+    const keys = [...new Set(targets.map(candidate => candidate.packageKey!))]
+    if (keys.length !== 1) continue
+    const local = imported.local ?? targets[0]?.packageKey?.split(':').at(-1)
+    if (local) namespaces.set(local, keys[0])
+  }
+  return namespaces
+}
+
 function resolveCall(module: ParsedModule, call: string, functions: Map<string, FlowFunction>, language: 'python' | 'go'): FlowFunction | undefined {
   const [receiver, member] = call.includes('.') ? call.split('.', 2) : [undefined, call]
   if (language === 'python' && receiver) { const target = module.namespaces.get(receiver); return target ? functions.get(`${target}:${member}`) : undefined }
+  if (language === 'go' && receiver) { const target = module.namespaces.get(receiver); return target ? functions.get(`${target}:${member}`) : undefined }
   if (!receiver) { const imported = module.imports.get(member); if (imported) return functions.get(`${imported.file}:${imported.exported}`); const local = functions.get(`${module.file}:${member}`); if (local) return local; if (language === 'go' && module.packageKey) return functions.get(`${module.packageKey}:${member}`) }
   return undefined
 }
@@ -158,6 +192,10 @@ function summaries(modules: Map<string, ParsedModule>, functions: Map<string, Fl
 function graph(inputs: FlowModule[], language: 'python' | 'go'): FlowGraphAnalysis {
   const extension = language === 'python' ? '.py' : '.go'; const normalized = inputs.filter(input => input.file.endsWith(extension)).map(input => ({ ...input, file: normalize(input.file) })); const known = new Set(normalized.map(input => input.file)); const modules = new Map<string, ParsedModule>()
   for (const input of normalized) { const parsed = language === 'python' ? pythonFunctions(input.file, input.source) : goFunctions(input.file, input.source); const imports = language === 'python' ? pythonImports(input.file, input.source, known) : { imports: new Map<string, ImportTarget>(), namespaces: new Map<string, string>() }; const packageName = language === 'go' ? goPackage(input.source) : undefined; modules.set(input.file, { file: input.file, source: input.source, lines: input.source.split(/\r?\n/), functions: parsed, imports: imports.imports, namespaces: imports.namespaces, packageKey: packageName ? `${normalize(dirname(input.file))}:${packageName}` : undefined }) }
+  if (language === 'go') for (const input of normalized) {
+    const module = modules.get(input.file)
+    if (module) module.namespaces = goImports(module, input.modulePath, modules)
+  }
   const functions = new Map<string, FlowFunction>(); for (const module of modules.values()) for (const fn of module.functions) { functions.set(fn.id, fn); if (language === 'go' && module.packageKey) functions.set(`${module.packageKey}:${fn.name}`, fn) }
   const rules = language === 'python' ? PYTHON_RULES : GO_RULES; const sources = language === 'python' ? PYTHON_SOURCE : GO_SOURCE; const summary = summaries(modules, functions, language, rules, sources); const candidates: Candidate[] = []
   for (const module of modules.values()) {

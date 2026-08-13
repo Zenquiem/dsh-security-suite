@@ -103,6 +103,21 @@ test('directory assessment records Python and Go cross-file data-flow evidence',
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment traces Go data flow through a static local-module import', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await mkdir(join(root, 'api')); await mkdir(join(root, 'internal', 'runner'), { recursive: true })
+    await writeFile(join(root, 'go.mod'), 'module example.test/service\n\ngo 1.24\n')
+    await writeFile(join(root, 'api', 'route.go'), 'package api\nimport runner "example.test/service/internal/runner"\nfunc Route(r Request) { runner.Execute(r.FormValue("cmd")) }\n')
+    await writeFile(join(root, 'internal', 'runner', 'runner.go'), 'package runner\nfunc Execute(command string) { exec.Command("sh", "-c", command) }\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidate = result.candidates.find(item => item.rule === 'shell-command-construction' && item.file === 'internal/runner/runner.go')
+    assert.ok(candidate)
+    assert.equal(candidate.evidence.some(item => item.location?.file === 'api/route.go'), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'go.cross-file-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment records structured flow evidence for Java, C#, PHP, Ruby, C, C++, and Rust', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -277,6 +292,27 @@ test('diff scan traces added Python and Go request paths into unchanged local wr
     assert.equal(shells.some(item => item.locations[0]?.file === 'py_runner.py' && item.evidence.some(evidence => evidence.location?.file === 'py_route.py' && evidence.location.line === 3)), true)
     assert.equal(shells.some(item => item.locations[0]?.file === 'go_runner.go' && item.evidence.some(evidence => evidence.location?.file === 'go_route.go' && evidence.location.line === 2)), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'python.diff-semantic-taint')?.matches, 1)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'go.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces an added Go caller into an unchanged local-module package', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, 'api')); await mkdir(join(root, 'internal', 'runner'), { recursive: true })
+    await writeFile(join(root, 'go.mod'), 'module example.test/service\n\ngo 1.24\n')
+    await writeFile(join(root, 'api', 'route.go'), 'package api\nimport runner "example.test/service/internal/runner"\nfunc Route() string { return "ok" }\n')
+    await writeFile(join(root, 'internal', 'runner', 'runner.go'), 'package runner\nfunc Execute(command string) { exec.Command("sh", "-c", command) }\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'api', 'route.go'), 'package api\nimport runner "example.test/service/internal/runner"\nfunc Route(r Request) { runner.Execute(r.FormValue("cmd")) }\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const finding = scan.findings.find(item => item.ruleId === 'shell.command.construction')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.file, 'internal/runner/runner.go')
+    assert.equal(finding.evidence.some(item => item.location?.file === 'api/route.go' && item.location.line === 3), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'go.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
