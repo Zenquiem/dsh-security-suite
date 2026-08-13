@@ -38,7 +38,7 @@ interface Rule { id: string; title: string; cwe: string; severity: Severity; rat
 interface ConfigurationRule { id: string; cwe: string; severity: Severity; rationale: string }
 
 const RULES: Rule[] = [
-  { id: 'dangerous-dynamic-code', title: 'Dynamic code execution', cwe: 'CWE-95', severity: 'high', rationale: 'Dynamic evaluation can turn attacker-controlled data into code execution.', pattern: /\beval\s*\(|\bnew\s+Function\s*\(/, languages: ['javascript', 'typescript'], context: /(?:req\.|params\.|query\.|body\.|input|user)/i },
+  { id: 'dangerous-dynamic-code', title: 'Dynamic code execution', cwe: 'CWE-95', severity: 'high', rationale: 'Dynamic evaluation can turn attacker-controlled data into code execution.', pattern: /\beval\s*\(|\bnew\s+Function\s*\(/, languages: [] },
   { id: 'shell-command-construction', title: 'Constructed shell command', cwe: 'CWE-78', severity: 'high', rationale: 'A constructed process command needs an attacker-to-shell data-flow review.', pattern: /(?:exec|execSync|spawn|spawnSync|system|popen|subprocess\.(?:run|call|Popen))\s*\([^\n]*(?:\+|`|\$\{|f["'])/i, context: /(?:req\.|params\.|query\.|argv|input|user)/i },
   { id: 'path-traversal-sink', title: 'Request-derived filesystem path', cwe: 'CWE-22', severity: 'medium', rationale: 'A filesystem sink receives request-derived data and needs canonical containment validation.', pattern: /(?:readFile|writeFile|createReadStream|createWriteStream|sendFile|open)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
   { id: 'tls-verification-disabled', title: 'TLS verification disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled.', pattern: /(?:(?:requests|httpx)\.[A-Za-z_]+\s*\([^\n)]*\bverify\s*=\s*False|CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)|InsecureSkipVerify\s*:\s*true)/, languages: ['python', 'go', 'php', 'c', 'cpp', 'csharp'] },
@@ -350,6 +350,7 @@ function analyzeText(root: string, file: string, content: string, pass: string, 
   const rel = relative(root, file); const language = languageFor(file); const lines = content.split(/\r?\n/); const candidates: Candidate[] = []; const receipts: RuleReceipt[] = []
   for (const rule of RULES) {
     if (onlyRules && !onlyRules.has(rule.id)) continue
+    if (['javascript', 'typescript'].includes(language) && new Set(['dangerous-dynamic-code', 'shell-command-construction', 'path-traversal-sink', 'ssrf-request-sink', 'sql-injection-query-construction']).has(rule.id)) { receipts.push({ ruleId: rule.id, pass, matches: 0 }); continue }
     if (rule.languages && !rule.languages.includes(language)) continue
     let matches = 0
     for (const [index, text] of lines.entries()) {
@@ -789,7 +790,10 @@ async function semanticDiffCandidates(root: string, addedLines: Map<string, Set<
   const inventory = await collectFiles(root, { maxFiles: 10_000, maxFileBytes: 1_048_576 })
   const goModuleCache = new Map<string, string | undefined>()
   const modules = await Promise.all(inventory.files.map(async file => ({ file: relative(root, file), source: await readFile(file, 'utf8'), modulePath: extname(file) === '.go' ? await localGoModulePath(root, file, goModuleCache) : undefined })))
-  const javascript = analyzeJavaScriptModuleGraph(modules.filter(module => ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'].includes(extname(module.file))))
+  const javascriptModules = modules.filter(module => ['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'].includes(extname(module.file)))
+  const javascriptGraph = analyzeJavaScriptModuleGraph(javascriptModules)
+  const javascriptLocal = javascriptModules.map(module => analyzeJavaScriptAst(module.source, module.file))
+  const javascriptCandidates = dedupeCandidateObservations([...javascriptGraph.candidates, ...javascriptLocal.flatMap(result => result.candidates)])
   const python = analyzePythonModuleGraph(modules.filter(module => extname(module.file) === '.py'))
   const go = analyzeGoPackageGraph(modules.filter(module => extname(module.file) === '.go'))
   const structuredInputs: Record<StructuredLanguage, Array<{ file: string; source: string }>> = { java: [], csharp: [], php: [], ruby: [], c: [], cpp: [], rust: [] }
@@ -798,10 +802,10 @@ async function semanticDiffCandidates(root: string, addedLines: Map<string, Set<
     if (language) structuredInputs[language].push(module)
   }
   const structured = Object.fromEntries((Object.keys(structuredInputs) as StructuredLanguage[]).map(language => [language, analyzeStructuredFlow(structuredInputs[language], language).candidates])) as Record<StructuredLanguage, Candidate[]>
-  const byEngine: Record<string, Candidate[]> = { 'ast.diff-semantic-taint': javascript.candidates, 'python.diff-semantic-taint': python.candidates, 'go.diff-semantic-taint': go.candidates, ...Object.fromEntries((Object.keys(structured) as StructuredLanguage[]).map(language => [`${language}.diff-semantic-taint`, structured[language]])) }
+  const byEngine: Record<string, Candidate[]> = { 'ast.diff-semantic-taint': javascriptCandidates, 'python.diff-semantic-taint': python.candidates, 'go.diff-semantic-taint': go.candidates, ...Object.fromEntries((Object.keys(structured) as StructuredLanguage[]).map(language => [`${language}.diff-semantic-taint`, structured[language]])) }
   const counts: Record<string, number> = {}; const candidates: Candidate[] = []
   for (const [engine, results] of Object.entries(byEngine)) { const retained = results.filter(candidate => candidateTouchesAddedLine(candidate, addedLines)); counts[engine] = retained.length; candidates.push(...retained) }
-  return { candidates, counts, parseErrors: javascript.parseErrors.length }
+  return { candidates, counts, parseErrors: javascriptGraph.parseErrors.length + javascriptLocal.filter(result => result.parseError).length }
 }
 
 export async function runScan(directory: string, limits: ScanLimits, mode: 'standard' | 'deep', threatModel: string, scopeRequested = false, stateDirectory = '', automaticValidation = true): Promise<ScanRecord> {

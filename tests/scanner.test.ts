@@ -10,10 +10,10 @@ import { finalizeAndSaveScan, loadScan, renderCsv, saveScan, saveTriageAnnotatio
 
 const execFileAsync = promisify(execFile)
 
-test('assessDirectory reports source candidates and skips dependencies', async () => {
+test('assessDirectory reports AST-proven JavaScript candidates and skips dependencies', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
-    await writeFile(join(root, 'app.ts'), "const apiKey = 'live-key-1e67af4309cd'\neval(input)\n")
+    await writeFile(join(root, 'app.ts'), "const apiKey = 'live-key-1e67af4309cd'\neval(input)\nfunction route(req) { eval(req.query.code) }\n")
     await mkdir(join(root, 'node_modules'))
     await writeFile(join(root, 'node_modules', 'ignored.js'), 'eval(input)')
 
@@ -21,6 +21,7 @@ test('assessDirectory reports source candidates and skips dependencies', async (
     assert.equal(result.filesScanned, 1)
     assert.equal(result.filesSkipped, 1)
     assert.deepEqual(result.candidates.map(candidate => candidate.rule).sort(), ['dangerous-dynamic-code', 'hardcoded-secret-marker'])
+    assert.equal(result.candidates.find(candidate => candidate.rule === 'dangerous-dynamic-code')?.line, 3)
   } finally {
     await rm(root, { recursive: true, force: true })
   }
@@ -1047,7 +1048,7 @@ test('scan records persist canonical findings and export SARIF', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
   try {
-    await writeFile(join(root, 'app.ts'), 'eval(input)\n')
+    await writeFile(join(root, 'app.ts'), 'function route(req) { eval(req.query.code) }\n')
     const scan = await runScan(root, { maxFiles: 10, maxFileBytes: 4096 }, 'deep', '')
     await saveScan(state, scan)
     const loaded = await loadScan(state, scan.id)
@@ -1067,7 +1068,7 @@ test('scan records persist canonical findings and export SARIF', async () => {
 test('integrity seal detects an in-memory scan mutation', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
-    await writeFile(join(root, 'app.ts'), 'eval(input)\n')
+    await writeFile(join(root, 'app.ts'), 'function route(req) { eval(req.query.code) }\n')
     const scan = await runScan(root, { maxFiles: 10, maxFileBytes: 4096 }, 'standard', '')
     scan.findings[0].severity = 'low'
     assert.equal(verifySeal(scan), false)
