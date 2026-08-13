@@ -607,6 +607,7 @@ function isMutableAction(value: string | undefined): boolean { return !!value &&
 function addedLine(line: WorkflowLine, added: Set<number>): boolean { return added.has(line.line) }
 
 interface WorkflowShellFlow { entry: WorkflowLine; sink: WorkflowLine; detail: string }
+interface WorkflowEnvironmentWrite extends WorkflowEnvironment { stepStart: number }
 
 function runLines(step: WorkflowStep): Array<{ run: WorkflowLine; body: WorkflowLine[] }> {
   const results: Array<{ run: WorkflowLine; body: WorkflowLine[] }> = []
@@ -672,21 +673,47 @@ function jobUntrustedEnvironment(source: string): Map<string, WorkflowEnvironmen
   return environments
 }
 
+/**
+ * Track only a direct event-expression assignment appended to GITHUB_ENV. The
+ * runner applies this file between steps, so a value becomes available solely
+ * to later steps in the same job. Shell transformations and other environment
+ * files are intentionally outside this static proof boundary.
+ */
+function githubEnvironmentWrites(steps: WorkflowStep[]): Map<string, WorkflowEnvironmentWrite[]> {
+  const writes = new Map<string, WorkflowEnvironmentWrite[]>()
+  for (const step of steps) {
+    for (const { body } of runLines(step)) {
+      for (const line of body) {
+        const match = /^echo\s+(["'])?([A-Za-z_][A-Za-z0-9_]*)=(\$\{\{\s*github\.event\.(?:pull_request|issue|comment)\.[^}]+\}\})\1?\s*>>\s*(?:["']?\$GITHUB_ENV["']?|\$\{GITHUB_ENV\})\s*$/i.exec(line.text)
+        if (!match) continue
+        const values = writes.get(step.job) ?? []
+        values.push({ name: match[2], line, stepStart: step.start })
+        writes.set(step.job, values)
+      }
+    }
+  }
+  return writes
+}
+
 function environmentReference(value: string, name: string): boolean {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   return new RegExp(`(?:\\$${escaped}\\b|\\$\\{${escaped}(?:[?:+\-][^}]*)?\\}|\\$\\{\\{\\s*env\\.${escaped}\\s*\\}\\})`).test(value)
 }
 
-function untrustedShellFlows(step: WorkflowStep, jobEnvironment: WorkflowEnvironment[] = []): WorkflowShellFlow[] {
+function writesRunnerEnvironment(line: WorkflowLine): boolean {
+  return />>\s*(?:["']?\$GITHUB_(?:ENV|OUTPUT)["']?|\$\{GITHUB_(?:ENV|OUTPUT)\})\s*$/i.test(line.text)
+}
+
+function untrustedShellFlows(step: WorkflowStep, jobEnvironment: WorkflowEnvironment[] = [], githubEnvironment: WorkflowEnvironmentWrite[] = []): WorkflowShellFlow[] {
   const flows: WorkflowShellFlow[] = []
   const stepEnvironment = stepUntrustedEnvironment(step)
   const stepOverrides = stepEnvironmentNames(step)
-  const environments = [...stepEnvironment, ...jobEnvironment.filter(environment => !stepOverrides.has(environment.name))]
+  const environments = [...stepEnvironment, ...jobEnvironment.filter(environment => !stepOverrides.has(environment.name)), ...githubEnvironment.filter(environment => environment.stepStart < step.start && !stepOverrides.has(environment.name))]
   for (const { run, body } of runLines(step)) {
-    for (const line of body) if (isUntrustedEvent(line.text)) flows.push({ entry: line, sink: line, detail: 'shell command interpolates untrusted GitHub event data directly' })
+    for (const line of body) if (isUntrustedEvent(line.text) && !writesRunnerEnvironment(line)) flows.push({ entry: line, sink: line, detail: 'shell command interpolates untrusted GitHub event data directly' })
     for (const environment of environments) {
       const sink = body.find(line => environmentReference(line.text, environment.name))
-      if (sink) flows.push({ entry: environment.line, sink, detail: `shell command references ${environment.name}, which is assigned from untrusted GitHub event data ${stepEnvironment.includes(environment) ? 'in the same step' : `at job scope for ${step.job}`}` })
+      if (sink) flows.push({ entry: environment.line, sink, detail: `shell command references ${environment.name}, which is assigned from untrusted GitHub event data ${stepEnvironment.includes(environment) ? 'in the same step' : 'stepStart' in environment ? `through GITHUB_ENV in an earlier step of job ${step.job}` : `at job scope for ${step.job}`}` })
     }
   }
   const unique = new Map<string, WorkflowShellFlow>(); for (const flow of flows) unique.set(`${flow.entry.line}:${flow.sink.line}`, flow)
@@ -722,14 +749,14 @@ function ciWorkflowDiffCandidates(file: string, added: Array<{ line: number; sou
   if (!isGitHubWorkflow(file)) return []
   const candidates: Candidate[] = []; const currentLines = workflowLines(currentSource); const addedNumbers = new Set(added.map(item => item.line)); const pullRequestTarget = currentLines.find(line => /^pull_request_target\s*(?::|$)/i.test(line.text))
   if (pullRequestTarget) {
-    const jobEnvironment = jobUntrustedEnvironment(currentSource)
+    const steps = workflowSteps(currentSource); const jobEnvironment = jobUntrustedEnvironment(currentSource); const githubEnvironment = githubEnvironmentWrites(steps)
     for (const permission of writePermissionLines(currentSource).filter(line => addedLine(line, addedNumbers))) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['write-permissions'], file, permission.line, permission.text.slice(0, 240), `Current pull_request_target trigger at ${file}:${pullRequestTarget.line} has newly added write permission at ${file}:${permission.line}.`, 'root_control'))
-    for (const step of workflowSteps(currentSource)) {
-      for (const flow of untrustedShellFlows(step, jobEnvironment.get(step.job))) { const candidate = workflowShellCandidate(file, flow, addedNumbers); if (candidate) candidates.push(candidate) }
+    for (const step of steps) {
+      for (const flow of untrustedShellFlows(step, jobEnvironment.get(step.job), githubEnvironment.get(step.job))) { const candidate = workflowShellCandidate(file, flow, addedNumbers); if (candidate) candidates.push(candidate) }
       const checkout = step.fields.find(line => /^-\s*uses\s*:\s*actions\/checkout@/i.test(line.text))
       const untrustedCheckoutField = checkout && step.fields.find(line => /^(?:ref|repository)\s*:/i.test(line.text) && isUntrustedEvent(valueAfterKey(line, 'ref') ?? valueAfterKey(line, 'repository')))
       if (!checkout || !untrustedCheckoutField) continue
-      const laterRun = workflowSteps(currentSource).flatMap(other => other.job === step.job && other.start > step.start ? other.fields.filter(line => valueAfterKey(line, 'run') !== undefined) : [])
+      const laterRun = steps.flatMap(other => other.job === step.job && other.start > step.start ? other.fields.filter(line => valueAfterKey(line, 'run') !== undefined) : [])
       const anchor = [untrustedCheckoutField, checkout, ...laterRun].find(line => addedLine(line, addedNumbers))
       if (laterRun.length && anchor) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['untrusted-checkout-execution'], file, anchor.line, anchor.text.slice(0, 240), `pull_request_target at ${file}:${pullRequestTarget.line} checks out pull-request head data at ${file}:${untrustedCheckoutField.line} before a later run step in job ${step.job}.`, anchor === untrustedCheckoutField || anchor === checkout ? 'entrypoint' : 'sink'))
     }
