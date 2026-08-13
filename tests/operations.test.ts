@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { applyRemediationProposal, installPreCommitHook, loadRemediationRollback, planCandidateValidation, remediationPlan, resumeBulkJob, rollbackRemediationProposal, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, startBulkCsvJob } from '../src/operations.ts'
+import { applyRemediationProposal, installPreCommitHook, loadRemediationRollback, planCandidateValidation, proposeReviewedRemediation, remediationPlan, resumeBulkJob, rollbackRemediationProposal, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, startBulkCsvJob } from '../src/operations.ts'
 import { runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
 import { claimAuditTask, recordValidation } from '../src/workbench.ts'
@@ -203,6 +203,37 @@ test('semantic findings retain a review-only remediation proposal instead of a b
     const proposal = await remediationPlan(root, { ...config, stateDir: state }, scan.id, scan.findings[0].id)
     assert.equal(proposal.safeToApply, false)
     await assert.rejects(() => applyRemediationProposal(root, { ...config, stateDir: state }, scan.id, proposal.id, true), /No mechanically safe replacement/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('reviewed remediation binds an exact validated source range, applies reversibly, and rejects drift', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    const original = 'function route(req) { return eval(req.query.code) }\n'
+    await writeFile(join(root, 'app.ts'), original)
+    const scan = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, scan)
+    const finding = scan.findings[0]
+    await assert.rejects(() => proposeReviewedRemediation(root, local, scan.id, finding.id, { file: 'app.ts', startLine: 1, endLine: 1, expectedText: original.trim(), replacementText: 'function route(req) { return safeEvaluate(req.query.code) }', rationale: 'Replace the dynamic execution primitive with the application-owned constrained evaluator.', testPlan: 'Run focused route regression tests.' }), /structured reportable validation/)
+    const claim = await claimAuditTask(local, scan.id, 'validator', 'validation'); assert.ok(claim)
+    await recordValidation(local, scan.id, finding.candidateId, { conclusion: 'reportable', method: 'static', attacker: 'Remote request sender.', entryPoint: 'route request parameter.', trustBoundary: 'Untrusted request crosses into application execution.', rootControl: 'Dynamic evaluation statement.', sink: 'eval invocation.', impact: 'Attacker-controlled execution.', directEvidence: 'Request data reaches eval without a parser or authorization guard.', counterevidence: 'No local containment was identified.', limitations: 'Runtime route execution was not performed.', confidence: 'medium' }, claim.claimToken)
+    const validated = await loadScan(state, scan.id); const reportable = validated.findings.find(item => item.id === finding.id)!; assert.equal(reportable.disposition, 'reportable')
+    const proposal = await proposeReviewedRemediation(root, local, scan.id, finding.id, { file: 'app.ts', startLine: 1, endLine: 1, expectedText: original.trim(), replacementText: 'function route(req) { return safeEvaluate(req.query.code) }', rationale: 'Replace the dynamic execution primitive with the application-owned constrained evaluator.', testPlan: 'Run focused route regression tests.' })
+    assert.equal(proposal.safeToApply, true)
+    assert.match(proposal.patch, /safeEvaluate/)
+    await writeFile(join(root, 'app.ts'), `${original}// concurrent edit\n`)
+    await assert.rejects(() => applyRemediationProposal(root, local, scan.id, proposal.id, true), /stale/)
+    await writeFile(join(root, 'app.ts'), original)
+    const fresh = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, fresh)
+    const freshClaim = await claimAuditTask(local, fresh.id, 'validator', 'validation'); assert.ok(freshClaim)
+    await recordValidation(local, fresh.id, fresh.findings[0].candidateId, { conclusion: 'reportable', method: 'static', attacker: 'Remote request sender.', entryPoint: 'route request parameter.', trustBoundary: 'Untrusted request crosses into application execution.', rootControl: 'Dynamic evaluation statement.', sink: 'eval invocation.', impact: 'Attacker-controlled execution.', directEvidence: 'Request data reaches eval without a parser or authorization guard.', counterevidence: 'No local containment was identified.', limitations: 'Runtime route execution was not performed.', confidence: 'medium' }, freshClaim.claimToken)
+    const freshProposal = await proposeReviewedRemediation(root, local, fresh.id, fresh.findings[0].id, { file: 'app.ts', startLine: 1, endLine: 1, expectedText: original.trim(), replacementText: 'function route(req) { return safeEvaluate(req.query.code) }', rationale: 'Replace the dynamic execution primitive with the application-owned constrained evaluator.', testPlan: 'Run focused route regression tests.' })
+    const applied = await applyRemediationProposal(root, local, fresh.id, freshProposal.id, true)
+    assert.match(await readFile(join(root, 'app.ts'), 'utf8'), /safeEvaluate/)
+    assert.ok(applied.rollbackId); assert.ok(applied.verificationScanId)
+    await rollbackRemediationProposal(root, local, fresh.id, freshProposal.id, true)
+    assert.equal(await readFile(join(root, 'app.ts'), 'utf8'), original)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
