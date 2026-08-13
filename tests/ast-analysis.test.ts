@@ -133,3 +133,43 @@ test('AST module analysis traces request-derived SQL text to a local database wr
   assert.equal(result.candidates[0]?.file, 'queries.ts')
   assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
 })
+
+test('AST analysis traces request-derived source objects into supported prototype-polluting merge APIs', () => {
+  const result = analyzeJavaScriptAst(`
+    function route(req) {
+      const payload = req.body
+      Object.assign({}, payload)
+      _.merge({}, req.body)
+      lodash.merge({}, req.body)
+    }
+  `, 'merge.ts')
+  assert.deepEqual(result.candidates.map(candidate => candidate.rule), [
+    'prototype-pollution-merge',
+    'prototype-pollution-merge',
+    'prototype-pollution-merge',
+  ])
+  assert.equal(result.candidates.every(candidate => candidate.evidence.some(item => item.location?.role === 'sink')), true)
+})
+
+test('AST prototype merge analysis excludes request targets, static sources, and unrelated merge-named calls', () => {
+  const result = analyzeJavaScriptAst(`
+    function merge(target, source) { return source }
+    function route(req) {
+      Object.assign(req.body, { role: 'user' })
+      _.merge({}, { role: 'user' })
+      merge({}, req.body)
+    }
+  `, 'merge-negative.ts')
+  assert.equal(result.candidates.some(candidate => candidate.rule === 'prototype-pollution-merge'), false)
+})
+
+test('AST module analysis follows request-derived objects through local wrappers to a supported merge source', () => {
+  const result = analyzeJavaScriptModuleGraph([
+    { file: 'route.ts', source: "import { apply } from './merge'\nexport function route(req) { apply(req.body) }\n" },
+    { file: 'merge.ts', source: 'export function apply(payload) { return Object.assign({}, payload) }\n' },
+  ])
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.rule, 'prototype-pollution-merge')
+  assert.equal(result.candidates[0]?.file, 'merge.ts')
+  assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
+})

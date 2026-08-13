@@ -212,6 +212,22 @@ test('directory assessment records cross-module CommonJS data-flow evidence', as
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment records request-derived object merge evidence without flagging request targets', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await mkdir(join(root, 'lib'))
+    await writeFile(join(root, 'route.ts'), "import { apply } from './lib/merge'\nexport function route(req) { apply(req.body) }\n")
+    await writeFile(join(root, 'lib', 'merge.ts'), 'export function apply(payload) { return Object.assign({}, payload) }\nexport function targetOnly(payload) { return Object.assign(payload, { role: "user" }) }\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'prototype-pollution-merge')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.file, 'lib/merge.ts')
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink'), true)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.file === 'route.ts' && item.location.role === 'propagation'), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'ast.cross-module-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment follows a CommonJS default function export', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -435,6 +451,26 @@ test('diff scan traces an added request path into an unchanged local SQL query w
     assert.equal(finding.locations[0]?.file, 'lib/queries.ts')
     assert.equal(scan.findings.filter(item => item.ruleId === 'sql.injection.query.construction').length, 1)
     assert.equal(finding.evidence.some(item => item.location?.file === 'route.ts' && item.location.line === 2), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces an added request object into an unchanged local merge wrapper', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, 'lib'))
+    await writeFile(join(root, 'route.ts'), 'export function route() {}\n')
+    await writeFile(join(root, 'lib', 'merge.ts'), 'export function apply(payload: object) { return Object.assign({}, payload) }\nexport function target(payload: object) { return Object.assign(payload, { role: "user" }) }\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'route.ts'), "import { apply, target } from './lib/merge'\nexport function route(req: Request) { apply(req.body); target(req.body) }\n")
+    const scan = await runDiffScan(root, undefined, '')
+    const findings = scan.findings.filter(item => item.ruleId === 'prototype.pollution.merge')
+    assert.equal(findings.length, 1)
+    assert.equal(findings[0]?.locations[0]?.file, 'lib/merge.ts')
+    assert.equal(findings[0]?.evidence.some(item => item.location?.file === 'route.ts' && item.location.line === 2 && item.location.role === 'propagation'), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
