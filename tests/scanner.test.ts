@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { assessDirectory, resolveSafeTarget, runScan } from '../src/scanner.ts'
-import { loadScan, renderCsv, saveScan, toSarif, verifySeal } from '../src/state.ts'
+import { finalizeAndSaveScan, loadScan, renderCsv, saveScan, toSarif, verifyScanBundle, verifySeal } from '../src/state.ts'
 
 test('assessDirectory reports source candidates and skips dependencies', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
@@ -55,4 +55,38 @@ test('integrity seal detects an in-memory scan mutation', async () => {
     scan.findings[0].severity = 'low'
     assert.equal(verifySeal(scan), false)
   } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('completed scan persists canonical artifacts and candidate-ledger phase receipts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await writeFile(join(root, 'SECURITY.md'), 'Use explicit authorization checks.\n')
+    await writeFile(join(root, 'app.ts'), 'app.get("/x", (req) => eval(req.query.code))\n')
+    const scan = await runScan(root, { maxFiles: 10, maxFileBytes: 4096 }, 'deep', '', false, state)
+    await finalizeAndSaveScan(state, scan)
+    const loaded = await loadScan(state, scan.id)
+    const verified = await verifyScanBundle(loaded)
+    assert.equal(verified.valid, true, verified.errors.join('\n'))
+    assert.equal(loaded.coverage.policyFiles.includes('SECURITY.md'), true)
+    assert.equal(loaded.artifacts.report, 'report.md')
+    assert.equal(loaded.findings[0].ledger.some(row => row.phase === 'discovery'), true)
+    assert.equal(loaded.findings[0].ledger.some(row => row.phase === 'validation'), true)
+    assert.equal(loaded.findings[0].ledger.some(row => row.phase === 'attack_path'), true)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('native preflight and source-evidenced threat model are durable scan context', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await writeFile(join(root, 'package.json'), '{"scripts":{"test":"node --test"}}\n')
+    await writeFile(join(root, 'app.ts'), 'app.post("/export", (req) => fetch(req.body.callback))\n')
+    const scan = await runScan(root, { maxFiles: 10, maxFileBytes: 4096, stateDir: state }, 'standard', '', false, state)
+    assert.equal(scan.preflight.projectFiles.includes('package.json'), true)
+    assert.equal(scan.preflight.languages.includes('typescript'), true)
+    assert.deepEqual(scan.preflight.suggestedCommands, ['npm test', 'npm run build'])
+    assert.match(scan.threatModel, /Source-Evidenced Threat Model/)
+    assert.match(scan.threatModel, /app\.ts/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })

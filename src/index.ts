@@ -4,9 +4,10 @@ import { defineTool, type JsonValue } from '@deepseek-ai/dsh-tools'
 import { Config, type Config as PluginConfig } from './config.js'
 import { SECURITY_REVIEW_GUIDANCE } from './prompt.js'
 import { FULL_SECURITY_WORKFLOW } from './workflows.js'
-import { runDiffScan, runScan, resolveSafeTarget } from './scanner.js'
-import { getStateDir, listScans, loadScan, renderCsv, renderMarkdownReport, saveScan, toSarif } from './state.js'
+import { generateSourceThreatModel, runDiffScan, runScan, resolveSafeTarget } from './scanner.js'
+import { finalizeAndSaveScan, getStateDir, listScans, loadScan, persistInvestigationArtifacts, renderCsv, renderMarkdownReport, saveTriageAnnotation, saveScan, toSarif, verifyScanBundle } from './state.js'
 import { bulkScan, installPreCommitHook, remediationPlan, rerunSavedScan } from './operations.js'
+import { claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation } from './workbench.js'
 
 export const name = 'dsh-security-suite'
 export const inject = ['tools', 'systemPrompt']
@@ -59,10 +60,46 @@ export function apply(ctx: Context, config: PluginConfig): void {
     async execute(args) {
       const workspace = process.cwd()
       const target = resolveSafeTarget(workspace, args.path)
-      const scan = await runScan(target, config, 'standard', '', args.path !== undefined)
-      await saveScan(getStateDir(config.stateDir), scan)
+      const scan = await runScan(target, config, 'standard', '', args.path !== undefined, config.stateDir)
+      await finalizeAndSaveScan(getStateDir(config.stateDir), scan)
       return { filesScanned: scan.coverage.reviewedFiles, filesSkipped: scan.coverage.skippedFiles, candidates: scan.findings.map(finding => ({ rule: finding.ruleId, severity: finding.severity, file: finding.locations[0].file, line: finding.locations[0].line, excerpt: finding.locations[0].excerpt, rationale: finding.rootCause })) }
     },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_claim_audit_task', description: 'Claim the next durable validation or attack-path task. Only the returned claim token can submit that task receipt, preventing duplicated or conflicting worker conclusions.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' }, owner: { type: 'string', required: true, description: 'DSH worker or reviewer identifier.' }, phase: { type: 'string', enum: ['validation', 'attack_path'], description: 'Optional task phase to claim.' } },
+    output: { schema: { oneOf: [{ type: 'object', properties: { taskId: { type: 'string' }, candidateId: { type: 'string' }, phase: { type: 'string' }, focus: { type: 'string' }, claimToken: { type: 'string' }, artifactRef: { type: 'string' } }, required: ['taskId', 'candidateId', 'phase', 'focus', 'claimToken', 'artifactRef'], additionalProperties: false }, { type: 'null' }] }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return claimAuditTask(config, args.scan_id, args.owner, args.phase as 'validation' | 'attack_path' | undefined) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_start_investigation', description: 'Create a durable standard or deep scan in discovery/validation state. It records candidates and evidence artifacts but does not auto-close them, enabling structured DSH or human review.', parameters: { path: { type: 'string', description: 'Optional workspace-relative scan scope.' }, mode: { type: 'string', enum: ['standard', 'deep'], description: 'Scan depth.' }, threat_model: { type: 'string', description: 'Threat-model context.' } },
+    output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, candidates: { type: 'number' }, lifecycle: { type: 'string' } }, required: ['scanId', 'candidates', 'lifecycle'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { const scan = await runScan(resolveSafeTarget(process.cwd(), args.path), config, args.mode === 'deep' ? 'deep' : 'standard', args.threat_model ?? '', args.path !== undefined, config.stateDir, false); await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan); return { scanId: scan.id, candidates: scan.findings.length, lifecycle: scan.lifecycle } },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_pending_candidates', description: 'List candidate findings that have not yet received a structured validation receipt.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' } },
+    output: { schema: { type: 'array', items: { type: 'object', properties: { candidateId: { type: 'string' }, title: { type: 'string' }, disposition: { type: 'string' }, stages: { type: 'array', items: { type: 'string' } } }, required: ['candidateId', 'title', 'disposition', 'stages'], additionalProperties: false } }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return pendingCandidates(config, args.scan_id) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_record_validation', description: 'Record structured source, test, runtime, or hybrid validation evidence for one claimed candidate task. Every field is persisted in the candidate ledger.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' }, candidate_id: { type: 'string', required: true, description: 'Candidate identifier.' }, claim_token: { type: 'string', required: true, description: 'Token returned by security_claim_audit_task.' }, conclusion: { type: 'string', required: true, enum: ['reportable', 'suppressed', 'deferred', 'not_applicable'], description: 'Validation conclusion.' }, method: { type: 'string', required: true, enum: ['static', 'test', 'runtime', 'hybrid'], description: 'Validation method.' }, attacker: { type: 'string', required: true, description: 'Realistic attacker capability.' }, entry_point: { type: 'string', required: true, description: 'Entrypoint evidence.' }, trust_boundary: { type: 'string', required: true, description: 'Boundary crossed.' }, root_control: { type: 'string', required: true, description: 'Broken control or sink.' }, sink: { type: 'string', required: true, description: 'Sensitive operation.' }, impact: { type: 'string', required: true, description: 'Concrete impact.' }, direct_evidence: { type: 'string', required: true, description: 'Source/test/runtime proof.' }, counterevidence: { type: 'string', required: true, description: 'Controls considered and why they do or do not prevent impact.' }, limitations: { type: 'string', required: true, description: 'Remaining evidence gap.' }, confidence: { type: 'string', required: true, enum: ['high', 'medium', 'low'], description: 'Calibrated confidence.' } },
+    output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, candidateId: { type: 'string' }, lifecycle: { type: 'string' } }, required: ['scanId', 'candidateId', 'lifecycle'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { const scan = await recordValidation(config, args.scan_id, args.candidate_id, { conclusion: args.conclusion as 'reportable' | 'suppressed' | 'deferred' | 'not_applicable', method: args.method as 'static' | 'test' | 'runtime' | 'hybrid', attacker: args.attacker, entryPoint: args.entry_point, trustBoundary: args.trust_boundary, rootControl: args.root_control, sink: args.sink, impact: args.impact, directEvidence: args.direct_evidence, counterevidence: args.counterevidence, limitations: args.limitations, confidence: args.confidence as 'high' | 'medium' | 'low' }, args.claim_token); return { scanId: scan.id, candidateId: args.candidate_id, lifecycle: scan.lifecycle } },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_record_attack_path', description: 'Record attack-path evidence for one claimed reportable candidate task.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' }, candidate_id: { type: 'string', required: true, description: 'Candidate identifier.' }, claim_token: { type: 'string', required: true, description: 'Token returned by security_claim_audit_task.' }, attacker: { type: 'string', required: true, description: 'Attacker.' }, entry_point: { type: 'string', required: true, description: 'Entrypoint.' }, preconditions: { type: 'string', required: true, description: 'Required conditions.' }, dataflow: { type: 'string', required: true, description: 'Source-to-sink path.' }, outcome: { type: 'string', required: true, description: 'Attacker outcome.' }, severity_rationale: { type: 'string', required: true, description: 'Severity calibration.' }, change_conditions: { type: 'string', required: true, description: 'Evidence that changes severity or confidence.' } },
+    output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, candidateId: { type: 'string' }, lifecycle: { type: 'string' } }, required: ['scanId', 'candidateId', 'lifecycle'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { const scan = await recordAttackPath(config, args.scan_id, args.candidate_id, { attacker: args.attacker, entryPoint: args.entry_point, preconditions: args.preconditions, dataflow: args.dataflow, outcome: args.outcome, severityRationale: args.severity_rationale, changeConditions: args.change_conditions }, args.claim_token); return { scanId: scan.id, candidateId: args.candidate_id, lifecycle: scan.lifecycle } },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_finalize_investigation', description: 'Seal a manually investigated scan only when every discovered candidate has a validation receipt and each reportable candidate has attack-path evidence.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' } },
+    output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, lifecycle: { type: 'string' }, findings: { type: 'number' } }, required: ['scanId', 'lifecycle', 'findings'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { const scan = await completeScan(config, args.scan_id); return { scanId: scan.id, lifecycle: scan.lifecycle, findings: scan.findings.filter(finding => finding.disposition === 'reportable').length } },
   }))
 
   ctx.tools.register(defineTool({
@@ -78,9 +115,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_threat_model_template', description: 'Create a source-review threat-model template for a repository or component. Fill it from actual architecture evidence before using it in a scan.', parameters: { scope: { type: 'string', description: 'Repository-relative system or component scope.' }, context: { type: 'string', description: 'Known deployment, actors, assets, or constraints supplied by the user.' } },
+    name: 'security_threat_model_template', description: 'Generate a source-evidenced threat model for a repository or component. It records observed architecture signals separately from deployment assumptions and open questions.', parameters: { scope: { type: 'string', description: 'Repository-relative system or component scope.' }, context: { type: 'string', description: 'Known deployment, actors, assets, or constraints supplied by the user.' } },
     output: { schema: { type: 'object', properties: { markdown: { type: 'string' } }, required: ['markdown'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.markdown ?? '' }] },
-    async execute(args) { const scope = args.scope ?? '.'; return { markdown: `# Threat Model\n\n## System and Scope\n- Scope: \`${scope}\`\n- Purpose and deployment: <verify from source>\n\n## Assets\n- <data, credentials, privileges, or integrity-sensitive operations>\n\n## Actors and Capabilities\n- <trusted operators, callers, and attacker-controlled inputs>\n\n## Trust Boundaries\n- <authentication, tenant, parser, network, process, filesystem, or plugin boundaries>\n\n## Security Invariants\n- <authorization, ownership, validation, isolation, cryptographic, and fail-closed properties>\n\n## Assumptions and Open Questions\n${args.context ?? '- No user-supplied context.'}\n` } },
+    async execute(args) { const target = resolveSafeTarget(process.cwd(), args.scope); return { markdown: await generateSourceThreatModel(target, config, args.context ?? '') } },
   }))
 
   ctx.tools.register(defineTool({
@@ -115,8 +152,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
       render: (_args, value) => [{ type: 'text', text: value.diff ?? '' }],
     },
     async execute(args) {
-      const scan = await runDiffScan(process.cwd(), args.base, '')
-      await saveScan(getStateDir(config.stateDir), scan)
+      const scan = await runDiffScan(process.cwd(), args.base, '', config.stateDir)
+      await finalizeAndSaveScan(getStateDir(config.stateDir), scan)
       const diff = scan.findings.map(finding => `${finding.locations[0].file}:${finding.locations[0].line} ${finding.ruleId}: ${finding.locations[0].excerpt}`).join('\n')
       return { mode: scan.mode, diff, truncated: !scan.coverage.complete }
     },
@@ -126,7 +163,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
     name: 'security_scan', description: 'Run a standard or deep read-only native scan and save canonical findings outside the target repository.',
     parameters: { path: { type: 'string', description: 'Optional workspace-relative scan scope.' }, mode: { type: 'string', enum: ['standard', 'deep'], description: 'standard performs one rule pass; deep executes independent injection and trust-boundary rule passes before reduction.' }, threat_model: { type: 'string', description: 'Optional security assumptions and protected assets.' } },
     output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, findings: { type: 'number' }, reviewedFiles: { type: 'number' }, complete: { type: 'boolean' } }, required: ['scanId', 'findings', 'reviewedFiles', 'complete'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-    async execute(args) { const scan = await runScan(resolveSafeTarget(process.cwd(), args.path), config, args.mode === 'deep' ? 'deep' : 'standard', args.threat_model ?? '', args.path !== undefined); await saveScan(getStateDir(config.stateDir), scan); return { scanId: scan.id, findings: scan.findings.length, reviewedFiles: scan.coverage.reviewedFiles, complete: scan.coverage.complete } },
+    async execute(args) { const scan = await runScan(resolveSafeTarget(process.cwd(), args.path), config, args.mode === 'deep' ? 'deep' : 'standard', args.threat_model ?? '', args.path !== undefined, config.stateDir); await finalizeAndSaveScan(getStateDir(config.stateDir), scan); return { scanId: scan.id, findings: scan.findings.filter(finding => finding.disposition === 'reportable').length, reviewedFiles: scan.coverage.reviewedFiles, complete: scan.coverage.complete } },
   }))
 
   ctx.tools.register(defineTool({
@@ -150,7 +187,13 @@ export function apply(ctx: Context, config: PluginConfig): void {
   ctx.tools.register(defineTool({
     name: 'security_update_finding', description: 'Persist a validated finding status and source-backed analysis. Use only after review establishes the fields.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Finding identifier.' }, status: { type: 'string', required: true, enum: ['open', 'false_positive', 'resolved', 'unknown'], description: 'Validated disposition.' }, validation: { type: 'string', description: 'Source-backed validation and counterevidence.' }, attack_path: { type: 'string', description: 'Attacker-to-sink path and prerequisites.' }, impact: { type: 'string', description: 'Concrete security impact.' }, remediation: { type: 'string', description: 'Focused remediation.' }, severity: { type: 'string', enum: ['critical', 'high', 'medium', 'low'], description: 'Calibrated severity.' }, confidence: { type: 'string', enum: ['high', 'medium', 'low'], description: 'Confidence after validation.' } },
     output: { schema: { type: 'object', properties: { updated: { type: 'boolean' }, findingId: { type: 'string' } }, required: ['updated', 'findingId'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-    async execute(args) { const stateDir = getStateDir(config.stateDir); const scan = await loadScan(stateDir, args.scan_id); const finding = scan.findings.find(item => item.id === args.finding_id); if (!finding) throw new Error('Finding was not found in this scan.'); if (args.status === 'false_positive' && !args.validation) throw new Error('A false-positive disposition requires source-backed validation or counterevidence.'); if (args.status === 'open' && (!args.validation || !args.attack_path || !args.impact)) throw new Error('An open validated finding requires validation, attack path, and impact evidence.'); finding.status = args.status as typeof finding.status; if (args.validation) { finding.validation = args.validation; finding.evidence.push({ kind: args.status === 'false_positive' ? 'counterevidence' : 'validation', detail: args.validation }) }; if (args.attack_path) finding.attackPath = args.attack_path; if (args.impact) finding.impact = args.impact; if (args.remediation) finding.remediation = args.remediation; if (args.severity) finding.severity = args.severity as typeof finding.severity; if (args.confidence) finding.confidence = args.confidence as typeof finding.confidence; await saveScan(stateDir, scan); return { updated: true, findingId: finding.id } },
+    async execute(args) { const stateDir = getStateDir(config.stateDir); const scan = await loadScan(stateDir, args.scan_id); const finding = scan.findings.find(item => item.id === args.finding_id); if (!finding) throw new Error('Finding was not found in this scan.'); if (args.status === 'false_positive' && !args.validation) throw new Error('A false-positive disposition requires source-backed validation or counterevidence.'); if (args.status === 'open' && (!args.validation || !args.attack_path || !args.impact)) throw new Error('An open validated finding requires validation, attack path, and impact evidence.'); finding.status = args.status as typeof finding.status; if (args.validation) { finding.validation = args.validation; finding.evidence.push({ kind: args.status === 'false_positive' ? 'counterevidence' : 'validation', detail: args.validation }) }; if (args.attack_path) finding.attackPath = args.attack_path; if (args.impact) finding.impact = args.impact; if (args.remediation) finding.remediation = args.remediation; if (args.severity) finding.severity = args.severity as typeof finding.severity; if (args.confidence) finding.confidence = args.confidence as typeof finding.confidence; await saveTriageAnnotation(stateDir, scan, finding); return { updated: true, findingId: finding.id } },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_verify_scan_bundle', description: 'Verify scan-state integrity, canonical artifacts, and the discovery/validation/attack-path ledger receipts for a saved scan.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' } },
+    output: { schema: { type: 'object', properties: { valid: { type: 'boolean' }, errors: { type: 'array', items: { type: 'string' } } }, required: ['valid', 'errors'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return verifyScanBundle(await loadScan(getStateDir(config.stateDir), args.scan_id)) },
   }))
 
   ctx.tools.register(defineTool({

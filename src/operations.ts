@@ -4,7 +4,7 @@ import { isAbsolute, join, relative, resolve } from 'node:path'
 import type { Config } from './config.js'
 import type { Finding, ScanRecord } from './contracts.js'
 import { runScan, resolveSafeTarget } from './scanner.js'
-import { getStateDir, loadScan, saveScan } from './state.js'
+import { finalizeAndSaveScan, getStateDir, loadScan, saveScan } from './state.js'
 
 export interface BulkResult { path: string; scanId?: string; findings?: number; error?: string }
 
@@ -15,8 +15,8 @@ export async function rerunSavedScan(workspace: string, config: Config, scanId: 
   if (previous.mode === 'diff') throw new Error('Diff scans must be rerun with security_review_diff so the requested base can be supplied explicitly.')
   const root = resolve(workspace); const target = resolve(previous.target)
   if (!inside(root, target)) throw new Error('Saved scan target is outside the active workspace.')
-  const scan = await runScan(target, config, previous.mode, previous.threatModel, previous.recipe.scopeRequested)
-  await saveScan(getStateDir(config.stateDir), scan)
+  const scan = await runScan(target, config, previous.mode, previous.threatModel, previous.recipe.scopeRequested, config.stateDir)
+  await finalizeAndSaveScan(getStateDir(config.stateDir), scan)
   return scan
 }
 
@@ -28,7 +28,7 @@ export async function bulkScan(workspace: string, config: Config, paths: string[
     while (true) {
       const index = cursor++; if (index >= unique.length) return
       const item = unique[index]
-      try { const scan = await runScan(resolveSafeTarget(workspace, item), config, mode, threatModel, true); await saveScan(getStateDir(config.stateDir), scan); output[index] = { path: item, scanId: scan.id, findings: scan.findings.length } } catch (error) { output[index] = { path: item, error: error instanceof Error ? error.message : String(error) } }
+      try { const scan = await runScan(resolveSafeTarget(workspace, item), config, mode, threatModel, true, config.stateDir); await finalizeAndSaveScan(getStateDir(config.stateDir), scan); output[index] = { path: item, scanId: scan.id, findings: scan.findings.filter(finding => finding.disposition === 'reportable').length } } catch (error) { output[index] = { path: item, error: error instanceof Error ? error.message : String(error) } }
     }
   }
   await Promise.all(Array.from({ length: Math.min(capped, unique.length) }, worker)); return output
@@ -45,9 +45,9 @@ export async function installPreCommitHook(workspace: string, approved: boolean)
 }
 
 function replacementFor(finding: Finding, source: string): string | undefined {
-  if (finding.ruleId === 'tls-verification-disabled') return source.replace(/rejectUnauthorized\s*:\s*false/, 'rejectUnauthorized: true').replace(/verify\s*=\s*False/, 'verify = True').replace(/InsecureSkipVerify\s*:\s*true/, 'InsecureSkipVerify: false')
-  if (finding.ruleId === 'dangerous-dynamic-code') return source.replace(/\beval\s*\(([^)]*)\)/, '/* Replace dynamic evaluation with a fixed operation over validated input: $1 */')
-  if (finding.ruleId === 'hardcoded-secret-marker') return source.replace(/((?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*)["'][^"']+["']/i, '$1process.env.APP_SECRET')
+  if (finding.ruleId === 'tls.verification.disabled') return source.replace(/rejectUnauthorized\s*:\s*false/, 'rejectUnauthorized: true').replace(/verify\s*=\s*False/, 'verify = True').replace(/InsecureSkipVerify\s*:\s*true/, 'InsecureSkipVerify: false')
+  if (finding.ruleId === 'dangerous.dynamic.code') return source.replace(/\beval\s*\(([^)]*)\)/, '/* Replace dynamic evaluation with a fixed operation over validated input: $1 */')
+  if (finding.ruleId === 'hardcoded.secret.marker') return source.replace(/((?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*)["'][^"']+["']/i, '$1process.env.APP_SECRET')
   return undefined
 }
 

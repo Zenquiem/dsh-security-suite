@@ -1,10 +1,11 @@
 import { createHash } from 'node:crypto'
-import { readdir, readFile, stat } from 'node:fs/promises'
+import { access, mkdir, readdir, readFile, stat } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
-import { extname, join, relative, resolve, sep } from 'node:path'
+import { basename, extname, join, relative, resolve, sep } from 'node:path'
 import { promisify } from 'node:util'
-import type { Confidence, Evidence, FileReceipt, Finding, RuleReceipt, ScanActivity, ScanRecord, Severity } from './contracts.js'
-import { createScanId, findingId, sealScan } from './state.js'
+import type { CandidateDisposition, Confidence, Evidence, FileReceipt, Finding, Preflight, RuleReceipt, ScanActivity, ScanRecord, Severity, TargetSnapshot } from './contracts.js'
+import { candidateId, createScanId, findingId, getStateDir, scanArtifactDir, sealScan, sha256 } from './state.js'
+import { analyzeJavaScriptAst } from './ast-analysis.js'
 
 export interface ScanLimits { maxFiles: number; maxFileBytes: number }
 export interface Candidate { rule: string; severity: Severity; file: string; line: number; excerpt: string; rationale: string; cwe: string; evidence: Evidence[] }
@@ -26,6 +27,13 @@ const RULES: Rule[] = [
   { id: 'unsafe-deserialization', title: 'Unsafe deserialization', cwe: 'CWE-502', severity: 'high', rationale: 'Deserialization of untrusted data can create code execution or object-injection paths.', pattern: /(?:pickle\.loads|yaml\.load\s*\([^\n]*(?!SafeLoader)|ObjectInputStream\s*\(|unserialize\s*\()/i, context: /(?:request|req\.|body|input|message|payload)/i },
   { id: 'ssrf-request-sink', title: 'Request-derived outbound request', cwe: 'CWE-918', severity: 'medium', rationale: 'An outbound request appears to use request-derived input and needs destination allowlisting.', pattern: /(?:fetch|axios\.(?:get|post|request)|requests\.(?:get|post|request)|http\.request)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
   { id: 'weak-randomness-security', title: 'Predictable randomness in security context', cwe: 'CWE-330', severity: 'medium', rationale: 'A non-cryptographic random source appears near a security-sensitive token or secret.', pattern: /(?:Math\.random\s*\(|random\.random\s*\()/, context: /(?:token|secret|session|password|reset|nonce)/i },
+  { id: 'sql-injection-query-construction', title: 'Constructed SQL query', cwe: 'CWE-89', severity: 'high', rationale: 'A database query appears to construct SQL syntax from request-derived input.', pattern: /(?:query|execute|raw)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input|\+|\$\{)/i, context: /(?:select|insert|update|delete|from|where)/i },
+  { id: 'xml-external-entity-risk', title: 'Potential unsafe XML parser', cwe: 'CWE-611', severity: 'high', rationale: 'An XML parser factory or parser call needs explicit external-entity hardening.', pattern: /(?:DocumentBuilderFactory\.newInstance|SAXParserFactory\.newInstance|XMLInputFactory\.newFactory|lxml\.etree\.parse|xml\.etree\.ElementTree\.parse)/ },
+  { id: 'insecure-deserialization-java', title: 'Java native deserialization', cwe: 'CWE-502', severity: 'high', rationale: 'ObjectInputStream deserializes a potentially attacker-controlled object graph.', pattern: /\.readObject\s*\(\)|new\s+ObjectInputStream\s*\(/ },
+  { id: 'jwt-verification-disabled', title: 'JWT verification disabled', cwe: 'CWE-347', severity: 'high', rationale: 'JWT signature or algorithm verification is disabled or accepts an unsafe configuration.', pattern: /(?:verify_signature\s*[:=]\s*False|algorithms\s*=\s*\[?['"]none|jwt\.decode\s*\([^\n]*(?:verify\s*[:=]\s*false))/i },
+  { id: 'cors-wildcard-credentials', title: 'Credentialed wildcard CORS', cwe: 'CWE-942', severity: 'medium', rationale: 'Credentialed CORS with a wildcard or reflected origin can expose authenticated data cross-origin.', pattern: /(?:Access-Control-Allow-Origin\s*['":=]+\s*['"]\*|origin\s*:\s*true)[^\n]*(?:credentials\s*:\s*true|Access-Control-Allow-Credentials)/i },
+  { id: 'missing-authorization-route', title: 'Potential unprotected state-changing route', cwe: 'CWE-862', severity: 'medium', rationale: 'A state-changing route is declared without an apparent authorization middleware in its local declaration.', pattern: /\.(?:post|put|patch|delete)\s*\(\s*['"][^'"]+['"]\s*,\s*(?:async\s*)?\(?\s*(?:req|request|ctx)/i },
+  { id: 'prototype-pollution-merge', title: 'Unsafe object merge from request data', cwe: 'CWE-1321', severity: 'medium', rationale: 'Request-derived object data reaches a generic merge/assignment primitive and needs prototype-key filtering.', pattern: /(?:Object\.assign|lodash\.merge|merge)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
 ]
 
 function languageFor(file: string): string {
@@ -34,7 +42,7 @@ function languageFor(file: string): string {
 
 function hash(value: string): string { return createHash('sha256').update(value).digest('hex') }
 function isContained(root: string, candidate: string): boolean { return candidate === root || candidate.startsWith(root + sep) }
-function location(file: string, line: number, excerpt: string): { file: string; line: number; excerpt: string } { return { file, line, excerpt: excerpt.trim().slice(0, 240) } }
+function location(file: string, line: number, excerpt: string, role: 'root_control' = 'root_control'): { file: string; line: number; excerpt: string; role: 'root_control' } { return { file, line, excerpt: excerpt.trim().slice(0, 240), role } }
 
 async function collectFiles(root: string, limits: ScanLimits): Promise<{ files: string[]; skipped: number; complete: boolean }> {
   const files: string[] = []; let skipped = 0; let complete = true
@@ -82,27 +90,147 @@ export async function assessDirectory(directory: string, limits: ScanLimits, dee
     fileReceipts.push({ path: rel, bytes: Buffer.byteLength(content, 'utf8'), sha256: hash(content), language: languageFor(file) })
     if (/(?:^|\/)SECURITY\.md$/i.test(rel)) policyFiles.push(rel)
     for (const [pass, ruleSet] of passes) { const analyzed = analyzeText(root, file, content, pass, ruleSet); candidates.push(...analyzed.candidates); ruleReceipts.push(...analyzed.receipts) }
+    if (['.js', '.jsx', '.mjs', '.cjs', '.ts', '.tsx'].includes(extname(file))) {
+      const ast = analyzeJavaScriptAst(content, rel)
+      candidates.push(...ast.candidates)
+      ruleReceipts.push({ ruleId: 'ast.local-taint', pass: 'semantic', matches: ast.candidates.length })
+      if (ast.parseError) ruleReceipts.push({ ruleId: 'ast.parse-error', pass: 'semantic', matches: 1 })
+    }
   }
   return { root, filesScanned: files.length, filesSkipped: skipped, candidates, receipts: fileReceipts, ruleReceipts, policyFiles, complete }
 }
+
+function slug(value: string): string { return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'root-control' }
 
 function candidateToFinding(candidate: Candidate): Finding {
   const fingerprint = hash(`${candidate.rule}:${candidate.file}:${candidate.excerpt.replace(/\s+/g, ' ')}`)
   const hasContext = candidate.evidence.some(item => item.kind === 'context')
   const confidence: Confidence = hasContext && candidate.rule === 'tls-verification-disabled' ? 'medium' : 'low'
-  return { id: findingId(candidate.rule, candidate.file, candidate.line), fingerprint, ruleId: candidate.rule, title: candidate.rule.replaceAll('-', ' '), severity: candidate.severity, confidence, cwe: candidate.cwe, status: 'open', locations: [location(candidate.file, candidate.line, candidate.excerpt)], rootCause: candidate.rationale, validation: 'Candidate generated by native static analysis. Confirm attacker control, reachability, controls, and impact before reporting a vulnerability.', attackPath: 'Not established by static analysis.', impact: 'Not established by static analysis.', remediation: 'Review the data flow and apply a context-appropriate safe API, validation, authorization, or containment control.', counterevidence: 'No control analysis has been completed.', evidence: candidate.evidence }
+  const anchor = slug(`${candidate.file}-${candidate.excerpt}`)
+  const candidateIdentifier = candidateId(candidate.rule, candidate.file, candidate.line)
+  return { id: findingId(candidate.rule, anchor), candidateId: candidateIdentifier, fingerprint, ruleId: candidate.rule.replaceAll('-', '.'), identity: { anchor, instance: slug(`${candidate.file}-${candidate.line}`) }, title: candidate.rule.replaceAll('-', ' '), severity: candidate.severity, confidence, cwe: candidate.cwe, status: 'open', disposition: 'discovered', locations: [location(candidate.file, candidate.line, candidate.excerpt)], rootCause: candidate.rationale, validation: 'Discovery-only candidate. Static evidence must establish attacker control, a broken control or sensitive sink, and impact before reportability.', attackPath: 'Not established.', impact: 'Not established.', remediation: 'Review the data flow and apply a context-appropriate safe API, validation, authorization, or containment control.', counterevidence: 'No control analysis has been completed.', evidence: candidate.evidence, ledger: [{ at: new Date().toISOString(), phase: 'discovery', disposition: 'discovered', summary: `Native rule ${candidate.rule} matched ${candidate.file}:${candidate.line}.` }] }
 }
 
 function reduceCandidates(candidates: Candidate[]): Finding[] {
   const byFingerprint = new Map<string, Finding>()
-  for (const candidate of candidates) { const finding = candidateToFinding(candidate); const existing = byFingerprint.get(finding.fingerprint); if (existing) existing.evidence.push(...finding.evidence); else byFingerprint.set(finding.fingerprint, finding) }
+  for (const candidate of candidates) {
+    const finding = candidateToFinding(candidate)
+    const mergeKey = `${finding.ruleId}:${finding.locations[0].file}:${finding.locations[0].line}`
+    const existing = [...byFingerprint.values()].find(item => `${item.ruleId}:${item.locations[0].file}:${item.locations[0].line}` === mergeKey)
+    if (existing) { existing.evidence.push(...finding.evidence); if (finding.evidence.some(item => item.detail.startsWith('AST resolved'))) existing.rootCause = finding.rootCause }
+    else byFingerprint.set(finding.fingerprint, finding)
+  }
   return [...byFingerprint.values()].sort((a, b) => a.locations[0].file.localeCompare(b.locations[0].file) || a.locations[0].line - b.locations[0].line)
 }
 
 function activity(phase: ScanActivity['phase'], message: string): ScanActivity { return { at: new Date().toISOString(), phase, message } }
 
-export async function runScan(directory: string, limits: ScanLimits, mode: 'standard' | 'deep', threatModel: string, scopeRequested = false): Promise<ScanRecord> {
-  const deep = mode === 'deep'; const result = await assessDirectory(directory, limits, deep); const now = new Date().toISOString(); const record: ScanRecord = { schemaVersion: 2, id: createScanId(), mode, lifecycle: result.complete ? 'completed' : 'incomplete', target: result.root, createdAt: now, completedAt: now, threatModel: threatModel || 'No user-supplied threat model. Review public inputs, identities, protected assets, trust boundaries, and sensitive operations before finalizing findings.', findings: reduceCandidates(result.candidates), coverage: { mode: scopeRequested ? 'scoped_path' : 'repository', reviewedFiles: result.filesScanned, skippedFiles: result.filesSkipped, exclusions: [...IGNORED_DIRECTORIES], complete: result.complete, receipts: result.receipts, ruleReceipts: result.ruleReceipts, policyFiles: result.policyFiles }, activity: [activity('inventory', `Inventoried ${result.filesScanned} eligible source files.`), activity('policy', result.policyFiles.length ? `Found policy files: ${result.policyFiles.join(', ')}.` : 'No SECURITY.md policy file found in the scan scope.'), activity('discovery', `Ran ${deep ? 3 : 1} native discovery pass(es) and collected ${result.candidates.length} observations.`), activity('reduction', `Reduced observations to ${reduceCandidates(result.candidates).length} unique candidate findings.`), activity('complete', result.complete ? 'Scan completed.' : 'Scan completed with incomplete coverage due to limits or unreadable paths.')], recipe: { mode, scopeRequested, passes: deep ? ['baseline', 'injection', 'boundaries'] : ['baseline'] }, seal: '' }
+async function exists(path: string): Promise<boolean> { try { await access(path); return true } catch { return false } }
+
+async function resolvePolicyGuidance(root: string): Promise<{ files: string[]; text: string }> {
+  const files: string[] = []; const values: string[] = []; const chain: string[] = []; let current = resolve(root)
+  while (true) { chain.push(current); const parent = resolve(current, '..'); if (parent === current) break; current = parent }
+  for (const directory of chain.reverse()) {
+    const policy = join(directory, 'SECURITY.md')
+    if (await exists(policy)) { files.push(relative(root, policy) || 'SECURITY.md'); values.push(`# ${relative(root, policy) || 'SECURITY.md'}\n\n${await readFile(policy, 'utf8')}`) }
+  }
+  return { files, text: values.length ? values.join('\n\n---\n\n') : 'No SECURITY.md policy guidance was found. Apply least privilege, explicit trust boundaries, and fail-closed security controls.' }
+}
+
+const PROJECT_FILES = new Set(['package.json', 'package-lock.json', 'pnpm-lock.yaml', 'yarn.lock', 'pyproject.toml', 'requirements.txt', 'pipfile', 'go.mod', 'cargo.toml', 'pom.xml', 'build.gradle', 'build.gradle.kts', 'composer.json', 'gemfile', 'makefile', 'dockerfile'])
+
+function suggestedCommands(projectFiles: string[]): string[] {
+  const names = new Set(projectFiles.map(path => basename(path).toLowerCase()))
+  if (names.has('package.json')) return ['npm test', 'npm run build']
+  if (names.has('pyproject.toml') || names.has('requirements.txt')) return ['python -m pytest']
+  if (names.has('go.mod')) return ['go test ./...']
+  if (names.has('cargo.toml')) return ['cargo test']
+  if (names.has('pom.xml')) return ['./mvnw test']
+  if (names.has('build.gradle') || names.has('build.gradle.kts')) return ['./gradlew test']
+  return []
+}
+
+async function nativePreflight(root: string, receipts: FileReceipt[], inventoryComplete: boolean, stateDirectory: string): Promise<Preflight> {
+  const checks: Preflight['checks'] = []
+  try { const details = await stat(root); checks.push({ id: 'target-directory', status: details.isDirectory() ? 'pass' : 'blocked', detail: details.isDirectory() ? 'Target is a readable directory.' : 'Target is not a directory.' }) } catch { checks.push({ id: 'target-directory', status: 'blocked', detail: 'Target directory cannot be read.' }) }
+  const projectFiles = receipts.map(item => item.path).filter(path => PROJECT_FILES.has(basename(path).toLowerCase())).sort()
+  const languages = [...new Set(receipts.map(item => item.language).filter(language => language !== 'text'))].sort()
+  checks.push({ id: 'source-inventory', status: receipts.length === 0 ? 'warn' : inventoryComplete ? 'pass' : 'warn', detail: receipts.length === 0 ? 'No eligible source files were found.' : `${receipts.length} eligible source files were inventoried${inventoryComplete ? '.' : '; configured limits or unreadable paths reduced coverage.'}` })
+  checks.push({ id: 'project-manifest', status: projectFiles.length ? 'pass' : 'warn', detail: projectFiles.length ? `Detected ${projectFiles.join(', ')}.` : 'No recognized project manifest was found; test commands cannot be inferred.' })
+  const stateDir = getStateDir(stateDirectory)
+  try { await mkdir(stateDir, { recursive: true }); await access(stateDir); checks.push({ id: 'state-directory', status: 'pass', detail: 'External state directory is writable for receipts and reports.' }) } catch { checks.push({ id: 'state-directory', status: 'blocked', detail: 'External state directory is not writable; choose stateDir or DSH_SECURITY_SUITE_STATE_DIR.' }) }
+  checks.push({ id: 'worker-orchestration', status: 'warn', detail: 'Investigation tasks are durable and claimable by DSH reviewers. This plugin does not assume a private subagent API.' })
+  const status = checks.some(check => check.status === 'blocked') ? 'blocked' : checks.some(check => check.status === 'warn') ? 'warn' : 'ready'
+  return { status, checks, projectFiles, languages, suggestedCommands: suggestedCommands(projectFiles) }
+}
+
+export async function generateSourceThreatModel(directory: string, limits: ScanLimits, context = ''): Promise<string> {
+  const result = await assessDirectory(directory, limits)
+  const cited: Array<{ path: string; signal: string }> = []
+  const signals = { routes: 0, requestInputs: 0, auth: 0, outbound: 0, storage: 0, secrets: 0, parsers: 0 }
+  for (const receipt of result.receipts) {
+    const source = await readFile(join(result.root, receipt.path), 'utf8')
+    const note = (signal: keyof typeof signals, pattern: RegExp, label: string): void => { if (pattern.test(source)) { signals[signal]++; cited.push({ path: receipt.path, signal: label }) } }
+    note('routes', /\b(?:app|router)\.(?:get|post|put|patch|delete)\s*\(|@(?:app|router)\.(?:get|post|put|patch|delete)|\b(?:Flask|FastAPI)\s*\(/i, 'request-handling or route declaration')
+    note('requestInputs', /\b(?:req|request|ctx\.request)\.(?:body|query|params|headers|cookies)|\binput\s*\(/i, 'caller-controlled input access')
+    note('auth', /\b(?:auth(?:enticate|orize|entication|orization)?|requireAuth|isAdmin|passport|permission|rbac)\b/i, 'authentication or authorization control')
+    note('outbound', /\b(?:fetch|axios|requests\.(?:get|post|request)|http\.request|https\.request)\s*\(/i, 'outbound network operation')
+    note('storage', /\b(?:readFile|writeFile|createReadStream|createWriteStream|open|query|execute|save|delete)\s*\(/i, 'filesystem or data-store operation')
+    note('secrets', /\b(?:secret|password|api[_-]?key|token|private[_-]?key)\b/i, 'credential or secret handling')
+    note('parsers', /\b(?:JSON\.parse|yaml\.load|pickle\.loads|unserialize|XML|DocumentBuilderFactory)\b/i, 'structured-data parser or deserialization')
+  }
+  const evidence = cited.length ? cited.slice(0, 30).map(item => `- \`${item.path}\`: ${item.signal}.`).join('\n') : '- No high-confidence architecture signal was detected in eligible source; verify deployment and entrypoints manually.'
+  const lines = ['# Source-Evidenced Threat Model', '', '## Scope', `- Target: \`${basename(result.root) || result.root}\`.`, `- Reviewed source files: ${result.filesScanned}${result.complete ? '.' : ' (coverage is partial).'}`, context.trim() ? `- Supplied context: ${context.trim()}` : '- Supplied context: none.', '', '## Evidence', evidence, '', '## Assets and Security Objectives', `- Protect credentials and tokens${signals.secrets ? ' observed in source.' : '; source evidence did not identify their storage location.'}`, `- Preserve integrity of filesystem and data-store operations${signals.storage ? ' observed in source.' : '.'}`, signals.auth ? '- Enforce authorization decisions consistently at every protected operation.' : '- Verify where authorization decisions are enforced; no clear local control signal was found.', '', '## Actors and Trust Boundaries', signals.routes || signals.requestInputs ? '- Remote callers can cross the request boundary into application handlers; validate identity, tenant, and input ownership at that boundary.' : '- Confirm external callers and entrypoints; no route or request-input marker was detected.', signals.outbound ? '- Outbound network operations form a second boundary; constrain destination, protocol, and credentials.' : '', signals.parsers ? '- Structured input parsing is a trust boundary; use safe parser modes and bounded resource handling.' : '', '', '## Attack Surfaces', `- Request/route signals: ${signals.routes}; caller-input signals: ${signals.requestInputs}; outbound-operation signals: ${signals.outbound}; parser signals: ${signals.parsers}.`, '- Review sensitive sinks found by the native discovery passes and retain deployment-specific assumptions as open questions.', '', '## Assumptions and Open Questions', '- Deployment topology, authentication provider, tenant model, and production reachability require confirmation from project owners or runtime configuration.', '- This model is generated from local source evidence and does not infer unobserved services.']
+  return lines.filter((line, index, all) => line || index === 0 || all[index - 1] !== '').join('\n') + '\n'
+}
+
+async function targetSnapshot(root: string, receipts: FileReceipt[]): Promise<TargetSnapshot> {
+  const inventory = receipts.slice().sort((a, b) => a.path.localeCompare(b.path)).map(receipt => `${receipt.path}\0${receipt.sha256}`).join('\n')
+  const digest = `dsh-security-suite-snapshot/v1:sha256:${sha256(inventory)}`
+  try {
+    const [{ stdout: gitRoot }, { stdout: revision }, remote] = await Promise.all([
+      execFileAsync('git', ['rev-parse', '--show-toplevel'], { cwd: root, encoding: 'utf8' }),
+      execFileAsync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: root, encoding: 'utf8' }),
+      execFileAsync('git', ['config', '--get', 'remote.origin.url'], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' })),
+    ])
+    const repository = resolve(gitRoot.trim()); const cleanRemote = remote.stdout.trim().replace(/^[^@]+@/, '').replace(/[?#].*$/, '')
+    return { kind: 'git_worktree', targetId: `dsh-security-suite-target/v1:sha256:${sha256(cleanRemote || repository)}`, displayName: basename(repository) || repository, revision: revision.trim(), snapshotDigest: digest }
+  } catch {
+    return { kind: 'directory_snapshot', targetId: `dsh-security-suite-target/v1:sha256:${sha256(resolve(root))}`, displayName: basename(root) || root, snapshotDigest: digest }
+  }
+}
+
+function validateCandidate(finding: Finding): CandidateDisposition {
+  const hasInputContext = finding.evidence.some(item => item.kind === 'context')
+  const direct = finding.ruleId === 'tls.verification.disabled' || (hasInputContext && ['dangerous.dynamic.code', 'shell.command.construction', 'path.traversal.sink', 'unsafe.deserialization', 'ssrf.request.sink'].includes(finding.ruleId))
+  const disposition: CandidateDisposition = direct ? 'reportable' : 'suppressed'
+  const conclusion = direct ? 'reportable' : 'suppressed'
+  const entry = hasInputContext ? 'Nearby source contains an input/request marker.' : 'No attacker-controlled entry point was established by the local static pass.'
+  const root = `${finding.locations[0].file}:${finding.locations[0].line} (${finding.ruleId})`
+  finding.disposition = disposition
+  finding.validation = direct ? `Static validation established a plausible path from request-derived input or an explicitly unsafe control to ${root}. Runtime reachability remains unexecuted.` : `Suppressed after static validation: ${entry}`
+  finding.impact = direct ? 'The vulnerable control could expose the security boundary described by the rule family if the observed input path is reachable.' : 'No concrete attacker-controlled path was established.'
+  finding.counterevidence = direct ? 'No equivalent local control was detected in the reviewed context. Runtime behavior was not executed.' : entry
+  finding.confidence = direct && finding.ruleId === 'tls.verification.disabled' ? 'high' : direct ? 'medium' : 'low'
+  finding.validationRecord = { method: 'static', conclusion, attacker: direct ? 'An unauthenticated or low-privilege caller able to influence the request-derived value.' : 'Not established.', entryPoint: entry, trustBoundary: 'Application request/input boundary to a sensitive operation.', rootControl: root, sink: finding.locations[0].excerpt, impact: finding.impact, directEvidence: finding.evidence.map(item => item.detail).join(' '), counterevidence: finding.counterevidence, limitations: 'No runtime execution or package build was performed by the native scanner.', confidence: finding.confidence, recordedAt: new Date().toISOString() }
+  finding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition, summary: finding.validation })
+  return disposition
+}
+
+function analyzeAttackPath(finding: Finding): void {
+  if (finding.disposition !== 'reportable') return
+  const location = finding.locations[0]
+  finding.attackPath = `An attacker influences the observed input path, reaches ${location.file}:${location.line}, and triggers ${finding.ruleId}; the concrete outcome depends on the deployment path and missing control.`
+  finding.attackPathRecord = { attacker: 'Caller able to control the identified input or invoke the affected feature.', entryPoint: finding.validationRecord?.entryPoint ?? 'Static source context.', preconditions: 'The affected code path must be reachable in deployment.', dataflow: `${finding.validationRecord?.entryPoint ?? 'Input'} -> ${finding.validationRecord?.rootControl ?? location.file} -> ${finding.validationRecord?.sink ?? location.excerpt}`, outcome: finding.impact, severityRationale: `${finding.severity} severity is provisional and reflects the sensitive operation with static reachability evidence.`, changeConditions: 'Increase confidence after a targeted test or runtime proof; lower severity if a complete upstream control prevents attacker influence.', recordedAt: new Date().toISOString() }
+  finding.evidence.push({ kind: 'attack_path', detail: finding.attackPath, location })
+  finding.ledger.push({ at: new Date().toISOString(), phase: 'attack_path', disposition: 'reportable', summary: finding.attackPath })
+}
+
+export async function runScan(directory: string, limits: ScanLimits, mode: 'standard' | 'deep', threatModel: string, scopeRequested = false, stateDirectory = '', automaticValidation = true): Promise<ScanRecord> {
+  const deep = mode === 'deep'; const now = new Date().toISOString(); const result = await assessDirectory(directory, limits, deep); const [policy, preflight, generatedThreatModel] = await Promise.all([resolvePolicyGuidance(result.root), nativePreflight(result.root, result.receipts, result.complete, stateDirectory), threatModel.trim() ? Promise.resolve('') : generateSourceThreatModel(result.root, limits)])
+  const findings = reduceCandidates(result.candidates); if (automaticValidation) { for (const finding of findings) validateCandidate(finding); for (const finding of findings) analyzeAttackPath(finding) }
+  const snapshot = await targetSnapshot(result.root, result.receipts); const id = createScanId(); const closed = findings.every(finding => finding.ledger.some(row => row.phase === 'validation') && (finding.disposition !== 'reportable' || finding.ledger.some(row => row.phase === 'attack_path'))); const complete = result.complete && closed
+  const record: ScanRecord = { schemaVersion: 3, id, mode, lifecycle: automaticValidation ? complete ? 'completed' : 'incomplete' : 'validation', target: result.root, targetSnapshot: snapshot, createdAt: now, completedAt: automaticValidation ? new Date().toISOString() : undefined, threatModel: threatModel.trim() || generatedThreatModel, policyGuidance: policy.text, preflight, findings, coverage: { mode: deep && !scopeRequested ? 'deep_repository' : scopeRequested ? 'scoped_path' : 'repository', reviewedFiles: result.filesScanned, skippedFiles: result.filesSkipped, exclusions: [...IGNORED_DIRECTORIES], complete: result.complete, receipts: result.receipts, ruleReceipts: result.ruleReceipts, policyFiles: [...new Set([...result.policyFiles, ...policy.files])], surfaces: result.ruleReceipts.filter(receipt => receipt.pass === 'baseline').map(receipt => ({ id: receipt.ruleId, label: receipt.ruleId, disposition: automaticValidation && findings.some(finding => finding.ruleId === receipt.ruleId && finding.disposition === 'reportable') ? 'reported' : automaticValidation && findings.some(finding => finding.ruleId === receipt.ruleId) ? 'rejected' : 'needs_follow_up', receiptRefs: ['artifacts/02_discovery/finding_discovery_report.md'], riskArea: receipt.ruleId })), deferred: result.complete ? [] : [{ id: 'coverage-limits', reason: 'File limit, unreadable path, or file-size limit prevented complete review.' }] }, activity: [activity('preflight', `Native preflight ${preflight.status}.`), activity('inventory', `Inventoried ${result.filesScanned} eligible source files.`), activity('policy', policy.files.length ? `Resolved policy files: ${policy.files.join(', ')}.` : 'No SECURITY.md policy file found in the scan scope.'), activity('threat_model', threatModel.trim() ? 'Recorded user-supplied threat model.' : 'Generated source-evidenced threat model.'), activity('discovery', `Ran ${deep ? 3 : 1} native discovery pass(es) and collected ${result.candidates.length} observations.`), activity('reduction', `Reduced observations to ${findings.length} unique candidates.`), ...(automaticValidation ? [activity('validation', `Recorded static validation receipts for ${findings.length} candidates.`), activity('attack_path', `Recorded attack-path receipts for ${findings.filter(finding => finding.disposition === 'reportable').length} reportable candidates.`), activity('complete', complete ? 'Scan completed with closed candidate ledgers.' : 'Scan incomplete because coverage or candidate closure is incomplete.')] : [activity('validation', 'Scan is awaiting structured validation receipts for each candidate.')])], tasks: automaticValidation ? [] : findings.map(finding => ({ id: `task_${sha256(`${id}:${finding.candidateId}:validation`).slice(0, 24)}`, candidateId: finding.candidateId, phase: 'validation' as const, focus: `Validate ${finding.title}: establish attacker, entrypoint, trust boundary, root control, sink, impact, and counterevidence.`, status: 'pending' as const })), recipe: { mode, scopeRequested, passes: deep ? ['baseline', 'injection', 'boundaries'] : ['baseline'] }, artifacts: { directory: scanArtifactDir(getStateDir(stateDirectory), result.root, id) }, seal: '' }
   record.seal = sealScan(record); return record
 }
 
@@ -114,7 +242,7 @@ export async function reviewGitDiff(workspace: string, base: string | undefined)
   const { stdout } = await execFileAsync('git', args, { cwd: resolve(workspace), encoding: 'utf8', maxBuffer: MAX_DIFF_BYTES + 1 }); return { mode, diff: stdout.slice(0, MAX_DIFF_BYTES), truncated: Buffer.byteLength(stdout, 'utf8') > MAX_DIFF_BYTES }
 }
 
-export async function runDiffScan(workspace: string, base: string | undefined, threatModel: string): Promise<ScanRecord> {
+export async function runDiffScan(workspace: string, base: string | undefined, threatModel: string, stateDirectory = ''): Promise<ScanRecord> {
   const review = await reviewGitDiff(workspace, base); const candidates: Candidate[] = []; let currentFile = ''; let newLine = 0
   for (const diffLine of review.diff.split(/\r?\n/)) {
     if (diffLine.startsWith('+++ b/')) { currentFile = diffLine.slice(6); newLine = 0; continue }
@@ -122,5 +250,5 @@ export async function runDiffScan(workspace: string, base: string | undefined, t
     if (diffLine.startsWith('+') && !diffLine.startsWith('+++')) { const analyzed = analyzeText(resolve(workspace), join(resolve(workspace), currentFile || 'unknown'), diffLine.slice(1), 'diff'); for (const candidate of analyzed.candidates) { candidate.file = currentFile || 'unknown'; candidate.line = newLine; candidate.evidence[0].location = location(candidate.file, newLine, candidate.excerpt); candidates.push(candidate) }; newLine++; continue }
     if (!diffLine.startsWith('-')) newLine++
   }
-  const now = new Date().toISOString(); const record: ScanRecord = { schemaVersion: 2, id: createScanId(), mode: 'diff', lifecycle: review.truncated ? 'incomplete' : 'completed', target: resolve(workspace), createdAt: now, completedAt: now, threatModel: threatModel || 'Review changed behavior for attacker-controlled inputs, authorization boundaries, and sensitive sinks.', findings: reduceCandidates(candidates), coverage: { mode: 'diff', reviewedFiles: review.diff.split('\ndiff --git ').length - 1, skippedFiles: review.truncated ? 1 : 0, exclusions: review.truncated ? ['diff truncated at 1 MB'] : [], complete: !review.truncated, receipts: [], ruleReceipts: [], policyFiles: [] }, activity: [activity('discovery', `Analyzed changed lines in ${review.mode}.`), activity('reduction', `Reduced observations to ${reduceCandidates(candidates).length} unique candidate findings.`), activity('complete', review.truncated ? 'Diff scan incomplete because the diff was truncated.' : 'Diff scan completed.')], recipe: { mode: 'diff', scopeRequested: true, passes: ['diff'] }, seal: '' }; record.seal = sealScan(record); return record
+  const root = resolve(workspace); const now = new Date().toISOString(); const findings = reduceCandidates(candidates); for (const finding of findings) validateCandidate(finding); for (const finding of findings) analyzeAttackPath(finding); const policy = await resolvePolicyGuidance(root); const id = createScanId(); const complete = !review.truncated && findings.every(finding => finding.ledger.some(row => row.phase === 'validation') && (finding.disposition !== 'reportable' || finding.ledger.some(row => row.phase === 'attack_path'))); const [head, baseRevision, remote] = await Promise.all([execFileAsync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' })), base ? execFileAsync('git', ['rev-parse', '--verify', base], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' })) : Promise.resolve({ stdout: '' }), execFileAsync('git', ['config', '--get', 'remote.origin.url'], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' }))]); const remoteValue = remote.stdout.trim().replace(/^[^@]+@/, '').replace(/[?#].*$/, ''); const record: ScanRecord = { schemaVersion: 3, id, mode: 'diff', lifecycle: complete ? 'completed' : 'incomplete', target: root, targetSnapshot: { kind: 'git_diff', targetId: `dsh-security-suite-target/v1:sha256:${sha256(remoteValue || root)}`, displayName: basename(root) || root, baseRevision: baseRevision.stdout.trim() || undefined, headRevision: head.stdout.trim() || undefined, snapshotDigest: `dsh-security-suite-snapshot/v1:sha256:${sha256(review.diff)}` }, createdAt: now, completedAt: new Date().toISOString(), threatModel: threatModel || 'Review changed behavior for attacker-controlled inputs, authorization boundaries, and sensitive sinks.', policyGuidance: policy.text, preflight: { status: review.truncated ? 'warn' : 'ready', checks: [{ id: 'git-diff', status: review.truncated ? 'warn' : 'pass', detail: `Reviewed ${review.mode}.` }, { id: 'worker-orchestration', status: 'warn', detail: 'Investigation tasks are durable and claimable by DSH reviewers. This plugin does not assume a private subagent API.' }], projectFiles: [], languages: [], suggestedCommands: [] }, findings, coverage: { mode: 'diff', reviewedFiles: review.diff.split('\ndiff --git ').length - 1, skippedFiles: review.truncated ? 1 : 0, exclusions: review.truncated ? ['diff truncated at 1 MB'] : [], complete, receipts: [], ruleReceipts: [], policyFiles: policy.files, surfaces: [{ id: 'git-diff', label: review.mode, disposition: findings.some(finding => finding.disposition === 'reportable') ? 'reported' : 'no_issue_found', receiptRefs: ['artifacts/02_discovery/finding_discovery_report.md'], riskArea: 'changed-code' }], deferred: review.truncated ? [{ id: 'diff-truncated', reason: 'Diff exceeded the 1 MB safe processing limit.' }] : [] }, activity: [activity('preflight', 'Git diff preflight completed.'), activity('policy', policy.files.length ? `Resolved policy files: ${policy.files.join(', ')}.` : 'No SECURITY.md policy file found in the scan scope.'), activity('discovery', `Analyzed changed lines in ${review.mode}.`), activity('reduction', `Reduced observations to ${findings.length} unique candidates.`), activity('validation', `Recorded static validation receipts for ${findings.length} candidates.`), activity('attack_path', `Recorded attack-path receipts for ${findings.filter(finding => finding.disposition === 'reportable').length} reportable candidates.`), activity('complete', complete ? 'Diff scan completed with closed candidate ledgers.' : 'Diff scan incomplete because the diff was truncated.')], tasks: [], recipe: { mode: 'diff', scopeRequested: true, passes: ['diff'] }, artifacts: { directory: scanArtifactDir(getStateDir(stateDirectory), root, id) }, seal: '' }; record.seal = sealScan(record); return record
 }
