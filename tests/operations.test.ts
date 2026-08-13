@@ -3,9 +3,10 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { applyRemediationProposal, installPreCommitHook, remediationPlan, resumeBulkJob, runIsolatedValidation, startBulkCsvJob } from '../src/operations.ts'
+import { applyRemediationProposal, installPreCommitHook, remediationPlan, resumeBulkJob, runCandidateValidation, runIsolatedValidation, startBulkCsvJob } from '../src/operations.ts'
 import { runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
+import { claimAuditTask, recordValidation } from '../src/workbench.ts'
 
 const config = { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: '' }
 
@@ -48,6 +49,28 @@ test('isolated validation records a command receipt without modifying the source
     assert.ok(receipt.artifactRef)
     assert.equal(await readFile(join(root, 'app.ts'), 'utf8'), 'eval(input)\n')
     assert.equal((await verifyScanBundle(await loadScan(state, scan.id))).valid, true)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('candidate validation attaches an isolated receipt to the claimed candidate ledger without deciding the finding', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, local, 'standard', '', false, state, false)
+    await saveScan(state, scan)
+    const candidate = scan.findings[0]; const claim = await claimAuditTask(local, scan.id, 'validator', 'validation')
+    assert.ok(claim)
+    await assert.rejects(() => runCandidateValidation(root, local, scan.id, candidate.candidateId, 'wrong', 'node --version'), /Claim token/)
+    const receipt = await runCandidateValidation(root, local, scan.id, candidate.candidateId, claim.claimToken, 'node --version')
+    assert.match(receipt.artifactRef ?? '', new RegExp(`${candidate.candidateId}/validation_artifacts`))
+    const attached = await loadScan(state, scan.id); const finding = attached.findings.find(item => item.candidateId === candidate.candidateId)
+    assert.ok(finding); assert.equal(finding.disposition, 'discovered')
+    assert.equal(finding.evidence.some(item => item.kind === 'test' && item.artifactRef === receipt.artifactRef), true)
+    assert.equal(finding.ledger.some(item => item.artifactRef === receipt.artifactRef), true)
+    assert.match(await readFile(join(attached.artifacts.directory, receipt.artifactRef ?? ''), 'utf8'), /node --version/)
+    await recordValidation(local, scan.id, candidate.candidateId, { conclusion: 'suppressed', method: 'test', attacker: 'none', entryPoint: 'test fixture', trustBoundary: 'isolated copy', rootControl: 'eval call', sink: 'eval', impact: 'none', directEvidence: 'The isolated command is attached as supporting evidence.', counterevidence: 'No reachable route was established.', limitations: 'The command does not exercise an HTTP route.', confidence: 'medium' }, claim.claimToken)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

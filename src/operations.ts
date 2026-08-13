@@ -8,7 +8,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Config } from './config.js'
 import type { Finding, ScanRecord } from './contracts.js'
 import { runScan, resolveSafeTarget, snapshotDigestForDirectory } from './scanner.js'
-import { finalizeAndSaveScan, getStateDir, loadScan, saveScan, sha256 } from './state.js'
+import { finalizeAndSaveScan, getStateDir, loadScan, persistInvestigationArtifacts, saveScan, sha256, writeArtifact } from './state.js'
 
 const execFileAsync = promisify(execFile)
 const MAX_COMMAND_OUTPUT = 256_000
@@ -48,6 +48,33 @@ export async function runIsolatedValidation(workspace: string, config: Config, s
     await atomicWrite(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`)
     return receipt
   } finally { await rm(copyRoot, { recursive: true, force: true }) }
+}
+
+/**
+ * Bind a disposable test/build execution to one claimed validation task.
+ * A command receipt is evidence only; the reviewer still records the final
+ * source/runtime conclusion with recordValidation.
+ */
+export async function runCandidateValidation(workspace: string, config: Config, scanId: string, candidateId: string, claimToken: string, command: string, timeoutMs = 120_000): Promise<CommandReceipt> {
+  const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId)
+  if (scan.lifecycle === 'completed') throw new Error('Completed scans cannot accept new validation evidence.')
+  const finding = scan.findings.find(item => item.candidateId === candidateId); if (!finding) throw new Error('Candidate was not found in this scan.')
+  const task = scan.tasks.find(item => item.candidateId === candidateId && item.phase === 'validation' && item.status === 'claimed')
+  if (!task || task.claim?.token !== claimToken) throw new Error('Claim token does not own this candidate validation task.')
+  const currentSnapshot = await snapshotDigestForDirectory(scan.target, config); if (currentSnapshot !== scan.targetSnapshot.snapshotDigest) throw new Error('Target changed since this scan. Create a follow-up scan before attaching validation evidence.')
+  const receipt = await runIsolatedValidation(workspace, config, scanId, command, timeoutMs)
+  if (receipt.snapshotDigest !== scan.targetSnapshot.snapshotDigest) throw new Error('Target changed during isolated validation; the receipt was retained externally but was not attached to this scan.')
+  const reloaded = await loadScan(state, scanId); const currentFinding = reloaded.findings.find(item => item.candidateId === candidateId); const currentTask = reloaded.tasks.find(item => item.id === task.id)
+  if (!currentFinding || !currentTask || currentTask.status !== 'claimed' || currentTask.claim?.token !== claimToken) throw new Error('Candidate validation task changed while the command was running; the receipt was retained externally but was not attached.')
+  const artifactRef = `artifacts/05_findings/${candidateId}/validation_artifacts/${receipt.id}.json`
+  const attached = { ...receipt, artifactRef }
+  await writeArtifact(reloaded, artifactRef, `${JSON.stringify(attached, null, 2)}\n`)
+  const outcome = receipt.timedOut ? 'timed out' : receipt.exitCode === 0 ? 'completed successfully' : `exited with ${receipt.exitCode ?? 'an unknown status'}`
+  currentFinding.evidence.push({ kind: 'test', detail: `Isolated validation command \`${receipt.command}\` ${outcome}; interpret this receipt with source and runtime context.`, artifactRef })
+  currentFinding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition: 'discovered', summary: `Attached isolated validation receipt ${receipt.id}: ${outcome}. Final validation conclusion remains pending.`, artifactRef })
+  currentTask.receipt = `test:${receipt.id}`
+  await persistInvestigationArtifacts(state, reloaded); await saveScan(state, reloaded)
+  return attached
 }
 
 export async function rerunSavedScan(workspace: string, config: Config, scanId: string): Promise<ScanRecord> {

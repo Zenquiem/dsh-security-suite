@@ -39,6 +39,7 @@ The scanner inventories eligible source files deterministically, skips dependenc
 - `security_threat_model_template`, `security_import_findings`, `security_triage_imported_finding`, `security_finding_writeup`, `security_hardening_proposal`
 - `security_cancel_investigation` and `security_resume_investigation` preserve task recovery; claims use expiring leases.
 - `security_run_validation` executes a simple command in a disposable copy and saves its receipt; `security_remediation_plan` and `security_apply_remediation` provide an approval-gated, stale-safe repair lifecycle.
+- `security_run_candidate_validation` binds one disposable test/build receipt to a claimed candidate-validation task and its ledger. It records evidence only; the final validation conclusion remains an explicit source-backed review step.
 - `security_install_precommit_hook` changes a repository only when `approved: true` is explicitly supplied; it preserves an existing hook.
 - `security_tracking_preview` builds the exact tracker issue and can perform a read-only GitHub duplicate lookup. `security_create_tracking_issue` makes one approval-gated provider write and saves a receipt; it never persists the supplied token.
 

@@ -6,7 +6,7 @@ import { SECURITY_REVIEW_GUIDANCE } from './prompt.js'
 import { FULL_SECURITY_WORKFLOW } from './workflows.js'
 import { generateSourceThreatModel, runDiffScan, runScan, resolveSafeTarget } from './scanner.js'
 import { finalizeAndSaveScan, getStateDir, listScans, loadScan, persistInvestigationArtifacts, renderCsv, renderMarkdownReport, saveTriageAnnotation, saveScan, toSarif, verifyScanBundle } from './state.js'
-import { applyRemediationProposal, bulkScan, installPreCommitHook, remediationPlan, rerunSavedScan, resumeBulkJob, runIsolatedValidation, startBulkCsvJob } from './operations.js'
+import { applyRemediationProposal, bulkScan, installPreCommitHook, remediationPlan, rerunSavedScan, resumeBulkJob, runCandidateValidation, runIsolatedValidation, startBulkCsvJob } from './operations.js'
 import { cancelInvestigation, claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation, resumeInvestigation } from './workbench.js'
 import { generateHardeningPortfolio, importFindings, triageImportedFinding } from './analysis.js'
 import { createTracking, previewTracking } from './tracking.js'
@@ -108,6 +108,12 @@ export function apply(ctx: Context, config: PluginConfig): void {
     name: 'security_run_validation', description: 'Run one explicit test or build command in an isolated temporary copy of a saved scan target. The source tree is never modified; stdout, stderr, timeout, snapshot, and exit code are retained as evidence.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, command: { type: 'string', required: true, description: 'Simple test or build command without shell operators.' }, timeout_ms: { type: 'number', description: 'Timeout from 1,000 to 600,000 ms; default 120,000.' } },
     output: { schema: { type: 'object', properties: { id: { type: 'string' }, command: { type: 'string' }, exitCode: { type: 'number' }, timedOut: { type: 'boolean' }, durationMs: { type: 'number' }, stdout: { type: 'string' }, stderr: { type: 'string' }, snapshotDigest: { type: 'string' }, artifactRef: { type: 'string' } }, required: ['id', 'command', 'timedOut', 'durationMs', 'stdout', 'stderr', 'snapshotDigest'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args) { return runIsolatedValidation(process.cwd(), config, args.scan_id, args.command, args.timeout_ms ?? 120_000) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_run_candidate_validation', description: 'Run a bounded test or build command in a disposable copy and attach its receipt to one claimed candidate-validation task. This records evidence only; use security_record_validation to make the final source-backed conclusion.', parameters: { scan_id: { type: 'string', required: true, description: 'Open investigation scan identifier.' }, candidate_id: { type: 'string', required: true, description: 'Candidate identifier from security_claim_audit_task.' }, claim_token: { type: 'string', required: true, description: 'Validation task claim token.' }, command: { type: 'string', required: true, description: 'Simple test or build command without shell operators.' }, timeout_ms: { type: 'number', description: 'Timeout from 1,000 to 600,000 ms; default 120,000.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, command: { type: 'string' }, exitCode: { type: 'number' }, timedOut: { type: 'boolean' }, durationMs: { type: 'number' }, stdout: { type: 'string' }, stderr: { type: 'string' }, snapshotDigest: { type: 'string' }, artifactRef: { type: 'string' } }, required: ['id', 'command', 'timedOut', 'durationMs', 'stdout', 'stderr', 'snapshotDigest', 'artifactRef'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return runCandidateValidation(process.cwd(), config, args.scan_id, args.candidate_id, args.claim_token, args.command, args.timeout_ms ?? 120_000) },
   }))
 
   ctx.tools.register(defineTool({
