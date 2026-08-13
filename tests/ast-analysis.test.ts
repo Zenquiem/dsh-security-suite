@@ -224,3 +224,17 @@ test('AST analysis traces Math.random through local transformations into named s
   assert.deepEqual(candidates.map(candidate => candidate.line), [2, 3, 4])
   assert.equal(candidates.every(candidate => candidate.evidence.some(item => item.location?.role === 'entrypoint') && candidate.evidence.some(item => item.location?.role === 'sink')), true)
 })
+
+test('AST analysis finds only embedded non-placeholder credential literals in security fields', () => {
+  const result = analyzeJavaScriptAst(`
+    const apiKey = 'live-key-6f9d63a4d1c1'
+    settings.accessToken = 'access-token-bf0e26d90c12'
+    const config = { privateKey: 'private-key-37ac9b5e4421' }
+    const exampleToken = 'example-token-value'
+    const password = process.env.PASSWORD
+    const color = 'blue'
+  `, 'secrets.ts')
+  const candidates = result.candidates.filter(candidate => candidate.rule === 'hardcoded-secret-marker')
+  assert.deepEqual(candidates.map(candidate => candidate.line), [2, 3, 4])
+  assert.equal(candidates.every(candidate => candidate.evidence.some(item => item.detail.includes('credential field'))), true)
+})

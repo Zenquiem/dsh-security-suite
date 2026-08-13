@@ -13,7 +13,7 @@ const execFileAsync = promisify(execFile)
 test('assessDirectory reports source candidates and skips dependencies', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
-    await writeFile(join(root, 'app.ts'), "const apiKey = 'not-a-real-secret-value'\neval(input)\n")
+    await writeFile(join(root, 'app.ts'), "const apiKey = 'live-key-1e67af4309cd'\neval(input)\n")
     await mkdir(join(root, 'node_modules'))
     await writeFile(join(root, 'node_modules', 'ignored.js'), 'eval(input)')
 
@@ -251,6 +251,19 @@ test('directory assessment records AST-proven JavaScript security-field weak ran
     assert.equal(candidates.length, 1)
     assert.equal(candidates[0]?.line, 1)
     assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'entrypoint'), true)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink'), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'ast.local-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('directory assessment records AST-proven embedded JavaScript credentials but excludes placeholders and environment references', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'secrets.ts'), "const apiKey = 'live-key-1e67af4309cd'\nconst sampleToken = 'sample-token-value'\nconst password = process.env.PASSWORD\n")
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'hardcoded-secret-marker')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.line, 1)
     assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink'), true)
     assert.equal(result.ruleReceipts.some(item => item.ruleId === 'ast.local-taint' && item.matches === 1), true)
   } finally { await rm(root, { recursive: true, force: true }) }
@@ -681,6 +694,25 @@ test('diff scan retains an added AST-proven Math.random security-field assignmen
     assert.equal(finding.locations[0]?.file, 'tokens.ts')
     assert.equal(finding.locations[0]?.line, 2)
     assert.equal(finding.evidence.some(item => item.location?.line === 2 && item.location.role === 'entrypoint'), true)
+    assert.equal(finding.evidence.some(item => item.location?.line === 2 && item.location.role === 'sink'), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan retains an added AST-proven embedded JavaScript credential literal', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'config.ts'), "const sampleToken = 'sample-token-value'\n")
+    await execFileAsync('git', ['add', 'config.ts'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'config.ts'), "const sampleToken = 'sample-token-value'\nconst accessToken = 'access-token-bf0e26d90c12'\n")
+    const scan = await runDiffScan(root, undefined, '')
+    const finding = scan.findings.find(item => item.ruleId === 'hardcoded.secret.marker')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.file, 'config.ts')
+    assert.equal(finding.locations[0]?.line, 2)
     assert.equal(finding.evidence.some(item => item.location?.line === 2 && item.location.role === 'sink'), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }

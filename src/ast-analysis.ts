@@ -27,6 +27,7 @@ const AST_RULES: AstRule[] = [
   { id: 'sql-injection-query-construction', title: 'SQL query construction from request data', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a database query-text API.', sinks: ['query', 'execute', 'raw', 'queryraw', 'executeraw'] },
   { id: 'prototype-pollution-merge', title: 'Prototype-polluting merge from request data', cwe: 'CWE-1321', severity: 'medium', rationale: 'Request-derived object data reaches a generic object merge primitive without a proven prototype-key filter.', sinks: ['assign', 'merge'] },
   { id: 'weak-randomness-security', title: 'Predictable randomness in a security field', cwe: 'CWE-330', severity: 'medium', rationale: 'Math.random() reaches a security-sensitive value where a cryptographic random source is required.', sinks: [] },
+  { id: 'hardcoded-secret-marker', title: 'Embedded credential literal', cwe: 'CWE-798', severity: 'medium', rationale: 'A credential-named field contains a non-placeholder string literal that should be moved to managed secret storage.', sinks: [] },
 ]
 
 function children(node: AstNode): AstNode[] {
@@ -142,6 +143,8 @@ function sinkFor(node: AstNode): Array<{ rule: AstRule; sink: string; argumentsL
 }
 
 const SECURITY_RANDOM_FIELD = /(?:token|secret|session|password|reset|nonce|csrf|verification|verify|otp|code)/i
+const SECRET_FIELD = /(?:api[_-]?key|access[_-]?key|secret|password|token|private[_-]?key|credential)/i
+const PLACEHOLDER_SECRET = /(?:^|[-_\s])(?:example|sample|dummy|placeholder|changeme|replace(?:[_-]?me)?|your|not[_-]?a[_-]?real)(?:[-_\s]|$)|^(?:test|development|dev)[-_\s]/i
 
 function randomBindingSources(program: AstNode): Map<string, AstNode> {
   const assignments: Array<{ name: string; value: AstNode }> = []
@@ -223,6 +226,42 @@ function weakRandomnessCandidates(program: AstNode, source: string, file: string
   return [...unique.values()]
 }
 
+function hardcodedSecretCandidate(rule: AstRule, source: string, file: string, field: string, sink: AstNode, value: string): Candidate | undefined {
+  const number = sink.loc?.start.line
+  if (!number) return undefined
+  const excerpt = line(source, number)
+  return {
+    rule: rule.id, severity: rule.severity, file, line: number, excerpt, rationale: rule.rationale, cwe: rule.cwe,
+    evidence: [
+      { kind: 'pattern', detail: `AST resolved a string literal assigned to credential field ${field}.`, location: { file, line: number, excerpt, role: 'sink' } },
+      { kind: 'context', detail: `The embedded literal is ${value.length} characters and does not match a recognized placeholder form.`, location: { file, line: number, excerpt, role: 'root_control' } },
+    ],
+  }
+}
+
+function hardcodedSecretCandidates(program: AstNode, source: string, file: string): Candidate[] {
+  const rule = AST_RULES.find(item => item.id === 'hardcoded-secret-marker')
+  if (!rule) return []
+  const candidates: Candidate[] = []
+  const report = (field: string, sink: AstNode, value: AstNode | undefined): void => {
+    const embedded = literal(value)
+    if (!SECRET_FIELD.test(field) || embedded.length < 8 || PLACEHOLDER_SECRET.test(embedded)) return
+    const item = hardcodedSecretCandidate(rule, source, file, field, sink, embedded)
+    if (item) candidates.push(item)
+  }
+  walk(program, node => {
+    if (node.type === 'VariableDeclarator') report(id(node.id as AstNode) ?? '', node, node.init as AstNode | undefined)
+    if (node.type === 'AssignmentExpression') {
+      const left = node.left as AstNode
+      const field = id(left) ?? (left.type === 'MemberExpression' || left.type === 'OptionalMemberExpression' ? left.computed ? literal(left.property as AstNode) : id(left.property as AstNode) ?? '' : '')
+      report(field, node, node.right as AstNode | undefined)
+    }
+    if (node.type === 'Property' || node.type === 'PropertyDefinition') report(propertyName(node), node, node.value as AstNode | undefined)
+  })
+  const unique = new Map<string, Candidate>(); for (const item of candidates) unique.set(`${item.rule}:${item.file}:${item.line}:${item.excerpt}`, item)
+  return [...unique.values()]
+}
+
 /** Fixed-point summaries for named local functions: parameter index -> reachable sink. */
 function localFunctionSinks(program: AstNode): Map<string, Map<number, FunctionSink[]>> {
   const functions = localFunctions(program); const byName = new Map(functions.map(item => [item.name, item])); const summaries = new Map<string, Map<number, FunctionSink[]>>(functions.map(item => [item.name, new Map()]))
@@ -257,7 +296,7 @@ export function analyzeJavaScriptAst(source: string, file: string): { candidates
     if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value, requestDestructure: false }) }
   })
   for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && (assignment.requestDestructure || sourceExpression(assignment.value, tainted))) { tainted.add(assignment.name); changed = true } if (!changed) break }
-  const candidates: Candidate[] = [...weakRandomnessCandidates(program, source, file)]; const functions = new Map(localFunctions(program).map(item => [item.name, item])); const summaries = localFunctionSinks(program)
+  const candidates: Candidate[] = [...weakRandomnessCandidates(program, source, file), ...hardcodedSecretCandidates(program, source, file)]; const functions = new Map(localFunctions(program).map(item => [item.name, item])); const summaries = localFunctionSinks(program)
   walk(program, node => {
     if (node.type !== 'CallExpression') return
     for (const sink of sinkFor(node)) { const input = sink.argumentsList.find(argument => sourceExpression(argument, tainted)); if (input) { const item = candidate(sink.rule, source, file, node, sink.sink, input); if (item) candidates.push(item) } }
@@ -431,6 +470,7 @@ export function analyzeJavaScriptModuleGraph(inputs: JavaScriptModule[]): Module
   const summaries = moduleFunctionSinks(modules, functions); const candidates: Candidate[] = []
   for (const module of modules.values()) {
     candidates.push(...weakRandomnessCandidates(module.program, module.source, module.file))
+    candidates.push(...hardcodedSecretCandidates(module.program, module.source, module.file))
     const tainted = new Set<string>(); const assignments: Array<{ name: string; value: AstNode; requestDestructure: boolean }> = []
     walk(module.program, node => { if (node.type === 'VariableDeclarator') { const pattern = node.id as AstNode; const value = node.init as AstNode | undefined; if (value) for (const name of assignmentNames(pattern)) assignments.push({ name, value, requestDestructure: destructuresRequestObject(pattern, value) }) }; if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value, requestDestructure: false }) } })
     for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && (assignment.requestDestructure || sourceExpression(assignment.value, tainted))) { tainted.add(assignment.name); changed = true }; if (!changed) break }
