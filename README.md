@@ -34,7 +34,7 @@ The scanner inventories eligible source files deterministically, skips dependenc
 
 ## Tool Surface
 
-SARIF imports retain their rule id, CWE, message, severity, and physical file/line. Imported triage returns `affected` only when a compatible native local-analysis candidate matches that cited location; a readable file alone is never confirmation.
+SARIF imports retain their rule id, CWE, message, severity, and physical file/line. Imported triage returns `affected` only when a compatible native local-analysis candidate matches that cited location; a readable file alone is never confirmation. Every completed scan with reportable findings also generates a derived `hardening/hardening.md` and `hardening/hardening.json` portfolio from those findings and their detailed reports; the main report links the portfolio and bundle verification rejects a missing or stale portfolio.
 
 - `security_scan`, `security_assess`, `security_review_diff`, `security_bulk_scan`, `security_bulk_scan_csv`, `security_resume_bulk_scan`, `security_rerun_scan`
 - `security_scan_history`, `security_get_scan`, `security_compare_scans`, `security_export_scan`

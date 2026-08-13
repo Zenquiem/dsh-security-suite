@@ -40,6 +40,13 @@ export function scanArtifactDir(stateDir: string, target: string, scanId: string
   return join(stateDir, 'artifacts', targetName, scanId)
 }
 
+export interface DerivedHardening {
+  outcome: 'structural_hardening_recommended' | 'local_remediation_preferred'
+  portfolioPath: string
+  structuredPath: string
+  evidenceDigest: string
+}
+
 export async function writeArtifact(scan: ScanRecord, path: string, content: string | Buffer): Promise<string> {
   const rel = safeRelative(path); const root = resolve(scan.artifacts.directory); const destination = resolve(root, rel)
   if (!contained(root, destination)) throw new Error('Artifact path must remain inside the scan directory.')
@@ -105,6 +112,37 @@ async function persistFindingWriteups(record: ScanRecord): Promise<void> {
   }
 }
 
+function hardeningOpportunity(findings: Finding[]): { title: string; invariant: string; evidence: Finding[] } | undefined {
+  const groups = new Map<string, Finding[]>()
+  for (const finding of findings) {
+    const family = finding.ruleId.split('.').slice(0, 2).join('.')
+    groups.set(family, [...(groups.get(family) ?? []), finding])
+  }
+  const repeated = [...groups.entries()].find(([, group]) => group.length >= 2)
+  if (repeated) return { title: `Centralize ${repeated[0]} controls`, invariant: `Every ${repeated[0]} operation must cross one owned enforcement boundary before reaching its sensitive sink.`, evidence: repeated[1] }
+  const highImpact = findings.find(finding => finding.severity === 'critical' || finding.severity === 'high')
+  return highImpact ? { title: `Consolidate the control behind ${highImpact.ruleId}`, invariant: `Every path to ${highImpact.ruleId} must apply the same explicit guard before the sensitive operation.`, evidence: [highImpact] } : undefined
+}
+
+function hardeningEvidenceDigest(findings: Finding[]): string {
+  return sha256(JSON.stringify(findings.map(finding => ({ id: finding.id, fingerprint: finding.fingerprint, ruleId: finding.ruleId, locations: finding.locations, writeup: finding.writeup?.evidenceDigest }))))
+}
+
+/** Generate the scan's derived hardening portfolio from surviving local evidence. */
+export async function generateDerivedHardening(record: ScanRecord): Promise<DerivedHardening | undefined> {
+  const findings = record.findings.filter(finding => finding.disposition === 'reportable')
+  if (!findings.length) return undefined
+  const opportunity = hardeningOpportunity(findings); const evidence = opportunity?.evidence ?? []
+  const outcome: DerivedHardening['outcome'] = opportunity ? 'structural_hardening_recommended' : 'local_remediation_preferred'
+  const portfolioPath = 'hardening/hardening.md'; const structuredPath = 'hardening/hardening.json'
+  const evidenceDigest = hardeningEvidenceDigest(findings)
+  const structured = { scanId: record.id, outcome, evidenceDigest, evidence: evidence.map(finding => ({ findingId: finding.id, title: finding.title, ruleId: finding.ruleId, location: finding.locations[0], writeupPath: finding.writeup?.reportPath })), opportunities: opportunity ? [{ id: opportunity.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, ''), title: opportunity.title, violatedInvariant: opportunity.invariant, options: [{ id: 'central-owned-boundary', title: 'Central owned enforcement boundary', securityEffect: 'Moves duplicated or implicit controls into one reviewed owner.', tradeoffs: { performance: 'One additional wrapper or policy check on sensitive paths.', reliability: 'Central owner must fail closed and be observable.', migration: 'Incremental migration with old callsites rejected after adoption.' } }, { id: 'local-strengthening', title: 'Strengthen each local callsite', securityEffect: 'Addresses observed sites without a larger ownership change.', tradeoffs: { performance: 'Minimal runtime overhead.', reliability: 'Control drift remains likely as new callsites are added.', migration: 'Low immediate disruption but repeated review work.' } }] }] : [], limitations: record.coverage.deferred }
+  const portfolio = ['# Security Hardening Portfolio', '', `- Scan: \`${record.id}\``, `- Outcome: ${outcome}`, `- Evidence digest: \`${evidenceDigest}\``, '', '## Evidence', ...(evidence.length ? evidence.map(finding => `- [${finding.title}](../${finding.writeup?.reportPath ?? ''}) at \`${finding.locations[0].file}:${finding.locations[0].line}\`: ${finding.rootCause}`) : findings.map(finding => `- [${finding.title}](../${finding.writeup?.reportPath ?? ''}) at \`${finding.locations[0].file}:${finding.locations[0].line}\`.`)), '', '## Assessment', opportunity ? `The observed evidence indicates that ${opportunity.title.toLowerCase()}. The proposed invariant is: ${opportunity.invariant}` : 'The current evidence favors focused local remediations. A larger design change would not be justified without repeated or cross-boundary evidence.', '', '## Options', ...(opportunity ? ['1. **Central owned enforcement boundary**: move the sensitive control into one reviewed API; retain focused fixes during migration.', '2. **Local strengthening**: patch each observed callsite; lower disruption but retain drift risk.', '', '## Recommendation', 'Adopt the central boundary when the affected operations are expected to grow or are owned by multiple components. Prefer local strengthening when the evidence remains isolated and the migration cost is disproportionate.'] : ['Use the verified local remediation plan for each finding, then rescan before considering architectural changes.'])].join('\n') + '\n'
+  await writeArtifact(record, portfolioPath, portfolio)
+  await writeArtifact(record, structuredPath, json(structured))
+  return { outcome, portfolioPath, structuredPath, evidenceDigest }
+}
+
 function coverageDocument(scan: ScanRecord): Record<string, unknown> {
   return {
     documentType: 'dsh-security-suite.coverage', schemaVersion: '1.0', scanId: scan.id, mode: scan.coverage.mode,
@@ -118,7 +156,7 @@ function coverageDocument(scan: ScanRecord): Record<string, unknown> {
 function manifestDocument(scan: ScanRecord, artifacts: Array<{ path: string; sha256: string; mediaType: string }>): Record<string, unknown> {
   return {
     documentType: 'dsh-security-suite.scan-manifest', schemaVersion: '1.0',
-    scan: { id: scan.id, producer: { name: 'dsh-security-suite', version: '0.27.0' }, status: 'completed', startedAt: scan.createdAt, completedAt: scan.completedAt, sealedAt: scan.completedAt, target: scan.targetSnapshot,
+    scan: { id: scan.id, producer: { name: 'dsh-security-suite', version: '0.28.0' }, status: 'completed', startedAt: scan.createdAt, completedAt: scan.completedAt, sealedAt: scan.completedAt, target: scan.targetSnapshot,
       scope: { includePaths: ['.'], excludePaths: scan.coverage.exclusions, summary: `${scan.coverage.reviewedFiles} source files reviewed.`, limitations: scan.coverage.deferred.map(item => item.reason) },
       threatModel: { summary: scan.threatModel }, coverageRef: 'coverage.json', findingsRef: 'findings.json', artifacts },
   }
@@ -127,6 +165,8 @@ function manifestDocument(scan: ScanRecord, artifacts: Array<{ path: string; sha
 export async function persistScanBundle(stateDir: string, record: ScanRecord): Promise<ScanRecord> {
   if (!record.artifacts.directory) record.artifacts.directory = scanArtifactDir(stateDir, record.target, record.id)
   const root = resolve(record.artifacts.directory); await mkdir(root, { recursive: true }); await persistFindingWriteups(record)
+  const hardening = await generateDerivedHardening(record)
+  record.hardening = hardening && { ...hardening, generatedAt: new Date().toISOString() }
   const findingPaths = await Promise.all(record.findings.map(async finding => {
     const base = `artifacts/05_findings/${finding.candidateId}`
     await writeArtifact(record, `${base}/candidate_ledger.jsonl`, `${finding.ledger.map(row => JSON.stringify(row)).join('\n')}\n`)
@@ -190,6 +230,13 @@ export async function verifyScanBundle(record: ScanRecord): Promise<{ valid: boo
   const errors: string[] = []
   if (!verifySeal(record)) errors.push('Scan state seal does not match.')
   if (!record.artifacts.manifest || !record.artifacts.findings || !record.artifacts.coverage || !record.artifacts.report) errors.push('Scan bundle paths are incomplete.')
+  if (record.findings.some(finding => finding.disposition === 'reportable') && !record.hardening) errors.push('Reportable findings require a derived hardening portfolio.')
+  if (record.hardening) {
+    if (record.hardening.evidenceDigest !== hardeningEvidenceDigest(record.findings.filter(finding => finding.disposition === 'reportable'))) errors.push('Derived hardening portfolio evidence digest is stale.')
+    for (const path of [record.hardening.portfolioPath, record.hardening.structuredPath]) {
+      try { await readArtifact(record, path) } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
+    }
+  }
   for (const candidate of record.findings) {
     const phases = new Set(candidate.ledger.map(item => item.phase))
     if (!phases.has('discovery')) errors.push(`${candidate.candidateId} has no discovery receipt.`)
@@ -271,7 +318,7 @@ export function renderCsv(scan: ScanRecord): string { const header = ['id', 'can
 
 export function renderMarkdownReport(scan: ScanRecord): string {
   const finalFindings = scan.findings.filter(finding => finding.disposition === 'reportable'); const summary = finalFindings.reduce<Record<string, number>>((counts, finding) => { counts[finding.severity] = (counts[finding.severity] ?? 0) + 1; return counts }, {})
-  const lines = ['# DSH Security Suite Report', '', `- Scan ID: \`${scan.id}\``, `- Mode: ${scan.mode}`, `- Lifecycle: ${scan.lifecycle}`, `- Target: \`${scan.targetSnapshot.displayName}\``, `- Snapshot: \`${scan.targetSnapshot.snapshotDigest}\``, `- Completed: ${scan.completedAt ?? 'not completed'}`, `- Integrity seal: \`${scan.seal}\``, `- Coverage: ${scan.coverage.reviewedFiles} reviewed, ${scan.coverage.skippedFiles} skipped, ${scan.coverage.complete ? 'complete' : 'partial'}`, `- Reportable findings: critical ${summary.critical ?? 0}, high ${summary.high ?? 0}, medium ${summary.medium ?? 0}, low ${summary.low ?? 0}`, '', '## Threat Model', '', scan.threatModel, '', '## Reviewed Surfaces', '']
+  const lines = ['# DSH Security Suite Report', '', `- Scan ID: \`${scan.id}\``, `- Mode: ${scan.mode}`, `- Lifecycle: ${scan.lifecycle}`, `- Target: \`${scan.targetSnapshot.displayName}\``, `- Snapshot: \`${scan.targetSnapshot.snapshotDigest}\``, `- Completed: ${scan.completedAt ?? 'not completed'}`, `- Integrity seal: \`${scan.seal}\``, `- Coverage: ${scan.coverage.reviewedFiles} reviewed, ${scan.coverage.skippedFiles} skipped, ${scan.coverage.complete ? 'complete' : 'partial'}`, `- Reportable findings: critical ${summary.critical ?? 0}, high ${summary.high ?? 0}, medium ${summary.medium ?? 0}, low ${summary.low ?? 0}`, ...(scan.hardening ? [`- Hardening portfolio: \`${scan.hardening.portfolioPath}\``] : []), '', '## Threat Model', '', scan.threatModel, '', '## Reviewed Surfaces', '']
   for (const surface of scan.coverage.surfaces) lines.push(`- ${surface.label}: ${surface.disposition}`)
   lines.push('', '## Findings')
   if (finalFindings.length === 0) lines.push('', 'No candidates survived the discovery, validation, and attack-path reportability gates.')

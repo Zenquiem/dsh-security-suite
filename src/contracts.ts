@@ -138,6 +138,14 @@ export interface ScanRecord {
   tasks: AuditTask[]
   recipe: { mode: 'standard' | 'deep' | 'diff'; scopeRequested: boolean; passes: string[] }
   artifacts: { directory: string; manifest?: string; findings?: string; coverage?: string; report?: string }
+  /** Derived architecture guidance; absent when no reportable finding survives finalization. */
+  hardening?: {
+    portfolioPath: string
+    structuredPath: string
+    outcome: 'structural_hardening_recommended' | 'local_remediation_preferred'
+    generatedAt: string
+    evidenceDigest: string
+  }
   annotations?: { path: string; updatedAt: string }
   seal: string
 }
