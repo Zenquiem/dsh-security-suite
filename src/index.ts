@@ -1,6 +1,6 @@
 import type { Context } from '@deepseek-ai/cordis'
 import type {} from '@deepseek-ai/dsh-system-prompt'
-import { defineTool, type JsonValue } from '@deepseek-ai/dsh-tools'
+import { defineTool as defineDshTool, type JsonValue } from '@deepseek-ai/dsh-tools'
 import { Config, type Config as PluginConfig } from './config.js'
 import { SECURITY_REVIEW_GUIDANCE } from './prompt.js'
 import { FULL_SECURITY_WORKFLOW } from './workflows.js'
@@ -10,10 +10,35 @@ import { applyRemediationProposal, bulkScan, installPreCommitHook, remediationPl
 import { cancelInvestigation, claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation, resumeInvestigation } from './workbench.js'
 import { generateHardeningPortfolio, importFindings, triageImportedFinding } from './analysis.js'
 import { createTracking, previewTracking } from './tracking.js'
+import { createDeepDiscoveryJob, deepDiscoveryCapability, reportDeepCandidate, runDeepDiscovery } from './deep-discovery.js'
 
 export const name = 'dsh-security-suite'
 export const inject = ['tools', 'systemPrompt']
 export { Config }
+
+/**
+ * DSH's value-schema DSL represents object requiredness on each property,
+ * whereas JSON Schema represents it as an object-level list. Keep the tool
+ * contracts strict while translating the originally authored output shapes.
+ */
+function adaptOutputSchema(schema: unknown): unknown {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return schema
+  const value = schema as Record<string, unknown>
+  if (Array.isArray(value.oneOf)) return { ...value, oneOf: value.oneOf.map(adaptOutputSchema) }
+  if (value.type === 'array') return { ...value, ...(value.items ? { items: adaptOutputSchema(value.items) } : {}) }
+  if (value.type !== 'object') return value
+  const required = new Set(Array.isArray(value.required) ? value.required.filter((name): name is string => typeof name === 'string') : [])
+  const properties = value.properties && typeof value.properties === 'object' && !Array.isArray(value.properties)
+    ? Object.fromEntries(Object.entries(value.properties as Record<string, unknown>).map(([name, property]) => [name, { ...(adaptOutputSchema(property) as Record<string, unknown>), ...(required.has(name) ? { required: true } : {}) }]))
+    : undefined
+  const { required: _required, ...rest } = value
+  return { ...rest, ...(properties ? { properties } : {}) }
+}
+
+const defineTool = ((options: unknown) => {
+  const tool = options as { output: { schema: unknown } }
+  return defineDshTool({ ...tool, output: { ...tool.output, schema: adaptOutputSchema(tool.output.schema) } } as never)
+}) as typeof defineDshTool
 
 export function apply(ctx: Context, config: PluginConfig): void {
   if (!config.enabled) return
@@ -24,6 +49,24 @@ export function apply(ctx: Context, config: PluginConfig): void {
     text: SECURITY_REVIEW_GUIDANCE,
   })
   ctx.systemPrompt.section({ name: 'dsh-security-suite:workflow', order: 161, text: FULL_SECURITY_WORKFLOW })
+
+  ctx.tools.register(defineTool({
+    name: 'security_deep_discovery_capability', description: 'Report whether this DSH profile exposes the native agent runtime required for six-worker delegated deep discovery. This performs no scan and creates no agent.', parameters: {},
+    output: { schema: { type: 'object', properties: { available: { type: 'boolean' }, workersPerRound: { type: 'number' }, reason: { type: 'string' } }, required: ['available', 'workersPerRound'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute() { return deepDiscoveryCapability(ctx) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_start_deep_discovery', description: 'Create and run a genuine six-worker-per-round DSH delegated discovery job for an open deep investigation. Every worker receives the same neutral brief, must submit source-backed candidates, and the job reaches saturation only after a complete round adds no new candidates.', parameters: { scan_id: { type: 'string', required: true, description: 'Open deep investigation scan identifier.' }, max_rounds: { type: 'number', description: 'Maximum complete independent discovery rounds from 1 to 10; default 10.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, lifecycle: { type: 'string' }, rounds: { type: 'array', items: { type: 'object', properties: { number: { type: 'number' }, candidateCount: { type: 'number' }, novelty: { type: 'number' }, status: { type: 'string' } }, required: ['number', 'candidateCount', 'novelty', 'status'], additionalProperties: false } }, candidates: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, workerId: { type: 'string' }, ruleId: { type: 'string' }, file: { type: 'string' }, line: { type: 'number' } }, required: ['id', 'workerId', 'ruleId', 'file', 'line'], additionalProperties: false } } }, required: ['id', 'lifecycle', 'rounds', 'candidates'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { const job = await createDeepDiscoveryJob(config, args.scan_id, args.max_rounds ?? 10); return runDeepDiscovery(ctx, config, job.id) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_deep_report_candidate', description: 'Submit one source-backed candidate for the active delegated deep-discovery worker. This is accepted only from the worker-specific job, worker id, and claim token issued by security_start_deep_discovery.', parameters: { job_id: { type: 'string', required: true, description: 'Deep discovery job identifier.' }, worker_id: { type: 'string', required: true, description: 'Worker identifier from the assignment.' }, claim_token: { type: 'string', required: true, description: 'Worker claim token from the assignment.' }, rule_id: { type: 'string', required: true, description: 'Stable vulnerability-family rule id.' }, title: { type: 'string', required: true, description: 'Concise candidate title.' }, severity: { type: 'string', required: true, enum: ['critical', 'high', 'medium', 'low'], description: 'Provisional severity.' }, cwe: { type: 'string', required: true, description: 'CWE identifier.' }, file: { type: 'string', required: true, description: 'Target-relative source path.' }, line: { type: 'number', required: true, description: 'Concrete source line.' }, root_cause: { type: 'string', required: true, description: 'Source-backed explanation of the suspected broken control.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, workerId: { type: 'string' }, ruleId: { type: 'string' }, file: { type: 'string' }, line: { type: 'number' } }, required: ['id', 'workerId', 'ruleId', 'file', 'line'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return reportDeepCandidate(config, args.job_id, args.worker_id, args.claim_token, { ruleId: args.rule_id, title: args.title, severity: args.severity as 'critical' | 'high' | 'medium' | 'low', cwe: args.cwe, file: args.file, line: args.line, rootCause: args.root_cause }) },
+  }))
 
   ctx.tools.register(defineTool({
     name: 'security_import_findings', description: 'Import JSON or text security findings from a workspace file. Imported material is treated as untrusted evidence and must be triaged against local source before it becomes a repository-impact conclusion.', parameters: { path: { type: 'string', required: true, description: 'Workspace-relative JSON or text finding file.' } },
