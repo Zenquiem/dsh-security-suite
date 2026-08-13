@@ -26,6 +26,7 @@ const AST_RULES: AstRule[] = [
   { id: 'ssrf-request-sink', title: 'Outbound request from request data', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects an outbound network destination.', sinks: ['fetch', 'request', 'get', 'post'] },
   { id: 'sql-injection-query-construction', title: 'SQL query construction from request data', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a database query-text API.', sinks: ['query', 'execute', 'raw', 'queryraw', 'executeraw'] },
   { id: 'prototype-pollution-merge', title: 'Prototype-polluting merge from request data', cwe: 'CWE-1321', severity: 'medium', rationale: 'Request-derived object data reaches a generic object merge primitive without a proven prototype-key filter.', sinks: ['assign', 'merge'] },
+  { id: 'weak-randomness-security', title: 'Predictable randomness in a security field', cwe: 'CWE-330', severity: 'medium', rationale: 'Math.random() reaches a security-sensitive value where a cryptographic random source is required.', sinks: [] },
 ]
 
 function children(node: AstNode): AstNode[] {
@@ -140,6 +141,88 @@ function sinkFor(node: AstNode): Array<{ rule: AstRule; sink: string; argumentsL
     .map(rule => ({ rule, sink, argumentsList: rule.id === 'ssrf-request-sink' ? outboundDestinationArguments(argumentsList) : rule.id === 'sql-injection-query-construction' ? argumentsList.slice(0, 1) : rule.id === 'prototype-pollution-merge' ? prototypeMergeSourceArguments(argumentsList) : argumentsList }))
 }
 
+const SECURITY_RANDOM_FIELD = /(?:token|secret|session|password|reset|nonce|csrf|verification|verify|otp|code)/i
+
+function randomBindingSources(program: AstNode): Map<string, AstNode> {
+  const assignments: Array<{ name: string; value: AstNode }> = []
+  walk(program, node => {
+    if (node.type === 'VariableDeclarator') {
+      const name = id(node.id as AstNode); const value = node.init as AstNode | undefined
+      if (name && value) assignments.push({ name, value })
+    }
+    if (node.type === 'AssignmentExpression') {
+      const name = id(node.left as AstNode); const value = node.right as AstNode | undefined
+      if (name && value) assignments.push({ name, value })
+    }
+  })
+  const bindings = new Map<string, AstNode>()
+  for (let pass = 0; pass < assignments.length + 1; pass++) {
+    let changed = false
+    for (const assignment of assignments) {
+      if (bindings.has(assignment.name)) continue
+      const source = mathRandomSource(assignment.value, bindings)
+      if (source) { bindings.set(assignment.name, source); changed = true }
+    }
+    if (!changed) break
+  }
+  return bindings
+}
+
+function mathRandomSource(node: AstNode | undefined, bindings: Map<string, AstNode>): AstNode | undefined {
+  if (!node) return undefined
+  if (node.type === 'Identifier') return bindings.get(String(node.name))
+  if (node.type === 'ChainExpression' || node.type === 'TSAsExpression' || node.type === 'TSTypeAssertion' || node.type === 'TSNonNullExpression' || node.type === 'AwaitExpression') return mathRandomSource(node.expression as AstNode, bindings)
+  if (node.type === 'CallExpression') {
+    if (memberName(node.callee as AstNode).toLowerCase() === 'math.random') return node
+    const calleeSource = mathRandomSource(node.callee as AstNode, bindings)
+    if (calleeSource) return calleeSource
+    return ((node.arguments ?? []) as AstNode[]).map(argument => mathRandomSource(argument, bindings)).find((source): source is AstNode => Boolean(source))
+  }
+  if (node.type === 'MemberExpression' || node.type === 'OptionalMemberExpression') return mathRandomSource(node.object as AstNode, bindings)
+  if (node.type === 'TemplateLiteral') return ((node.expressions ?? []) as AstNode[]).map(expression => mathRandomSource(expression, bindings)).find((source): source is AstNode => Boolean(source))
+  if (node.type === 'BinaryExpression' || node.type === 'LogicalExpression' || node.type === 'AssignmentExpression') return mathRandomSource(node.left as AstNode, bindings) ?? mathRandomSource(node.right as AstNode, bindings)
+  if (node.type === 'ConditionalExpression') return mathRandomSource(node.consequent as AstNode, bindings) ?? mathRandomSource(node.alternate as AstNode, bindings)
+  if (node.type === 'SequenceExpression') return ((node.expressions ?? []) as AstNode[]).map(expression => mathRandomSource(expression, bindings)).find((source): source is AstNode => Boolean(source))
+  return undefined
+}
+
+function weakRandomnessCandidate(rule: AstRule, source: string, file: string, target: string, sink: AstNode, random: AstNode): Candidate | undefined {
+  const number = sink.loc?.start.line
+  const randomLine = random.loc?.start.line
+  if (!number || !randomLine) return undefined
+  const excerpt = line(source, number)
+  return {
+    rule: rule.id, severity: rule.severity, file, line: number, excerpt, rationale: rule.rationale, cwe: rule.cwe,
+    evidence: [
+      { kind: 'pattern', detail: `AST resolved Math.random() reaching security-sensitive field ${target}.`, location: { file, line: randomLine, excerpt: line(source, randomLine), role: 'entrypoint' } },
+      { kind: 'context', detail: 'AST local value-flow analysis resolved a non-cryptographic random source in a security-sensitive assignment.', location: { file, line: number, excerpt, role: 'sink' } },
+    ],
+  }
+}
+
+function weakRandomnessCandidates(program: AstNode, source: string, file: string): Candidate[] {
+  const rule = AST_RULES.find(item => item.id === 'weak-randomness-security')
+  if (!rule) return []
+  const bindings = randomBindingSources(program); const candidates: Candidate[] = []
+  const report = (target: string, sink: AstNode, value: AstNode | undefined): void => {
+    if (!SECURITY_RANDOM_FIELD.test(target)) return
+    const random = mathRandomSource(value, bindings)
+    const item = random && weakRandomnessCandidate(rule, source, file, target, sink, random)
+    if (item) candidates.push(item)
+  }
+  walk(program, node => {
+    if (node.type === 'VariableDeclarator') report(id(node.id as AstNode) ?? '', node, node.init as AstNode | undefined)
+    if (node.type === 'AssignmentExpression') {
+      const left = node.left as AstNode
+      const target = id(left) ?? (left.type === 'MemberExpression' || left.type === 'OptionalMemberExpression' ? left.computed ? literal(left.property as AstNode) : id(left.property as AstNode) ?? '' : '')
+      report(target, node, node.right as AstNode | undefined)
+    }
+    if (node.type === 'Property') report(propertyName(node), node, node.value as AstNode | undefined)
+  })
+  const unique = new Map<string, Candidate>(); for (const item of candidates) unique.set(`${item.rule}:${item.file}:${item.line}:${item.excerpt}`, item)
+  return [...unique.values()]
+}
+
 /** Fixed-point summaries for named local functions: parameter index -> reachable sink. */
 function localFunctionSinks(program: AstNode): Map<string, Map<number, FunctionSink[]>> {
   const functions = localFunctions(program); const byName = new Map(functions.map(item => [item.name, item])); const summaries = new Map<string, Map<number, FunctionSink[]>>(functions.map(item => [item.name, new Map()]))
@@ -174,7 +257,7 @@ export function analyzeJavaScriptAst(source: string, file: string): { candidates
     if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value, requestDestructure: false }) }
   })
   for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && (assignment.requestDestructure || sourceExpression(assignment.value, tainted))) { tainted.add(assignment.name); changed = true } if (!changed) break }
-  const candidates: Candidate[] = []; const functions = new Map(localFunctions(program).map(item => [item.name, item])); const summaries = localFunctionSinks(program)
+  const candidates: Candidate[] = [...weakRandomnessCandidates(program, source, file)]; const functions = new Map(localFunctions(program).map(item => [item.name, item])); const summaries = localFunctionSinks(program)
   walk(program, node => {
     if (node.type !== 'CallExpression') return
     for (const sink of sinkFor(node)) { const input = sink.argumentsList.find(argument => sourceExpression(argument, tainted)); if (input) { const item = candidate(sink.rule, source, file, node, sink.sink, input); if (item) candidates.push(item) } }
@@ -347,6 +430,7 @@ export function analyzeJavaScriptModuleGraph(inputs: JavaScriptModule[]): Module
   const functions = new Map<string, ModuleFunction>(); for (const module of modules.values()) for (const record of module.functions.values()) functions.set(record.id, record)
   const summaries = moduleFunctionSinks(modules, functions); const candidates: Candidate[] = []
   for (const module of modules.values()) {
+    candidates.push(...weakRandomnessCandidates(module.program, module.source, module.file))
     const tainted = new Set<string>(); const assignments: Array<{ name: string; value: AstNode; requestDestructure: boolean }> = []
     walk(module.program, node => { if (node.type === 'VariableDeclarator') { const pattern = node.id as AstNode; const value = node.init as AstNode | undefined; if (value) for (const name of assignmentNames(pattern)) assignments.push({ name, value, requestDestructure: destructuresRequestObject(pattern, value) }) }; if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value, requestDestructure: false }) } })
     for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && (assignment.requestDestructure || sourceExpression(assignment.value, tainted))) { tainted.add(assignment.name); changed = true }; if (!changed) break }

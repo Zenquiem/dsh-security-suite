@@ -242,6 +242,20 @@ test('directory assessment records request-derived object merge evidence without
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment records AST-proven JavaScript security-field weak randomness and excludes UI randomness', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'tokens.ts'), 'const resetToken = Math.random().toString(36)\nconst color = Math.random()\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'weak-randomness-security')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.line, 1)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'entrypoint'), true)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink'), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'ast.local-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment follows a CommonJS default function export', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -649,6 +663,26 @@ test('diff scan does not restate an unchanged JavaScript source-to-sink path', a
     const scan = await runDiffScan(root, undefined, '')
     assert.equal(scan.findings.length, 0)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 0)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan retains an added AST-proven Math.random security-field assignment', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'tokens.ts'), 'const color = Math.random()\n')
+    await execFileAsync('git', ['add', 'tokens.ts'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'tokens.ts'), 'const color = Math.random()\nconst sessionToken = Math.random().toString(36)\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const finding = scan.findings.find(item => item.ruleId === 'weak.randomness.security')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.file, 'tokens.ts')
+    assert.equal(finding.locations[0]?.line, 2)
+    assert.equal(finding.evidence.some(item => item.location?.line === 2 && item.location.role === 'entrypoint'), true)
+    assert.equal(finding.evidence.some(item => item.location?.line === 2 && item.location.role === 'sink'), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ast.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

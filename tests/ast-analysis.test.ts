@@ -211,3 +211,16 @@ test('AST module analysis follows request-derived objects through local wrappers
   assert.equal(result.candidates[0]?.file, 'merge.ts')
   assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
 })
+
+test('AST analysis traces Math.random through local transformations into named security fields only', () => {
+  const result = analyzeJavaScriptAst(`
+    const resetToken = Math.random().toString(36)
+    session.nonce = Math.random()
+    const response = { verificationCode: 'v-' + Math.random() }
+    const color = Math.random()
+    const layout = { shade: Math.random() }
+  `, 'randomness.ts')
+  const candidates = result.candidates.filter(candidate => candidate.rule === 'weak-randomness-security')
+  assert.deepEqual(candidates.map(candidate => candidate.line), [2, 3, 4])
+  assert.equal(candidates.every(candidate => candidate.evidence.some(item => item.location?.role === 'entrypoint') && candidate.evidence.some(item => item.location?.role === 'sink')), true)
+})

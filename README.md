@@ -37,6 +37,8 @@ The scanner inventories eligible source files deterministically, skips dependenc
 
 JavaScript/TypeScript request destructuring is a supported source form: aliases introduced by `const { body } = req` or `const { query: q } = request` participate in local and relative-module flow summaries. Destructuring from a non-request object does not establish attacker control.
 
+JavaScript/TypeScript weak-randomness discovery is AST-based: it recognizes `Math.random()` after supported local value transformations only when it reaches a named security field, including token, session, nonce, reset, verification, OTP, or code assignments. It records both the random-source and assignment locations. General-purpose values such as UI colors are not candidates; other languages, dynamic property names, and unmodeled random APIs remain unproven.
+
 Ruby deserialization analysis follows request-derived values through same-directory local wrappers into `YAML.load`, `Psych.load`, and `Marshal.load`. `safe_load`, static data, and unrelated parser methods remain unproven.
 
 PHP deserialization analysis follows request-derived values through same-directory local wrappers into `unserialize()`. It recognizes the explicit `allowed_classes => false` control; other allowlists, wrappers, and parser APIs remain validation-required.

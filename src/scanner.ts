@@ -44,7 +44,6 @@ const RULES: Rule[] = [
   { id: 'tls-verification-disabled', title: 'TLS verification disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled.', pattern: /(?:rejectUnauthorized\s*:\s*false|(?:requests|httpx)\.[A-Za-z_]+\s*\([^\n)]*\bverify\s*=\s*False|CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)|InsecureSkipVerify\s*:\s*true)/ },
   { id: 'hardcoded-secret-marker', title: 'Likely hardcoded credential', cwe: 'CWE-798', severity: 'medium', rationale: 'A likely credential literal appears in source and should be moved to managed secret storage.', pattern: /(?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*["'][^"']{8,}["']/i },
   { id: 'ssrf-request-sink', title: 'Request-derived outbound request', cwe: 'CWE-918', severity: 'medium', rationale: 'An outbound request appears to use request-derived input and needs destination allowlisting.', pattern: /(?:fetch|axios\.(?:get|post|request)|requests\.(?:get|post|request)|http\.request)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
-  { id: 'weak-randomness-security', title: 'Predictable randomness in security context', cwe: 'CWE-330', severity: 'medium', rationale: 'A non-cryptographic random source appears near a security-sensitive token or secret.', pattern: /(?:Math\.random\s*\(|random\.random\s*\()/, context: /(?:token|secret|session|password|reset|nonce)/i },
   { id: 'sql-injection-query-construction', title: 'Constructed SQL query', cwe: 'CWE-89', severity: 'high', rationale: 'A database query appears to construct SQL syntax from request-derived input.', pattern: /(?:query|execute|raw)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input|\+|\$\{)/i, context: /(?:select|insert|update|delete|from|where)/i },
 ]
 
@@ -63,6 +62,20 @@ function isContained(root: string, candidate: string): boolean { return candidat
 function location(file: string, line: number, excerpt: string, role: 'root_control' = 'root_control'): { file: string; line: number; excerpt: string; role: 'root_control' } { return { file, line, excerpt: excerpt.trim().slice(0, 240), role } }
 function lineAt(source: string, offset: number): number { return source.slice(0, offset).split(/\r?\n/).length }
 function sourceLine(lines: string[], number: number): string { return lines[number - 1]?.trim().slice(0, 240) ?? '' }
+
+function dedupeCandidateObservations(candidates: Candidate[]): Candidate[] {
+  const unique = new Map<string, Candidate>()
+  for (const candidate of candidates) {
+    const key = `${candidate.rule}:${candidate.file}:${candidate.line}:${candidate.excerpt}`
+    const existing = unique.get(key)
+    if (!existing) { unique.set(key, candidate); continue }
+    for (const evidence of candidate.evidence) {
+      const evidenceKey = `${evidence.kind}:${evidence.detail}:${evidence.location?.file ?? ''}:${evidence.location?.line ?? ''}:${evidence.location?.role ?? ''}`
+      if (!existing.evidence.some(item => `${item.kind}:${item.detail}:${item.location?.file ?? ''}:${item.location?.line ?? ''}:${item.location?.role ?? ''}` === evidenceKey)) existing.evidence.push(evidence)
+    }
+  }
+  return [...unique.values()]
+}
 
 function configurationCandidate(rule: ConfigurationRule, file: string, lines: string[], line: number, detail: string, controlLine?: number): Candidate {
   const excerpt = sourceLine(lines, line)
@@ -361,7 +374,7 @@ function analyzeText(root: string, file: string, content: string, pass: string, 
 }
 
 export async function assessDirectory(directory: string, limits: ScanLimits, deep = false): Promise<ScanResult> {
-  const root = resolve(directory); const { files, skipped, complete } = await collectFiles(root, limits); const candidates: Candidate[] = []; const ruleReceipts: RuleReceipt[] = []; const fileReceipts: FileReceipt[] = []; const policyFiles: string[] = []; const modules: JavaScriptModule[] = []; const pythonModules: Array<{ file: string; source: string }> = []; const goModules: Array<{ file: string; source: string; modulePath?: string }> = []; const goModuleCache = new Map<string, string | undefined>(); const structuredModules: Record<StructuredLanguage, Array<{ file: string; source: string }>> = { java: [], csharp: [], php: [], ruby: [], c: [], cpp: [], rust: [] }; const passes = deep ? [['baseline', undefined], ['injection', new Set(['dangerous-dynamic-code', 'shell-command-construction'])], ['boundaries', new Set(['path-traversal-sink', 'ssrf-request-sink', 'tls-verification-disabled', 'weak-randomness-security', 'hardcoded-secret-marker'])]] as const : [['baseline', undefined]] as const
+  const root = resolve(directory); const { files, skipped, complete } = await collectFiles(root, limits); const candidates: Candidate[] = []; const ruleReceipts: RuleReceipt[] = []; const fileReceipts: FileReceipt[] = []; const policyFiles: string[] = []; const modules: JavaScriptModule[] = []; const pythonModules: Array<{ file: string; source: string }> = []; const goModules: Array<{ file: string; source: string; modulePath?: string }> = []; const goModuleCache = new Map<string, string | undefined>(); const structuredModules: Record<StructuredLanguage, Array<{ file: string; source: string }>> = { java: [], csharp: [], php: [], ruby: [], c: [], cpp: [], rust: [] }; const passes = deep ? [['baseline', undefined], ['injection', new Set(['dangerous-dynamic-code', 'shell-command-construction'])], ['boundaries', new Set(['path-traversal-sink', 'ssrf-request-sink', 'tls-verification-disabled', 'hardcoded-secret-marker'])]] as const : [['baseline', undefined]] as const
   for (const file of files) {
     const content = await readFile(file, 'utf8'); const rel = relative(root, file)
     fileReceipts.push({ path: rel, bytes: Buffer.byteLength(content, 'utf8'), sha256: hash(content), language: languageFor(file) })
@@ -389,7 +402,7 @@ export async function assessDirectory(directory: string, limits: ScanLimits, dee
   candidates.push(...goGraph.candidates)
   ruleReceipts.push({ ruleId: 'go.cross-file-taint', pass: 'semantic', matches: goGraph.candidates.length })
   for (const language of Object.keys(structuredModules) as StructuredLanguage[]) { const graph = analyzeStructuredFlow(structuredModules[language], language); candidates.push(...graph.candidates); ruleReceipts.push({ ruleId: `${language}.structured-taint`, pass: 'semantic', matches: graph.candidates.length }) }
-  return { root, filesScanned: files.length, filesSkipped: skipped, candidates, receipts: fileReceipts, ruleReceipts, policyFiles, complete }
+  return { root, filesScanned: files.length, filesSkipped: skipped, candidates: dedupeCandidateObservations(candidates), receipts: fileReceipts, ruleReceipts, policyFiles, complete }
 }
 
 export async function snapshotDigestForDirectory(directory: string, limits: ScanLimits): Promise<string> {
