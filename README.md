@@ -20,6 +20,7 @@ Deep workers are DSH-native child agents. Their scoped tool view is restricted t
 | Candidate validation and remediation | Isolated command evidence plus snapshot-checked, user-approved patch and verification workflow |
 | Bulk scans and pre-commit hook | Native bounded scheduler and Git hook installer |
 | Threat model, attack-path write-up, DSH-local reports | `security_threat_model_template`, `security_finding_writeup`, and state tools |
+| External security backlog triage | GitHub REST intake, local evidence triage, per-input audit retention, and separate exploitability queues |
 | GitHub, Jira, Linear tracking | Exact preview, provider-scoped duplicate lookup, and explicit one-at-a-time creation with durable receipts |
 | GitHub private draft advisories | Immutable-revision-bound draft creation, advisory-specific duplicate lookup, exact readback, and durable receipts |
 
@@ -47,6 +48,7 @@ SARIF imports retain their rule id, CWE, message, severity, and physical file/li
 - `security_install_precommit_hook`, `security_apply_remediation`, and `security_rollback_remediation` require both reviewed acknowledgement and DSH one-shot user approval for each write; a missing approval route fails closed.
 - `security_tracking_preview` builds the exact GitHub, Jira, or Linear issue and can perform provider-scoped, read-only duplicate lookup. `security_create_tracking_issue` requires reviewed acknowledgement plus DSH one-shot user approval, blocks duplicate local writes, verifies every successful provider write by readback, and saves a token-free receipt.
 - `security_tracking_advisory_preview` and `security_create_github_security_advisory` are a separate GitHub private-draft advisory flow. They require a completed clean GitHub-worktree scan with an immutable verified source revision, never fall back to Issues, never update or publish, use only GitHub's repository-advisory REST endpoints, and fail closed when duplicate lookup or exact draft readback cannot establish the required state.
+- `security_import_github_findings` reads only an explicitly selected GitHub REST family: code scanning, Dependabot, repository security advisories/private reports, or all. It treats every returned field as untrusted evidence. `security_triage_finding_backlog` preserves one result per imported item, reruns local static evidence, records policy and supported-boundary proof gaps, classifies `confirmed`, `not_actionable`, or `needs_review`, and ranks the confirmed and needs-review queues independently. It does not deduplicate inputs or write to GitHub.
 
 ## Install
 
