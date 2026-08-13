@@ -51,7 +51,7 @@ test('directory assessment records Python and Go cross-file data-flow evidence',
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
-test('directory assessment records structured flow evidence for Java, C#, PHP, Ruby, C and C++', async () => {
+test('directory assessment records structured flow evidence for Java, C#, PHP, Ruby, C, C++, and Rust', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
     await writeFile(join(root, 'Handler.java'), 'class Handler {\n void execute(String command) {\n  Runtime.getRuntime().exec(command);\n }\n void route(Request request) {\n  execute(request.getParameter("cmd"));\n }\n}')
@@ -60,9 +60,10 @@ test('directory assessment records structured flow evidence for Java, C#, PHP, R
     await writeFile(join(root, 'handler.rb'), 'def execute(command)\n system(command)\nend\ndef route\n execute(params[:cmd])\nend')
     await writeFile(join(root, 'handler.c'), 'void execute(char *command) { system(command); }\nvoid route(char **argv) { execute(argv[1]); }')
     await writeFile(join(root, 'handler.cpp'), 'void execute(char *command) { system(command); }\nvoid route(char **argv) { execute(argv[1]); }')
+    await writeFile(join(root, 'handler.rs'), 'fn execute(command: String) {\n Command::new(command);\n}\nasync fn route(req: Request) {\n execute(req.query("cmd"));\n}')
     const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
-    for (const file of ['Handler.java', 'Handler.cs', 'handler.php', 'handler.rb', 'handler.c', 'handler.cpp']) assert.equal(result.candidates.some(item => item.rule === 'shell-command-construction' && item.file === file && item.evidence.some(evidence => evidence.detail.includes('structured function data-flow'))), true)
-    for (const rule of ['java.structured-taint', 'csharp.structured-taint', 'php.structured-taint', 'ruby.structured-taint', 'c.structured-taint', 'cpp.structured-taint']) assert.equal(result.ruleReceipts.some(item => item.ruleId === rule && item.matches === 1), true)
+    for (const file of ['Handler.java', 'Handler.cs', 'handler.php', 'handler.rb', 'handler.c', 'handler.cpp', 'handler.rs']) assert.equal(result.candidates.some(item => item.rule === 'shell-command-construction' && item.file === file && item.evidence.some(evidence => evidence.detail.includes('structured function data-flow'))), true)
+    for (const rule of ['java.structured-taint', 'csharp.structured-taint', 'php.structured-taint', 'ruby.structured-taint', 'c.structured-taint', 'cpp.structured-taint', 'rust.structured-taint']) assert.equal(result.ruleReceipts.some(item => item.ruleId === rule && item.matches === 1), true)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

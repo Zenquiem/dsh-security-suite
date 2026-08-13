@@ -71,6 +71,7 @@ const structuredCases: Array<{ language: StructuredLanguage; file: string; sourc
   { language: 'ruby', file: 'handler.rb', source: 'def execute(command)\n  system(command)\nend\ndef route\n  execute(params[:cmd])\nend' },
   { language: 'c', file: 'handler.c', source: 'void execute(char *command) { system(command); }\nvoid route(char **argv) { execute(argv[1]); }' },
   { language: 'cpp', file: 'handler.cpp', source: 'void execute(char *command) { system(command); }\nvoid route(char **argv) { execute(argv[1]); }' },
+  { language: 'rust', file: 'handler.rs', source: 'fn execute(command: String) {\n Command::new(command);\n}\nasync fn route(req: Request) {\n execute(req.query("cmd"));\n}' },
 ]
 
 for (const item of structuredCases) test(`${item.language} structured analysis traces request input through a local wrapper`, () => {
@@ -93,4 +94,20 @@ test('structured analysis follows a C# caller into a same-directory helper file 
   ], 'csharp')
   assert.equal(result.candidates.length, 1)
   assert.equal(result.candidates[0]?.file, 'api/Runner.cs')
+})
+
+test('Rust structured analysis follows async request data into a same-directory helper only', () => {
+  const result = analyzeStructuredFlow([
+    { file: 'api/route.rs', source: 'async fn route(req: Request) {\n execute(req.query("cmd"));\n}' },
+    { file: 'api/runner.rs', source: 'pub fn execute(command: String) {\n Command::new(command);\n}' },
+    { file: 'other/runner.rs', source: 'pub fn execute(command: String) {\n Command::new(command);\n}' },
+  ], 'rust')
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.rule, 'shell-command-construction')
+  assert.equal(result.candidates[0]?.file, 'api/runner.rs')
+})
+
+test('Rust structured analysis does not report a static sensitive wrapper call', () => {
+  const result = analyzeStructuredFlow([{ file: 'handler.rs', source: 'fn execute(command: String) {\n Command::new(command);\n}\nfn route() {\n execute("git --version".to_string());\n}' }], 'rust')
+  assert.equal(result.candidates.length, 0)
 })

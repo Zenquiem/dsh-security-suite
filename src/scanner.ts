@@ -86,7 +86,7 @@ function analyzeText(root: string, file: string, content: string, pass: string, 
 }
 
 export async function assessDirectory(directory: string, limits: ScanLimits, deep = false): Promise<ScanResult> {
-  const root = resolve(directory); const { files, skipped, complete } = await collectFiles(root, limits); const candidates: Candidate[] = []; const ruleReceipts: RuleReceipt[] = []; const fileReceipts: FileReceipt[] = []; const policyFiles: string[] = []; const modules: JavaScriptModule[] = []; const pythonModules: Array<{ file: string; source: string }> = []; const goModules: Array<{ file: string; source: string }> = []; const structuredModules: Record<StructuredLanguage, Array<{ file: string; source: string }>> = { java: [], csharp: [], php: [], ruby: [], c: [], cpp: [] }; const passes = deep ? [['baseline', undefined], ['injection', new Set(['dangerous-dynamic-code', 'shell-command-construction', 'unsafe-deserialization'])], ['boundaries', new Set(['path-traversal-sink', 'ssrf-request-sink', 'tls-verification-disabled', 'weak-randomness-security', 'hardcoded-secret-marker'])]] as const : [['baseline', undefined]] as const
+  const root = resolve(directory); const { files, skipped, complete } = await collectFiles(root, limits); const candidates: Candidate[] = []; const ruleReceipts: RuleReceipt[] = []; const fileReceipts: FileReceipt[] = []; const policyFiles: string[] = []; const modules: JavaScriptModule[] = []; const pythonModules: Array<{ file: string; source: string }> = []; const goModules: Array<{ file: string; source: string }> = []; const structuredModules: Record<StructuredLanguage, Array<{ file: string; source: string }>> = { java: [], csharp: [], php: [], ruby: [], c: [], cpp: [], rust: [] }; const passes = deep ? [['baseline', undefined], ['injection', new Set(['dangerous-dynamic-code', 'shell-command-construction', 'unsafe-deserialization'])], ['boundaries', new Set(['path-traversal-sink', 'ssrf-request-sink', 'tls-verification-disabled', 'weak-randomness-security', 'hardcoded-secret-marker'])]] as const : [['baseline', undefined]] as const
   for (const file of files) {
     const content = await readFile(file, 'utf8'); const rel = relative(root, file)
     fileReceipts.push({ path: rel, bytes: Buffer.byteLength(content, 'utf8'), sha256: hash(content), language: languageFor(file) })
@@ -101,7 +101,7 @@ export async function assessDirectory(directory: string, limits: ScanLimits, dee
     }
     if (extname(file) === '.py') { const semantic = analyzePythonFlow(content, rel); candidates.push(...semantic); pythonModules.push({ file: rel, source: content }); ruleReceipts.push({ ruleId: 'python.local-taint', pass: 'semantic', matches: semantic.length }) }
     if (extname(file) === '.go') { const semantic = analyzeGoFlow(content, rel); candidates.push(...semantic); goModules.push({ file: rel, source: content }); ruleReceipts.push({ ruleId: 'go.local-taint', pass: 'semantic', matches: semantic.length }) }
-    const structured = ({ '.java': 'java', '.cs': 'csharp', '.php': 'php', '.rb': 'ruby', '.c': 'c', '.cc': 'cpp', '.cpp': 'cpp' } as Record<string, StructuredLanguage>)[extname(file)]
+    const structured = ({ '.java': 'java', '.cs': 'csharp', '.php': 'php', '.rb': 'ruby', '.c': 'c', '.cc': 'cpp', '.cpp': 'cpp', '.rs': 'rust' } as Record<string, StructuredLanguage>)[extname(file)]
     if (structured) structuredModules[structured].push({ file: rel, source: content })
   }
   const moduleGraph = analyzeJavaScriptModuleGraph(modules)

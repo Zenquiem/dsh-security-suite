@@ -2,7 +2,7 @@ import { dirname, normalize } from 'node:path'
 import type { Evidence, Severity } from './contracts.js'
 import type { Candidate } from './scanner.js'
 
-type Language = 'java' | 'csharp' | 'php' | 'ruby' | 'c' | 'cpp'
+type Language = 'java' | 'csharp' | 'php' | 'ruby' | 'c' | 'cpp' | 'rust'
 type Boundary = 'brace' | 'ruby'
 
 interface Rule { id: string; cwe: string; severity: Severity; rationale: string; sink: RegExp }
@@ -42,6 +42,11 @@ const RULES: Record<Language, Rule[]> = {
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Externally controlled data reaches a native process execution API.', sink: /\b(?:system|popen|execl|execv|execve)\s*\(/ },
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Externally controlled data reaches a native filesystem API.', sink: /\b(?:fopen|open|std::filesystem::remove)\s*\(/ },
   ],
+  rust: [
+    { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a Rust process execution API.', sink: /\b(?:std::process::)?Command::new\s*\(/ },
+    { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a Rust filesystem API.', sink: /\b(?:std::fs::)?(?:read|read_to_string|write|remove_file|File::open)\s*\(/ },
+    { id: 'ssrf-request-sink', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects a Rust outbound request destination.', sink: /\b(?:reqwest::)?(?:get|Client::new\(\)\.(?:get|post|request))\s*\(/ },
+  ],
 }
 
 const SOURCES: Record<Language, RegExp> = {
@@ -51,10 +56,11 @@ const SOURCES: Record<Language, RegExp> = {
   ruby: /\b(?:params\s*(?:\[|\.fetch)|request\.(?:params|body|query_parameters))/,
   c: /\b(?:argv\s*\[|getenv\s*\(|get_param\s*\(|request_get\s*\()/,
   cpp: /\b(?:argv\s*\[|getenv\s*\(|get_param\s*\(|request_get\s*\()/,
+  rust: /\b(?:req|request)\s*\.\s*(?:query|param|path|body|json|form)\s*\(|\b(?:Query|Path|Json|Form)\s*\(/i,
 }
 
-const BOUNDARIES: Record<Language, Boundary> = { java: 'brace', csharp: 'brace', php: 'brace', ruby: 'ruby', c: 'brace', cpp: 'brace' }
-const EXTENSIONS: Record<Language, string[]> = { java: ['.java'], csharp: ['.cs'], php: ['.php'], ruby: ['.rb'], c: ['.c'], cpp: ['.cc', '.cpp'] }
+const BOUNDARIES: Record<Language, Boundary> = { java: 'brace', csharp: 'brace', php: 'brace', ruby: 'ruby', c: 'brace', cpp: 'brace', rust: 'brace' }
+const EXTENSIONS: Record<Language, string[]> = { java: ['.java'], csharp: ['.cs'], php: ['.php'], ruby: ['.rb'], c: ['.c'], cpp: ['.cc', '.cpp'], rust: ['.rs'] }
 const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'foreach', 'using', 'return', 'new', 'function', 'def'])
 
 function escaped(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
@@ -76,15 +82,20 @@ function calls(value: string): Array<{ name: string; args: string[] }> {
   return results
 }
 
-function paramNames(value: string): string[] { return value.split(',').map(item => (item.match(/\$?[A-Za-z_]\w*\s*(?:=[^,]*)?$/)?.[0] ?? '').replace(/^\$/, '').replace(/\s*=.*$/, '').trim()).filter(item => /^[A-Za-z_]\w*$/.test(item)) }
+function paramNames(value: string, language?: Language): string[] {
+  if (language === 'rust') return value.split(',').map(item => item.trim().replace(/^&(?:mut\s+)?/, '').replace(/^mut\s+/, '').match(/^([A-Za-z_]\w*)\s*(?::|$)/)?.[1] ?? '').filter(item => /^[A-Za-z_]\w*$/.test(item) && item !== 'self')
+  return value.split(',').map(item => (item.match(/\$?[A-Za-z_]\w*\s*(?:=[^,]*)?$/)?.[0] ?? '').replace(/^\$/, '').replace(/\s*=.*$/, '').trim()).filter(item => /^[A-Za-z_]\w*$/.test(item))
+}
 function declaration(value: string, language: Language): { name: string; params: string[] } | undefined {
   const ruby = /^\s*def\s+([A-Za-z_]\w*[!?=]?)\s*(?:\(([^)]*)\)|(.*))\s*$/.exec(value)
   if (language === 'ruby') return ruby ? { name: ruby[1], params: paramNames(ruby[2] ?? ruby[3] ?? '') } : undefined
   const php = /^\s*(?:public|private|protected|static|final|abstract|\s)*function\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*\{/.exec(value)
   if (language === 'php') return php ? { name: php[1], params: paramNames(php[2]) } : undefined
+  const rust = /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_]\w*)\s*(?:<[^>{}]*>)?\s*\(([^)]*)\)\s*(?:->\s*[^\{]+)?\{/.exec(value)
+  if (language === 'rust') return rust ? { name: rust[1], params: paramNames(rust[2], language) } : undefined
   const match = /^\s*(?:[A-Za-z_][\w<>\[\],?*:\s]*\s+)?([A-Za-z_]\w*)\s*\(([^;{}]*)\)\s*(?:throws\s+[\w,\s]+)?\{/.exec(value)
   if (!match || KEYWORDS.has(match[1])) return undefined
-  return { name: match[1], params: paramNames(match[2]) }
+  return { name: match[1], params: paramNames(match[2], language) }
 }
 
 function functions(file: string, source: string, language: Language): FunctionRecord[] {
