@@ -32,6 +32,7 @@ const RULES: Record<Language, Rule[]> = {
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a PHP filesystem API.', sink: /\b(?:file_get_contents|file_put_contents|fopen|unlink|readfile)\s*\(/ },
     { id: 'ssrf-request-sink', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects a PHP network destination.', sink: /\b(?:curl_setopt|file_get_contents)\s*\(/ },
     { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a PHP SQL query-text API.', sink: /\b(?:pdo|db|database|connection|stmt)\s*->\s*(?:query|exec|prepare)\s*\(/i },
+    { id: 'unsafe-deserialization', cwe: 'CWE-502', severity: 'high', rationale: 'Request-derived data reaches PHP unserialize() without an explicit object-instantiation restriction.', sink: /\bunserialize\s*\(/i },
   ],
   ruby: [
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Request-derived data reaches a Ruby command execution API.', sink: /\b(?:system|exec|spawn|Open3\.(?:capture2|capture3|popen3))\s*\(/ },
@@ -101,6 +102,14 @@ function sinkTainted(value: string, rule: Rule, tainted: Set<string>, source: Re
       rule.sink.lastIndex = 0
       if (!rule.sink.test(value)) return false
       return calls(value).some(call => /^(?:YAML|Psych|Marshal)\.load$/.test(call.qualified) && Boolean(call.args[0]) && sourceTainted(call.args[0], tainted, source))
+    }
+    if (language === 'php') {
+      rule.sink.lastIndex = 0
+      if (!rule.sink.test(value)) return false
+      return calls(value).some(call => call.name.toLowerCase() === 'unserialize'
+        && Boolean(call.args[0])
+        && sourceTainted(call.args[0], tainted, source)
+        && !/['"]allowed_classes['"]\s*=>\s*false/i.test(call.args[1] ?? ''))
     }
     return false
   }

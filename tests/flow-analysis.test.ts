@@ -162,6 +162,12 @@ test('Ruby structured analysis traces request data into supported unsafe deseria
   assert.equal(result.candidates.every(item => item.evidence.some(evidence => evidence.detail.includes('structured function data-flow'))), true)
 })
 
+test('PHP structured analysis traces request data into unserialize and excludes explicit object restrictions', () => {
+  const result = analyzeStructuredFlow([{ file: 'handler.php', source: 'function load_unsafe($payload) {\n return unserialize($payload);\n}\nfunction load_safe($payload) {\n return unserialize($payload, ["allowed_classes" => false]);\n}\nfunction route() {\n load_unsafe($_POST["payload"]);\n load_safe($_POST["safe"]);\n}\n' }], 'php')
+  assert.deepEqual(result.candidates.map(item => item.rule), ['unsafe-deserialization'])
+  assert.equal(result.candidates[0]?.evidence.some(evidence => evidence.detail.includes('structured function data-flow')), true)
+})
+
 test('C# structured SSRF analysis does not treat a request body sent to a fixed destination as SSRF', () => {
   const result = analyzeStructuredFlow([{ file: 'Handler.cs', source: 'class Handler {\n void outbound(string body) { client.PostAsync("https://api.example.test/events", body); }\n void route(HttpRequest Request) { outbound(Request.Body); }\n}' }], 'csharp')
   assert.equal(result.candidates.some(item => item.rule === 'ssrf-request-sink'), false)

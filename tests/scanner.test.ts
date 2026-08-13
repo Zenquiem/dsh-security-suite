@@ -319,6 +319,20 @@ test('directory assessment records request-derived Ruby deserialization evidence
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment records request-derived PHP unserialize evidence and excludes object restrictions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'handler.php'), 'function load_unsafe($payload) {\n return unserialize($payload);\n}\nfunction load_safe($payload) {\n return unserialize($payload, ["allowed_classes" => false]);\n}\nfunction route() {\n load_unsafe($_POST["payload"]);\n load_safe($_POST["safe"]);\n}\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'unsafe-deserialization')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.file, 'handler.php')
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink' && item.location.line === 2), true)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'propagation' && item.location.line === 8), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'php.structured-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment traces Go data flow through a static local-module import', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -569,6 +583,24 @@ test('diff scan traces an added Ruby request value into an unchanged YAML loader
     assert.equal(findings[0]?.locations[0]?.line, 2)
     assert.equal(findings[0]?.evidence.some(item => item.location?.line === 5 && item.location.role === 'propagation'), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ruby.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces an added PHP request value into an unchanged unserialize wrapper', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'handler.php'), 'function load_payload($payload) {\n return unserialize($payload);\n}\nfunction route() {\n return null;\n}\n')
+    await execFileAsync('git', ['add', 'handler.php'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'handler.php'), 'function load_payload($payload) {\n return unserialize($payload);\n}\nfunction route() {\n return load_payload($_POST["payload"]);\n}\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const findings = scan.findings.filter(item => item.ruleId === 'unsafe.deserialization')
+    assert.equal(findings.length, 1)
+    assert.equal(findings[0]?.locations[0]?.line, 2)
+    assert.equal(findings[0]?.evidence.some(item => item.location?.line === 5 && item.location.role === 'propagation'), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'php.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
