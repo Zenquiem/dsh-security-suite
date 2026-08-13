@@ -232,8 +232,27 @@ test('reviewed remediation binds an exact validated source range, applies revers
     const applied = await applyRemediationProposal(root, local, fresh.id, freshProposal.id, true)
     assert.match(await readFile(join(root, 'app.ts'), 'utf8'), /safeEvaluate/)
     assert.ok(applied.rollbackId); assert.ok(applied.verificationScanId)
+    assert.equal(applied.verification?.status, 'not_detected')
+    assert.match(applied.verification?.limitation ?? '', /not proof/i)
     await rollbackRemediationProposal(root, local, fresh.id, freshProposal.id, true)
     assert.equal(await readFile(join(root, 'app.ts'), 'utf8'), original)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('remediation verification reports a still-detected family without claiming resolution', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'client.ts'), 'one({ rejectUnauthorized: false })\ntwo({ rejectUnauthorized: false })\n')
+    const scan = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, scan)
+    const claim = await claimAuditTask(local, scan.id, 'validator', 'validation'); assert.ok(claim)
+    await recordValidation(local, scan.id, scan.findings[0].candidateId, { conclusion: 'reportable', method: 'static', attacker: 'Network attacker.', entryPoint: 'Outbound client configuration.', trustBoundary: 'TLS connection to remote service.', rootControl: 'Certificate verification setting.', sink: 'TLS client request.', impact: 'A network attacker can intercept traffic.', directEvidence: 'The first client disables certificate verification.', counterevidence: 'No explicit compensating verification is present.', limitations: 'No live network test was performed.', confidence: 'high' }, claim.claimToken)
+    const proposal = await proposeReviewedRemediation(root, local, scan.id, scan.findings[0].id, { file: 'client.ts', startLine: 1, endLine: 1, expectedText: 'one({ rejectUnauthorized: false })', replacementText: 'one({ rejectUnauthorized: true })', rationale: 'Re-enable certificate verification for the first outbound client path.', testPlan: 'Run the client regression suite.' })
+    const applied = await applyRemediationProposal(root, local, scan.id, proposal.id, true)
+    assert.equal(applied.verification?.status, 'still_detected')
+    assert.equal(applied.verification?.matchingFindingIds.length, 1)
+    assert.match(applied.verification?.limitation ?? '', /not proof/i)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

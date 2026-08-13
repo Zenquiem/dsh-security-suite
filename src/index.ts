@@ -443,8 +443,8 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: 'security_apply_remediation', description: 'Apply one explicitly reviewable safe remediation only after reviewed acknowledgement plus DSH one-shot user approval. It rejects stale targets, saves an exact rollback record, rescans, and records the verification scan.', parameters: { scan_id: { type: 'string', required: true, description: 'Source scan identifier.' }, remediation_id: { type: 'string', required: true, description: 'Identifier from security_remediation_plan.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the patch; this does not replace DSH user approval.' } },
-    output: { schema: { type: 'object', properties: { id: { type: 'string' }, findingId: { type: 'string' }, status: { type: 'string' }, appliedAt: { type: 'string' }, verificationScanId: { type: 'string' }, rollbackId: { type: 'string' } }, required: ['id', 'findingId', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-    async execute(args) { return applyRemediationProposal(process.cwd(), config, args.scan_id, args.remediation_id, args.approved) },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, findingId: { type: 'string' }, status: { type: 'string' }, appliedAt: { type: 'string' }, verificationScanId: { type: 'string' }, verification: { type: 'object', additionalProperties: true }, rollbackId: { type: 'string' } }, required: ['id', 'findingId', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return JSON.parse(JSON.stringify(await applyRemediationProposal(process.cwd(), config, args.scan_id, args.remediation_id, args.approved))) as { id: string; findingId: string; status: string; appliedAt?: string; verificationScanId?: string; verification?: Record<string, JsonValue>; rollbackId?: string } },
   }))
 
   ctx.tools.register(defineTool({

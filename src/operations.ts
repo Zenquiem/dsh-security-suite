@@ -19,7 +19,8 @@ export interface ValidationStrategy { method: 'isolated_project_checks' | 'reali
 export interface CandidateValidationPlan { id: string; scanId: string; candidateId: string; snapshotDigest: string; projectFiles: string[]; commands: Array<{ command: string; reason: string }>; strategies: ValidationStrategy[]; skipped: Array<{ reason: string }>; createdAt: string }
 export interface CandidateValidationPlanRun extends CandidateValidationPlan { approved: true; executedAt: string; receipts: CommandReceipt[]; artifactRef: string }
 export interface RemediationReplacement { startLine: number; endLine: number; expectedText: string; replacementText: string; testPlan: string }
-export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; createdAt: string; status: 'proposed' | 'applied' | 'rolled_back' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; safeToApply: boolean; rationale: string; replacement?: RemediationReplacement; appliedAt?: string; verificationScanId?: string; rollbackId?: string }
+export interface RemediationVerification { scanId: string; status: 'not_detected' | 'still_detected'; ruleId: string; file: string; matchingFindingIds: string[]; observedAt: string; limitation: string }
+export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; createdAt: string; status: 'proposed' | 'applied' | 'rolled_back' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; safeToApply: boolean; rationale: string; replacement?: RemediationReplacement; appliedAt?: string; verificationScanId?: string; verification?: RemediationVerification; rollbackId?: string }
 export interface RemediationRollback { id: string; remediationId: string; scanId: string; file: string; beforeContent: string; beforeSha256: string; appliedSha256: string; appliedSnapshotDigest: string; createdAt: string; status: 'available' | 'rolled_back' | 'stale'; rolledBackAt?: string; verificationScanId?: string }
 
 export interface BulkResult { path: string; scanId?: string; findings?: number; error?: string }
@@ -243,6 +244,11 @@ function patchFor(file: string, replacement: RemediationReplacement): string {
   return `--- a/${file}\n+++ b/${file}\n@@ lines ${replacement.startLine}-${replacement.endLine} @@\n${replacement.expectedText.split('\n').map(line => `- ${line}`).join('\n')}\n${replacement.replacementText.split('\n').map(line => `+ ${line}`).join('\n')}`
 }
 
+function remediationVerification(scan: ScanRecord, original: Finding): RemediationVerification {
+  const matching = scan.findings.filter(finding => finding.ruleId === original.ruleId && finding.locations.some(location => location.file === original.locations[0]?.file))
+  return { scanId: scan.id, status: matching.length ? 'still_detected' : 'not_detected', ruleId: original.ruleId, file: original.locations[0]?.file ?? '', matchingFindingIds: matching.map(finding => finding.id), observedAt: new Date().toISOString(), limitation: 'This is a post-change native-analysis observation, not proof that all exploit paths, runtime configurations, or regressions are resolved. Run the proposal test plan and complete source-backed review.' }
+}
+
 /**
  * Persist a reviewed, bounded source replacement for a reportable finding.
  * This is deliberately not an arbitrary shell patch: application requires an
@@ -290,7 +296,7 @@ export async function applyRemediationProposal(workspace: string, config: Config
   await writeFile(file, content, 'utf8'); const appliedSnapshotDigest = await snapshotDigestForDirectory(scan.target, config); const rollback: RemediationRollback = { id: `rollback_${randomUUID()}`, remediationId: proposal.id, scanId, file: proposal.file, beforeContent: current, beforeSha256: sha256(current), appliedSha256: sha256(content), appliedSnapshotDigest, createdAt: new Date().toISOString(), status: 'available' }
   await saveRollback(getStateDir(config.stateDir), rollback); proposal.status = 'applied'; proposal.appliedAt = new Date().toISOString(); proposal.rollbackId = rollback.id
   const verification = await runScan(scan.target, config, 'standard', scan.threatModel, scan.recipe.scopeRequested, config.stateDir)
-  await finalizeAndSaveScan(getStateDir(config.stateDir), verification); proposal.verificationScanId = verification.id; await saveProposal(getStateDir(config.stateDir), proposal)
+  await finalizeAndSaveScan(getStateDir(config.stateDir), verification); proposal.verificationScanId = verification.id; proposal.verification = remediationVerification(verification, finding); await saveProposal(getStateDir(config.stateDir), proposal)
   return proposal
 }
 
