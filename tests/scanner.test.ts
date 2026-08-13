@@ -100,6 +100,17 @@ test('directory assessment ties Go TLS disablement to a constructed client that 
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment recognizes only non-placeholder embedded credential assignments outside JavaScript', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'config.py'), 'api_key = "live-key-4e2e9b6f8a12"\nsample_token = "sample-token-value"\npassword = os.environ["PASSWORD"]\n# secret = "comment-secret-5fd3c1"\nsettings.accessToken = "access-token-8d0f2c7e4b61"\nlogger.info("token = not-a-credential")\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'hardcoded-secret-marker')
+    assert.deepEqual(candidates.map(item => item.line), [1, 5])
+    assert.equal(candidates.every(item => item.evidence.some(evidence => evidence.location?.role === 'sink')), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment ties JavaScript credentialed CORS origins to a CORS middleware call', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -901,6 +912,23 @@ test('diff scan retains an added Go client request that activates an existing di
     assert.ok(finding)
     assert.equal(finding.locations[0]?.line, 3)
     assert.equal(finding.evidence.some(item => item.location?.role === 'sink' && item.location.line === 6), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan retains an added non-placeholder Python credential assignment but not an example value', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'config.py'), 'sample_token = "sample-token-value"\n')
+    await execFileAsync('git', ['add', 'config.py'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'config.py'), 'sample_token = "sample-token-value"\nservice_password = "service-password-84c2e6f1"\n')
+    const scan = await runDiffScan(root, undefined, '', '', false)
+    const finding = scan.findings.find(item => item.ruleId === 'hardcoded.secret.marker')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.line, 2)
+    assert.equal(scan.findings.filter(item => item.ruleId === 'hardcoded.secret.marker').length, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

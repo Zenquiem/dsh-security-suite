@@ -42,7 +42,6 @@ const RULES: Rule[] = [
   { id: 'shell-command-construction', title: 'Constructed shell command', cwe: 'CWE-78', severity: 'high', rationale: 'A constructed process command needs an attacker-to-shell data-flow review.', pattern: /(?:exec|execSync|spawn|spawnSync|system|popen|subprocess\.(?:run|call|Popen))\s*\([^\n]*(?:\+|`|\$\{|f["'])/i, context: /(?:req\.|params\.|query\.|argv|input|user)/i },
   { id: 'path-traversal-sink', title: 'Request-derived filesystem path', cwe: 'CWE-22', severity: 'medium', rationale: 'A filesystem sink receives request-derived data and needs canonical containment validation.', pattern: /(?:readFile|writeFile|createReadStream|createWriteStream|sendFile|open)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
   { id: 'tls-verification-disabled', title: 'TLS verification disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled.', pattern: /(?:CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0))/, languages: ['php', 'c', 'cpp', 'csharp'] },
-  { id: 'hardcoded-secret-marker', title: 'Likely hardcoded credential', cwe: 'CWE-798', severity: 'medium', rationale: 'A likely credential literal appears in source and should be moved to managed secret storage.', pattern: /(?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*["'][^"']{8,}["']/i, languages: ['python', 'go', 'java', 'php', 'ruby', 'rust', 'shell', 'c', 'cpp', 'csharp'] },
   { id: 'ssrf-request-sink', title: 'Request-derived outbound request', cwe: 'CWE-918', severity: 'medium', rationale: 'An outbound request appears to use request-derived input and needs destination allowlisting.', pattern: /(?:fetch|axios\.(?:get|post|request)|requests\.(?:get|post|request)|http\.request)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
   { id: 'sql-injection-query-construction', title: 'Constructed SQL query', cwe: 'CWE-89', severity: 'high', rationale: 'A database query appears to construct SQL syntax from request-derived input.', pattern: /(?:query|execute|raw)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input|\+|\$\{)/i, context: /(?:select|insert|update|delete|from|where)/i },
 ]
@@ -53,6 +52,9 @@ const CONFIGURATION_RULES: Record<'jwt' | 'cors' | 'tls' | 'xml', ConfigurationR
   tls: { id: 'tls-verification-disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled for a supported HTTP client request.' },
   xml: { id: 'xml-external-entity-risk', cwe: 'CWE-611', severity: 'high', rationale: 'A Java XML parser factory creates a parser without recognized external-entity hardening controls.' },
 }
+
+const SECRET_FIELD_NAME = /(?:api[_-]?key|access[_-]?key|secret|password|token|private[_-]?key|credential)/i
+const PLACEHOLDER_SECRET_VALUE = /(?:^|[-_\s])(example|sample|test|dummy|placeholder|replace|changeme|your[-_\s]?)(?:[-_\s]|$)|\.example(?:\.com|\.org|\.net)?$/i
 
 function languageFor(file: string): string {
   return ({ '.js': 'javascript', '.jsx': 'javascript', '.mjs': 'javascript', '.cjs': 'javascript', '.ts': 'typescript', '.tsx': 'typescript', '.py': 'python', '.go': 'go', '.java': 'java', '.php': 'php', '.rb': 'ruby', '.rs': 'rust', '.sh': 'shell', '.bash': 'shell', '.c': 'c', '.cc': 'cpp', '.cpp': 'cpp', '.cs': 'csharp' } as Record<string, string>)[extname(file)] ?? 'text'
@@ -335,6 +337,26 @@ function pythonTlsConfigurationCandidates(file: string, content: string, lines: 
 }
 
 /**
+ * A credential finding is evidence-bearing only when source assigns a
+ * non-placeholder literal to a field whose name denotes credential material.
+ * Runtime/environment lookups and comments deliberately remain out of scope.
+ */
+function embeddedCredentialCandidates(file: string, content: string, lines: string[]): Candidate[] {
+  const candidates: Candidate[] = []
+  const assignment = /(?:\b[A-Za-z_$][\w$]*\s*\.\s*)?\$?([A-Za-z_$][\w$]*)\s*(?::=|=|:)\s*(["'])((?:\\.|(?!\2)[\s\S])*)\2/g
+  for (const match of content.matchAll(assignment)) {
+    const offset = match.index ?? 0; const number = lineAt(content, offset); const excerpt = sourceLine(lines, number)
+    if (/^\s*(?:\/\/|#|\/\*|\*)/.test(excerpt) || !SECRET_FIELD_NAME.test(match[1]!)) continue
+    const value = match[3]!.replace(/\\(?:[\\'"nrt])/g, '').trim()
+    if (value.length < 8 || PLACEHOLDER_SECRET_VALUE.test(value)) continue
+    const candidate = configurationCandidate({ id: 'hardcoded-secret-marker', cwe: 'CWE-798', severity: 'medium', rationale: 'A credential-named field contains a non-placeholder string literal that should be moved to managed secret storage.' }, file, lines, number, `Configuration analysis found a ${match[1]} field assigned a non-placeholder embedded credential literal.`)
+    candidate.evidence.push({ kind: 'context', detail: `The embedded literal is ${value.length} characters; no environment or secret-manager reference is present in this assignment.`, location: { file, line: number, excerpt, role: 'sink' } })
+    candidates.push(candidate)
+  }
+  return candidates
+}
+
+/**
  * Reconstruct the ordinary local Go construction chain from tls.Config through
  * http.Transport and http.Client to a request. This deliberately leaves
  * dynamic, cross-function, and opaque client construction unresolved.
@@ -387,6 +409,7 @@ function analyzeSecurityConfiguration(file: string, content: string, onlyRules?:
   const lines = content.split(/\r?\n/); const candidates: Candidate[] = []
   const enabled = (rule: ConfigurationRule): boolean => !onlyRules || onlyRules.has(rule.id)
   if (enabled(CONFIGURATION_RULES.jwt) && languageFor(file) === 'python') candidates.push(...pythonJwtConfigurationCandidates(file, content, lines))
+  if ((!onlyRules || onlyRules.has('hardcoded-secret-marker')) && !['javascript', 'typescript'].includes(languageFor(file))) candidates.push(...embeddedCredentialCandidates(file, content, lines))
   if (enabled(CONFIGURATION_RULES.tls) && languageFor(file) === 'python') candidates.push(...pythonTlsConfigurationCandidates(file, content, lines))
   if (enabled(CONFIGURATION_RULES.tls) && languageFor(file) === 'go') candidates.push(...goTlsConfigurationCandidates(file, content, lines))
   if (enabled(CONFIGURATION_RULES.cors) && !['javascript', 'typescript'].includes(languageFor(file))) {
