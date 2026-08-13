@@ -48,7 +48,6 @@ const RULES: Rule[] = [
   { id: 'weak-randomness-security', title: 'Predictable randomness in security context', cwe: 'CWE-330', severity: 'medium', rationale: 'A non-cryptographic random source appears near a security-sensitive token or secret.', pattern: /(?:Math\.random\s*\(|random\.random\s*\()/, context: /(?:token|secret|session|password|reset|nonce)/i },
   { id: 'sql-injection-query-construction', title: 'Constructed SQL query', cwe: 'CWE-89', severity: 'high', rationale: 'A database query appears to construct SQL syntax from request-derived input.', pattern: /(?:query|execute|raw)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input|\+|\$\{)/i, context: /(?:select|insert|update|delete|from|where)/i },
   { id: 'insecure-deserialization-java', title: 'Java native deserialization', cwe: 'CWE-502', severity: 'high', rationale: 'ObjectInputStream deserializes a potentially attacker-controlled object graph.', pattern: /\.readObject\s*\(\)|new\s+ObjectInputStream\s*\(/ },
-  { id: 'missing-authorization-route', title: 'Potential unprotected state-changing route', cwe: 'CWE-862', severity: 'medium', rationale: 'A state-changing route is declared without an apparent authorization middleware in its local declaration.', pattern: /\.(?:post|put|patch|delete)\s*\(\s*['"][^'"]+['"]\s*,\s*(?:async\s*)?\(?\s*(?:req|request|ctx)/i },
   { id: 'prototype-pollution-merge', title: 'Unsafe object merge from request data', cwe: 'CWE-1321', severity: 'medium', rationale: 'Request-derived object data reaches a generic merge/assignment primitive and needs prototype-key filtering.', pattern: /(?:Object\.assign|lodash\.merge|merge)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
 ]
 
@@ -77,6 +76,59 @@ function configurationCandidate(rule: ConfigurationRule, file: string, lines: st
       ...(controlLine ? [{ kind: 'counterevidence' as const, detail: 'The paired security control was configured in the same effective configuration block.', location: { file, line: controlLine, excerpt: sourceLine(lines, controlLine), role: 'expected_control' as const } }] : []),
     ],
   }
+}
+
+const ROUTE_AUTHORIZATION_RULE = { id: 'missing-authorization-route', cwe: 'CWE-862', severity: 'medium' as const, rationale: 'A state-changing route accepts a request handler without a local or previously registered explicit authorization middleware.' }
+const AUTHORIZATION_MIDDLEWARE = /(?:auth(?:enticate|orize|entication|orization)?|permission|role|rbac|access(?:control)?|guard|csrf)/i
+
+function closingParenthesis(source: string, open: number): number | undefined {
+  let depth = 0; let quote = ''
+  for (let index = open; index < source.length; index++) {
+    const character = source[index]
+    if (quote) { if (character === quote && source[index - 1] !== '\\') quote = ''; continue }
+    if (character === '"' || character === "'" || character === '`') { quote = character; continue }
+    if (character === '(') depth++
+    if (character === ')' && --depth === 0) return index
+  }
+  return undefined
+}
+
+function topLevelArguments(source: string, start: number, end: number): Array<{ text: string; start: number }> {
+  const values: Array<{ text: string; start: number }> = []; let offset = start; let depth = 0; let quote = ''
+  for (let index = start; index <= end; index++) {
+    const character = source[index] ?? ','
+    if (quote) { if (character === quote && source[index - 1] !== '\\') quote = ''; continue }
+    if (character === '"' || character === "'" || character === '`') { quote = character; continue }
+    if ('([{'.includes(character)) depth++
+    if (')]}'.includes(character)) depth--
+    if ((character === ',' && depth === 0) || index === end) {
+      const text = source.slice(offset, index).trim()
+      if (text) values.push({ text, start: offset + source.slice(offset, index).search(/\S/) })
+      offset = index + 1
+    }
+  }
+  return values
+}
+
+function analyzeRouteAuthorization(file: string, content: string, onlyRules?: Set<string>): Candidate[] {
+  if (onlyRules && !onlyRules.has(ROUTE_AUTHORIZATION_RULE.id)) return []
+  const lines = content.split(/\r?\n/); const candidates: Candidate[] = []; const globallyProtected = new Map<string, number[]>()
+  for (const match of content.matchAll(/\b([A-Za-z_$][\w$]*)\.use\s*\(([^)]*)\)/g)) if (AUTHORIZATION_MIDDLEWARE.test(match[2])) {
+    const receiver = match[1]; const positions = globallyProtected.get(receiver) ?? []; positions.push(match.index ?? 0); globallyProtected.set(receiver, positions)
+  }
+  for (const match of content.matchAll(/\b([A-Za-z_$][\w$]*)\.(?:post|put|patch|delete)\s*\(/gi)) {
+    const receiver = match[1]; const open = (match.index ?? 0) + match[0].lastIndexOf('('); const close = closingParenthesis(content, open)
+    if (close === undefined) continue
+    const args = topLevelArguments(content, open + 1, close)
+    if (args.length < 2 || !/^['"`]/.test(args[0]?.text ?? '')) continue
+    const handler = args.slice(1).findIndex(argument => /^(?:async\s+)?(?:function\b|\(?\s*(?:req|request|ctx)\b)/.test(argument.text))
+    if (handler < 0) continue
+    const handlerIndex = handler + 1; const protectedByRoute = args.slice(1, handlerIndex).some(argument => AUTHORIZATION_MIDDLEWARE.test(argument.text))
+    if (globallyProtected.get(receiver)?.some(position => position < (match.index ?? 0)) || protectedByRoute) continue
+    const anchor = args[handlerIndex]!; const line = lineAt(content, anchor.start)
+    candidates.push({ rule: ROUTE_AUTHORIZATION_RULE.id, severity: ROUTE_AUTHORIZATION_RULE.severity, file, line, excerpt: sourceLine(lines, line), rationale: ROUTE_AUTHORIZATION_RULE.rationale, cwe: ROUTE_AUTHORIZATION_RULE.cwe, evidence: [{ kind: 'pattern', detail: 'Route authorization analysis found a state-changing request handler without an explicit local or preceding global authorization middleware.', location: { file, line, excerpt: sourceLine(lines, line), role: 'root_control' } }] })
+  }
+  return candidates
 }
 
 /** Analyze security-sensitive configuration blocks that require paired controls. */
@@ -178,6 +230,9 @@ function analyzeText(root: string, file: string, content: string, pass: string, 
   const configuration = analyzeSecurityConfiguration(rel, content, onlyRules)
   candidates.push(...configuration)
   for (const rule of Object.values(CONFIGURATION_RULES)) if (!onlyRules || onlyRules.has(rule.id)) receipts.push({ ruleId: rule.id, pass, matches: configuration.filter(item => item.rule === rule.id).length })
+  const routes = analyzeRouteAuthorization(rel, content, onlyRules)
+  candidates.push(...routes)
+  if (!onlyRules || onlyRules.has(ROUTE_AUTHORIZATION_RULE.id)) receipts.push({ ruleId: ROUTE_AUTHORIZATION_RULE.id, pass, matches: routes.length })
   return { candidates, receipts }
 }
 

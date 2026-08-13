@@ -53,6 +53,25 @@ test('directory assessment does not flag paired configuration controls that rema
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment relates Express state-changing routes to local and preceding global authorization middleware', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'routes.ts'), `
+      app.post('/open', (req, res) => res.json({ ok: true }))
+      app.post('/local', requireAuthorization, (req, res) => res.json({ ok: true }))
+      api.use(requireAuthentication)
+      api.delete('/global', (req, res) => res.sendStatus(204))
+      late.patch('/before', (req, res) => res.json({ ok: true }))
+      late.use(requireRole)
+      late.patch('/after', (req, res) => res.json({ ok: true }))
+    `)
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const routes = result.candidates.filter(item => item.rule === 'missing-authorization-route')
+    assert.deepEqual(routes.map(item => item.line), [2, 6])
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'missing-authorization-route' && item.matches === 2), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment records cross-module JavaScript data-flow evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -358,6 +377,22 @@ test('diff scan retains a complete CORS policy when an added paired control crea
     assert.ok(finding)
     assert.equal(finding.locations[0]?.line, 2)
     assert.equal(finding.evidence.some(item => item.location?.file === 'server.ts' && item.location.line === 3), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan reports a newly unprotected route but not a route with newly added authorization middleware', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'routes.ts'), 'app.post("/admin", requireAuthorization, (req, res) => res.json({ ok: true }))\n')
+    await execFileAsync('git', ['add', 'routes.ts'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'routes.ts'), 'app.post("/admin", (req, res) => res.json({ ok: true }))\napp.delete("/operators", requireRole, (req, res) => res.sendStatus(204))\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const routes = scan.findings.filter(item => item.ruleId === 'missing.authorization.route')
+    assert.equal(routes.length, 1)
+    assert.equal(routes[0]?.locations[0]?.line, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
