@@ -1,4 +1,5 @@
 import { parse } from '@typescript-eslint/typescript-estree'
+import { dirname, extname, join, normalize } from 'node:path'
 import type { Candidate } from './scanner.js'
 import type { Evidence, Severity } from './contracts.js'
 
@@ -12,6 +13,11 @@ interface AstNode {
 interface AstRule { id: string; title: string; cwe: string; severity: Severity; rationale: string; sinks: string[] }
 interface FunctionRecord { name: string; params: string[]; body: AstNode }
 interface FunctionSink { rule: AstRule; sink: string; node: AstNode }
+interface ModuleFunction extends FunctionRecord { id: string; file: string; source: string }
+interface ModuleRecord { file: string; source: string; program: AstNode; functions: Map<string, ModuleFunction>; exports: Map<string, string>; imports: Map<string, { file: string; exported: string }>; namespaces: Map<string, string> }
+
+export interface JavaScriptModule { file: string; source: string }
+export interface ModuleGraphAnalysis { candidates: Candidate[]; parseErrors: Array<{ file: string; message: string }> }
 
 const AST_RULES: AstRule[] = [
   { id: 'dangerous-dynamic-code', title: 'Dynamic code execution from request data', cwe: 'CWE-95', severity: 'high', rationale: 'Request-derived data reaches dynamic code evaluation.', sinks: ['eval', 'function'] },
@@ -147,4 +153,121 @@ export function analyzeJavaScriptAst(source: string, file: string): { candidates
   })
   const unique = new Map<string, Candidate>(); for (const item of candidates) unique.set(`${item.rule}:${item.file}:${item.line}:${item.excerpt}`, item)
   return { candidates: [...unique.values()] }
+}
+
+function extensionCandidates(path: string): string[] {
+  if (extname(path)) return [path]
+  return [path, ...['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].map(extension => `${path}${extension}`), ...['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs'].map(extension => join(path, `index${extension}`))]
+}
+
+function resolveRelativeModule(file: string, specifier: string, known: Set<string>): string | undefined {
+  if (!specifier.startsWith('.')) return undefined
+  const base = normalize(join(dirname(file), specifier))
+  return extensionCandidates(base).find(candidate => known.has(candidate))
+}
+
+function exportDeclarationNames(node: AstNode): string[] {
+  if (node.type === 'FunctionDeclaration' || node.type === 'ClassDeclaration') return [id(node.id as AstNode)].filter((value): value is string => Boolean(value))
+  if (node.type !== 'VariableDeclaration') return []
+  return Array.isArray(node.declarations) ? node.declarations.map(item => id((item as AstNode).id as AstNode)).filter((value): value is string => Boolean(value)) : []
+}
+
+function createModuleRecord(file: string, source: string, known: Set<string>): { record?: ModuleRecord; parseError?: string } {
+  let program: AstNode
+  try { program = parse(source, { loc: true, range: true, jsx: true, comment: false }) as unknown as AstNode } catch (error) { return { parseError: error instanceof Error ? error.message : String(error) } }
+  const functions = new Map<string, ModuleFunction>()
+  for (const item of localFunctions(program)) functions.set(item.name, { ...item, id: `${file}:${item.name}`, file, source })
+  const exports = new Map<string, string>(); const imports = new Map<string, { file: string; exported: string }>(); const namespaces = new Map<string, string>()
+  const body = Array.isArray(program.body) ? program.body as AstNode[] : []
+  for (const statement of body) {
+    if (statement.type === 'ImportDeclaration') {
+      const specifier = literal(statement.source as AstNode); const target = resolveRelativeModule(file, specifier, known); if (!target) continue
+      for (const imported of (statement.specifiers ?? []) as AstNode[]) {
+        const local = id(imported.local as AstNode); if (!local) continue
+        if (imported.type === 'ImportNamespaceSpecifier') { namespaces.set(local, target); continue }
+        const exported = imported.type === 'ImportDefaultSpecifier' ? 'default' : id(imported.imported as AstNode); if (exported) imports.set(local, { file: target, exported })
+      }
+      continue
+    }
+    if (statement.type === 'ExportNamedDeclaration') {
+      for (const name of exportDeclarationNames(statement.declaration as AstNode)) if (functions.has(name)) exports.set(name, `${file}:${name}`)
+      for (const specifier of (statement.specifiers ?? []) as AstNode[]) { const local = id(specifier.local as AstNode); const exported = id(specifier.exported as AstNode); if (local && exported && functions.has(local)) exports.set(exported, `${file}:${local}`) }
+      continue
+    }
+    if (statement.type === 'ExportDefaultDeclaration') {
+      const declaration = statement.declaration as AstNode; const local = id(declaration.id as AstNode); if (local && functions.has(local)) exports.set('default', `${file}:${local}`)
+    }
+  }
+  return { record: { file, source, program, functions, exports, imports, namespaces } }
+}
+
+function targetForCall(module: ModuleRecord, node: AstNode, modules: Map<string, ModuleRecord>, functions: Map<string, ModuleFunction>): ModuleFunction | undefined {
+  const direct = id(node.callee as AstNode)
+  if (direct) {
+    const local = module.functions.get(direct); if (local) return local
+    const imported = module.imports.get(direct); const target = imported && modules.get(imported.file)?.exports.get(imported.exported); return target ? functions.get(target) : undefined
+  }
+  const callee = node.callee as AstNode
+  if (callee.type !== 'MemberExpression' && callee.type !== 'OptionalMemberExpression') return undefined
+  const namespace = id(callee.object as AstNode); const property = callee.computed ? literal(callee.property as AstNode) : id(callee.property as AstNode); const target = namespace && property ? modules.get(module.namespaces.get(namespace) ?? '')?.exports.get(property) : undefined
+  return target ? functions.get(target) : undefined
+}
+
+/**
+ * Summarize parameter-to-sink flows across the scanned relative ES-module graph.
+ * External packages and dynamic imports are intentionally unresolved: they require
+ * source or runtime evidence rather than an inferred summary.
+ */
+function moduleFunctionSinks(modules: Map<string, ModuleRecord>, functions: Map<string, ModuleFunction>): Map<string, Map<number, FunctionSink[]>> {
+  const summaries = new Map<string, Map<number, FunctionSink[]>>([...functions.values()].map(record => [record.id, new Map()]))
+  const add = (record: ModuleFunction, index: number, item: FunctionSink): boolean => {
+    const entries = summaries.get(record.id)?.get(index) ?? []; const key = `${item.rule.id}:${item.node.range?.join(':') ?? item.sink}`
+    if (entries.some(existing => `${existing.rule.id}:${existing.node.range?.join(':') ?? existing.sink}` === key)) return false
+    const target = summaries.get(record.id); if (!target) return false; target.set(index, [...entries, item]); return true
+  }
+  for (let pass = 0; pass < functions.size * Math.max(2, functions.size) + 1; pass++) {
+    let changed = false
+    for (const record of functions.values()) for (const [index, param] of record.params.entries()) {
+      const tainted = new Set([param]); const module = modules.get(record.file); if (!module) continue
+      walkFunction(record.body, node => {
+        for (const sink of sinkFor(node)) if (sink.argumentsList.some(argument => sourceExpression(argument, tainted))) changed = add(record, index, { rule: sink.rule, sink: sink.sink, node }) || changed
+        if (node.type !== 'CallExpression') return
+        const target = targetForCall(module, node, modules, functions); if (!target) return
+        const args = (node.arguments ?? []) as AstNode[]; const nested = summaries.get(target.id)
+        for (const [targetIndex] of target.params.entries()) if (args[targetIndex] && sourceExpression(args[targetIndex], tainted)) for (const result of nested?.get(targetIndex) ?? []) changed = add(record, index, result) || changed
+      })
+    }
+    if (!changed) break
+  }
+  return summaries
+}
+
+/** Analyze request-input flows that cross local ES-module boundaries inside one scan scope. */
+export function analyzeJavaScriptModuleGraph(inputs: JavaScriptModule[]): ModuleGraphAnalysis {
+  const normalized = inputs.map(input => ({ ...input, file: normalize(input.file) })); const known = new Set(normalized.map(input => input.file)); const modules = new Map<string, ModuleRecord>(); const parseErrors: ModuleGraphAnalysis['parseErrors'] = []
+  for (const input of normalized) { const parsed = createModuleRecord(input.file, input.source, known); if (parsed.record) modules.set(input.file, parsed.record); else if (parsed.parseError) parseErrors.push({ file: input.file, message: parsed.parseError }) }
+  const functions = new Map<string, ModuleFunction>(); for (const module of modules.values()) for (const record of module.functions.values()) functions.set(record.id, record)
+  const summaries = moduleFunctionSinks(modules, functions); const candidates: Candidate[] = []
+  for (const module of modules.values()) {
+    const tainted = new Set<string>(); const assignments: Array<{ name: string; value: AstNode }> = []
+    walk(module.program, node => { if (node.type === 'VariableDeclarator') { const name = id(node.id as AstNode); const value = node.init as AstNode | undefined; if (name && value) assignments.push({ name, value }) }; if (node.type === 'AssignmentExpression') { const name = id(node.left as AstNode); const value = node.right as AstNode | undefined; if (name && value) assignments.push({ name, value }) } })
+    for (let pass = 0; pass < assignments.length + 1; pass++) { let changed = false; for (const assignment of assignments) if (!tainted.has(assignment.name) && sourceExpression(assignment.value, tainted)) { tainted.add(assignment.name); changed = true }; if (!changed) break }
+    walk(module.program, node => {
+      if (node.type !== 'CallExpression') return
+      const target = targetForCall(module, node, modules, functions); if (!target) return
+      const args = (node.arguments ?? []) as AstNode[]; const nested = summaries.get(target.id)
+      for (const [index] of target.params.entries()) {
+        const input = args[index]; if (!input || !sourceExpression(input, tainted)) continue
+        for (const result of nested?.get(index) ?? []) {
+          const item = candidate(result.rule, target.source, target.file, result.node, result.sink, input)
+          if (!item) continue
+          const at = node.loc?.start.line ?? item.line
+          item.evidence.push({ kind: 'context', detail: `AST cross-module call-chain analysis resolved request-derived input through ${target.name}() in ${target.file} to ${result.sink}.`, location: { file: module.file, line: at, excerpt: line(module.source, at), role: 'propagation' } })
+          candidates.push(item)
+        }
+      }
+    })
+  }
+  const unique = new Map<string, Candidate>(); for (const item of candidates) unique.set(`${item.rule}:${item.file}:${item.line}:${item.excerpt}`, item)
+  return { candidates: [...unique.values()], parseErrors }
 }

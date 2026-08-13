@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { analyzeJavaScriptAst } from '../src/ast-analysis.ts'
+import { analyzeJavaScriptAst, analyzeJavaScriptModuleGraph } from '../src/ast-analysis.ts'
 
 test('AST analysis follows request-derived values through local assignments into sensitive sinks', () => {
   const result = analyzeJavaScriptAst(`
@@ -56,4 +56,25 @@ test('AST analysis follows named local wrapper chains without treating static he
   `, 'wrappers.ts')
   assert.equal(result.candidates.length, 1)
   assert.equal(result.candidates[0]?.rule, 'shell-command-construction')
+})
+
+test('AST module analysis follows request input through relative named imports into a sink module', () => {
+  const result = analyzeJavaScriptModuleGraph([
+    { file: 'server/route.ts', source: "import { executeTemplate } from '../lib/runner'\nexport function route(req) { executeTemplate(req.query.command) }\n" },
+    { file: 'lib/runner.ts', source: 'export function executeTemplate(command) { exec(command) }\n' },
+  ])
+  assert.deepEqual(result.parseErrors, [])
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.rule, 'shell-command-construction')
+  assert.equal(result.candidates[0]?.file, 'lib/runner.ts')
+  assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
+})
+
+test('AST module analysis supports namespace imports but does not infer external package internals', () => {
+  const result = analyzeJavaScriptModuleGraph([
+    { file: 'route.ts', source: "import * as runner from './runner'\nimport { execute as external } from 'external-runner'\nexport function route(req) { runner.execute(req.query.command); external(req.query.command); runner.execute('git --version') }\n" },
+    { file: 'runner.ts', source: 'export const execute = command => exec(command)\n' },
+  ])
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.file, 'runner.ts')
 })

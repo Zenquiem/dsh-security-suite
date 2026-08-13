@@ -22,6 +22,20 @@ test('assessDirectory reports source candidates and skips dependencies', async (
   }
 })
 
+test('directory assessment records cross-module JavaScript data-flow evidence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await mkdir(join(root, 'lib'))
+    await writeFile(join(root, 'route.ts'), "import { execute } from './lib/runner'\nexport function route(req) { execute(req.query.command) }\n")
+    await writeFile(join(root, 'lib', 'runner.ts'), 'export function execute(command) { exec(command) }\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidate = result.candidates.find(item => item.rule === 'shell-command-construction' && item.file === 'lib/runner.ts')
+    assert.ok(candidate)
+    assert.equal(candidate.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'ast.cross-module-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('resolveSafeTarget rejects paths outside the workspace', () => {
   assert.throws(() => resolveSafeTarget('/workspace', '../outside'), /inside the current workspace/)
 })
