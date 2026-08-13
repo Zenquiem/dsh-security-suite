@@ -303,7 +303,7 @@ function analyzeSecurityConfiguration(file: string, content: string, onlyRules?:
   const lines = content.split(/\r?\n/); const candidates: Candidate[] = []
   const enabled = (rule: ConfigurationRule): boolean => !onlyRules || onlyRules.has(rule.id)
   if (enabled(CONFIGURATION_RULES.jwt) && languageFor(file) === 'python') candidates.push(...pythonJwtConfigurationCandidates(file, content, lines))
-  if (enabled(CONFIGURATION_RULES.cors)) {
+  if (enabled(CONFIGURATION_RULES.cors) && !['javascript', 'typescript'].includes(languageFor(file))) {
     for (const match of content.matchAll(/\bcors\s*\(\s*\{([\s\S]{0,1200}?)\}\s*\)/gi)) {
       const block = match[1]
       const credential = /\b(?:credentials|supportsCredentials)\s*:\s*true\b|Access-Control-Allow-Credentials\s*['":=]+\s*['"]true/i.exec(block)
@@ -411,6 +411,7 @@ export async function assessDirectory(directory: string, limits: ScanLimits, dee
       candidates.push(...ast.candidates)
       modules.push({ file: rel, source: content })
       ruleReceipts.push({ ruleId: 'ast.local-taint', pass: 'semantic', matches: ast.candidates.length })
+      ruleReceipts.push({ ruleId: 'ast.cors-configuration', pass: 'semantic', matches: ast.candidates.filter(candidate => candidate.rule === 'cors-wildcard-credentials').length })
       if (ast.parseError) ruleReceipts.push({ ruleId: 'ast.parse-error', pass: 'semantic', matches: 1 })
     }
     if (extname(file) === '.py') { const semantic = analyzePythonFlow(content, rel); candidates.push(...semantic); pythonModules.push({ file: rel, source: content }); ruleReceipts.push({ ruleId: 'python.local-taint', pass: 'semantic', matches: semantic.length }) }

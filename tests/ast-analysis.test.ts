@@ -252,3 +252,16 @@ test('AST analysis relates rejectUnauthorized false only to supported TLS client
   assert.deepEqual(candidates.map(candidate => candidate.line), [2, 3])
   assert.equal(candidates.every(candidate => candidate.evidence.some(item => item.location?.role === 'sink')), true)
 })
+
+test('AST analysis relates credentialed wildcard origins only to supported CORS middleware calls', () => {
+  const result = analyzeJavaScriptAst(`
+    cors({ origin: true, credentials: true })
+    const options = { origin: '*', credentials: true }
+    cors(options)
+    logger.info({ origin: true, credentials: true })
+    cors({ origin: ['https://console.example.test'], credentials: true })
+  `, 'cors.ts')
+  const candidates = result.candidates.filter(candidate => candidate.rule === 'cors-wildcard-credentials')
+  assert.deepEqual(candidates.map(candidate => candidate.line), [2, 3])
+  assert.equal(candidates.every(candidate => candidate.evidence.some(item => item.location?.role === 'sink') && candidate.evidence.some(item => item.location?.role === 'expected_control')), true)
+})

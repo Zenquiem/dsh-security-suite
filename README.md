@@ -47,6 +47,8 @@ JavaScript/TypeScript dynamic execution, command, filesystem, outbound-request, 
 
 Python JWT verification discovery is call-scoped: an explicit `verify=False`, unsigned `none` algorithm, or `verify_signature=False` local options dictionary must be used by a supported `jwt.decode()` or `jwt.verify()` call. Unused dictionaries and unrelated verification settings are not candidates.
 
+JavaScript/TypeScript CORS discovery is AST-based: a wildcard or reflected origin and credential support must be paired in one configuration object passed directly or by local binding to `cors()`. Unused objects, logging calls, and fixed origin lists are not candidates.
+
 Ruby deserialization analysis follows request-derived values through same-directory local wrappers into `YAML.load`, `Psych.load`, and `Marshal.load`. `safe_load`, static data, and unrelated parser methods remain unproven.
 
 PHP deserialization analysis follows request-derived values through same-directory local wrappers into `unserialize()`. It recognizes the explicit `allowed_classes => false` control; other allowlists, wrappers, and parser APIs remain validation-required.

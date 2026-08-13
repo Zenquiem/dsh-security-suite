@@ -38,7 +38,7 @@ test('directory assessment structurally detects unsafe multi-line JWT, CORS, and
     const cors = result.candidates.find(item => item.rule === 'cors-wildcard-credentials')
     assert.equal(cors?.evidence.some(item => item.kind === 'context' && item.location?.role === 'expected_control' && item.location.line === 3), true)
     assert.equal(result.ruleReceipts.some(item => item.ruleId === 'jwt-verification-disabled' && item.matches === 1), true)
-    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'cors-wildcard-credentials' && item.matches === 1), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'ast.cors-configuration' && item.matches === 1), true)
     assert.equal(result.ruleReceipts.some(item => item.ruleId === 'xml-external-entity-risk' && item.matches === 1), true)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
@@ -62,6 +62,18 @@ test('directory assessment ties Python JWT verification disablement to a PyJWT c
     const candidates = result.candidates.filter(item => item.rule === 'jwt-verification-disabled')
     assert.equal(candidates.length, 1)
     assert.equal(candidates[0]?.line, 2)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.line === 2 && item.location.role === 'sink'), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('directory assessment ties JavaScript credentialed CORS origins to a CORS middleware call', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'server.ts'), 'const options = { origin: true, credentials: true }\ncors(options)\nlogger.info({ origin: true, credentials: true })\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'cors-wildcard-credentials')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.line, 1)
     assert.equal(candidates[0]?.evidence.some(item => item.location?.line === 2 && item.location.role === 'sink'), true)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
