@@ -42,7 +42,7 @@ The scanner inventories eligible source files deterministically, skips dependenc
 - `security_run_candidate_validation` binds one disposable test/build receipt to a claimed candidate-validation task and its ledger. It records evidence only; the final validation conclusion remains an explicit source-backed review step.
 - `security_plan_candidate_validation` previews preflight-derived commands; `security_run_candidate_validation_plan` approval-gates their isolated execution and preserves every per-command receipt.
 - `security_install_precommit_hook` changes a repository only when `approved: true` is explicitly supplied; it preserves an existing hook.
-- `security_tracking_preview` builds the exact tracker issue and can perform a read-only GitHub duplicate lookup. `security_create_tracking_issue` makes one approval-gated provider write and saves a receipt; it never persists the supplied token.
+- `security_tracking_preview` builds the exact GitHub, Jira, or Linear issue and can perform provider-scoped, read-only duplicate lookup. `security_create_tracking_issue` requires approval, blocks duplicate local writes, verifies every successful provider write by readback, and saves a token-free receipt.
 
 ## Install
 
