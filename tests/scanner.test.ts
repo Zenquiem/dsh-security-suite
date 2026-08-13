@@ -26,6 +26,33 @@ test('assessDirectory reports source candidates and skips dependencies', async (
   }
 })
 
+test('directory assessment structurally detects unsafe multi-line JWT, CORS, and XML configurations', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'auth.py'), 'claims = jwt.decode(\n  token,\n  key,\n  verify=False,\n)\n')
+    await writeFile(join(root, 'server.ts'), 'app.use(cors({\n  origin: true,\n  credentials: true,\n}))\n')
+    await writeFile(join(root, 'Xml.java'), 'class Xml {\n void parse() throws Exception {\n  DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();\n  factory.newDocumentBuilder();\n }\n}\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    assert.deepEqual(result.candidates.filter(item => ['jwt-verification-disabled', 'cors-wildcard-credentials', 'xml-external-entity-risk'].includes(item.rule)).map(item => item.rule).sort(), ['cors-wildcard-credentials', 'jwt-verification-disabled', 'xml-external-entity-risk'])
+    const cors = result.candidates.find(item => item.rule === 'cors-wildcard-credentials')
+    assert.equal(cors?.evidence.some(item => item.kind === 'context' && item.location?.role === 'expected_control' && item.location.line === 3), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'jwt-verification-disabled' && item.matches === 1), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'cors-wildcard-credentials' && item.matches === 1), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'xml-external-entity-risk' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('directory assessment does not flag paired configuration controls that remain explicit', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'auth.py'), 'claims = jwt.decode(token, key, algorithms=["RS256"])\n')
+    await writeFile(join(root, 'server.ts'), 'app.use(cors({\n  origin: ["https://console.example.test"],\n  credentials: true,\n}))\n')
+    await writeFile(join(root, 'Xml.java'), 'class Xml {\n void parse() throws Exception {\n  DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();\n  factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);\n  factory.newDocumentBuilder();\n }\n}\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    assert.equal(result.candidates.some(item => ['jwt-verification-disabled', 'cors-wildcard-credentials', 'xml-external-entity-risk'].includes(item.rule)), false)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment records cross-module JavaScript data-flow evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -314,6 +341,23 @@ test('diff scan traces an added Go caller into an unchanged local-module package
     assert.equal(finding.locations[0]?.file, 'internal/runner/runner.go')
     assert.equal(finding.evidence.some(item => item.location?.file === 'api/route.go' && item.location.line === 3), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'go.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan retains a complete CORS policy when an added paired control creates the risk', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'server.ts'), 'app.use(cors({\n  origin: true,\n  credentials: false,\n}))\n')
+    await execFileAsync('git', ['add', 'server.ts'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'server.ts'), 'app.use(cors({\n  origin: true,\n  credentials: true,\n}))\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const finding = scan.findings.find(item => item.ruleId === 'cors.wildcard.credentials')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.line, 2)
+    assert.equal(finding.evidence.some(item => item.location?.file === 'server.ts' && item.location.line === 3), true)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

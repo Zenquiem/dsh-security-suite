@@ -35,24 +35,28 @@ const CI_WORKFLOW_RULES: Record<'untrusted-shell' | 'write-permissions' | 'mutab
 }
 
 interface Rule { id: string; title: string; cwe: string; severity: Severity; rationale: string; pattern: RegExp; languages?: string[]; context?: RegExp }
+interface ConfigurationRule { id: string; cwe: string; severity: Severity; rationale: string }
 
 const RULES: Rule[] = [
   { id: 'dangerous-dynamic-code', title: 'Dynamic code execution', cwe: 'CWE-95', severity: 'high', rationale: 'Dynamic evaluation can turn attacker-controlled data into code execution.', pattern: /\beval\s*\(|\bnew\s+Function\s*\(/, languages: ['javascript', 'typescript'], context: /(?:req\.|params\.|query\.|body\.|input|user)/i },
   { id: 'shell-command-construction', title: 'Constructed shell command', cwe: 'CWE-78', severity: 'high', rationale: 'A constructed process command needs an attacker-to-shell data-flow review.', pattern: /(?:exec|execSync|spawn|spawnSync|system|popen|subprocess\.(?:run|call|Popen))\s*\([^\n]*(?:\+|`|\$\{|f["'])/i, context: /(?:req\.|params\.|query\.|argv|input|user)/i },
   { id: 'path-traversal-sink', title: 'Request-derived filesystem path', cwe: 'CWE-22', severity: 'medium', rationale: 'A filesystem sink receives request-derived data and needs canonical containment validation.', pattern: /(?:readFile|writeFile|createReadStream|createWriteStream|sendFile|open)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
-  { id: 'tls-verification-disabled', title: 'TLS verification disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled.', pattern: /(?:rejectUnauthorized\s*:\s*false|verify\s*=\s*False|CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)|InsecureSkipVerify\s*:\s*true)/ },
+  { id: 'tls-verification-disabled', title: 'TLS verification disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled.', pattern: /(?:rejectUnauthorized\s*:\s*false|(?:requests|httpx)\.[A-Za-z_]+\s*\([^\n)]*\bverify\s*=\s*False|CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)|InsecureSkipVerify\s*:\s*true)/ },
   { id: 'hardcoded-secret-marker', title: 'Likely hardcoded credential', cwe: 'CWE-798', severity: 'medium', rationale: 'A likely credential literal appears in source and should be moved to managed secret storage.', pattern: /(?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*["'][^"']{8,}["']/i },
   { id: 'unsafe-deserialization', title: 'Unsafe deserialization', cwe: 'CWE-502', severity: 'high', rationale: 'Deserialization of untrusted data can create code execution or object-injection paths.', pattern: /(?:pickle\.loads|yaml\.load\s*\([^\n]*(?!SafeLoader)|ObjectInputStream\s*\(|unserialize\s*\()/i, context: /(?:request|req\.|body|input|message|payload)/i },
   { id: 'ssrf-request-sink', title: 'Request-derived outbound request', cwe: 'CWE-918', severity: 'medium', rationale: 'An outbound request appears to use request-derived input and needs destination allowlisting.', pattern: /(?:fetch|axios\.(?:get|post|request)|requests\.(?:get|post|request)|http\.request)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
   { id: 'weak-randomness-security', title: 'Predictable randomness in security context', cwe: 'CWE-330', severity: 'medium', rationale: 'A non-cryptographic random source appears near a security-sensitive token or secret.', pattern: /(?:Math\.random\s*\(|random\.random\s*\()/, context: /(?:token|secret|session|password|reset|nonce)/i },
   { id: 'sql-injection-query-construction', title: 'Constructed SQL query', cwe: 'CWE-89', severity: 'high', rationale: 'A database query appears to construct SQL syntax from request-derived input.', pattern: /(?:query|execute|raw)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input|\+|\$\{)/i, context: /(?:select|insert|update|delete|from|where)/i },
-  { id: 'xml-external-entity-risk', title: 'Potential unsafe XML parser', cwe: 'CWE-611', severity: 'high', rationale: 'An XML parser factory or parser call needs explicit external-entity hardening.', pattern: /(?:DocumentBuilderFactory\.newInstance|SAXParserFactory\.newInstance|XMLInputFactory\.newFactory|lxml\.etree\.parse|xml\.etree\.ElementTree\.parse)/ },
   { id: 'insecure-deserialization-java', title: 'Java native deserialization', cwe: 'CWE-502', severity: 'high', rationale: 'ObjectInputStream deserializes a potentially attacker-controlled object graph.', pattern: /\.readObject\s*\(\)|new\s+ObjectInputStream\s*\(/ },
-  { id: 'jwt-verification-disabled', title: 'JWT verification disabled', cwe: 'CWE-347', severity: 'high', rationale: 'JWT signature or algorithm verification is disabled or accepts an unsafe configuration.', pattern: /(?:["']?verify_signature["']?\s*[:=]\s*False|algorithms\s*=\s*\[?['"]none|jwt\.decode\s*\([^\n]*(?:verify\s*[:=]\s*false))/i },
-  { id: 'cors-wildcard-credentials', title: 'Credentialed wildcard CORS', cwe: 'CWE-942', severity: 'medium', rationale: 'Credentialed CORS with a wildcard or reflected origin can expose authenticated data cross-origin.', pattern: /(?:Access-Control-Allow-Origin\s*['":=]+\s*['"]\*|origin\s*:\s*true)[^\n]*(?:credentials\s*:\s*true|Access-Control-Allow-Credentials)/i },
   { id: 'missing-authorization-route', title: 'Potential unprotected state-changing route', cwe: 'CWE-862', severity: 'medium', rationale: 'A state-changing route is declared without an apparent authorization middleware in its local declaration.', pattern: /\.(?:post|put|patch|delete)\s*\(\s*['"][^'"]+['"]\s*,\s*(?:async\s*)?\(?\s*(?:req|request|ctx)/i },
   { id: 'prototype-pollution-merge', title: 'Unsafe object merge from request data', cwe: 'CWE-1321', severity: 'medium', rationale: 'Request-derived object data reaches a generic merge/assignment primitive and needs prototype-key filtering.', pattern: /(?:Object\.assign|lodash\.merge|merge)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
 ]
+
+const CONFIGURATION_RULES: Record<'jwt' | 'cors' | 'xml', ConfigurationRule> = {
+  jwt: { id: 'jwt-verification-disabled', cwe: 'CWE-347', severity: 'high', rationale: 'JWT signature validation is disabled or the token algorithm allowlist accepts the unsigned none algorithm.' },
+  cors: { id: 'cors-wildcard-credentials', cwe: 'CWE-942', severity: 'medium', rationale: 'A credentialed CORS policy allows every origin or reflects the caller origin without an explicit allowlist.' },
+  xml: { id: 'xml-external-entity-risk', cwe: 'CWE-611', severity: 'high', rationale: 'A Java XML parser factory creates a parser without recognized external-entity hardening controls.' },
+}
 
 function languageFor(file: string): string {
   return ({ '.js': 'javascript', '.jsx': 'javascript', '.mjs': 'javascript', '.cjs': 'javascript', '.ts': 'typescript', '.tsx': 'typescript', '.py': 'python', '.go': 'go', '.java': 'java', '.php': 'php', '.rb': 'ruby', '.rs': 'rust', '.sh': 'shell', '.bash': 'shell', '.c': 'c', '.cc': 'cpp', '.cpp': 'cpp', '.cs': 'csharp' } as Record<string, string>)[extname(file)] ?? 'text'
@@ -61,6 +65,57 @@ function languageFor(file: string): string {
 function hash(value: string): string { return createHash('sha256').update(value).digest('hex') }
 function isContained(root: string, candidate: string): boolean { return candidate === root || candidate.startsWith(root + sep) }
 function location(file: string, line: number, excerpt: string, role: 'root_control' = 'root_control'): { file: string; line: number; excerpt: string; role: 'root_control' } { return { file, line, excerpt: excerpt.trim().slice(0, 240), role } }
+function lineAt(source: string, offset: number): number { return source.slice(0, offset).split(/\r?\n/).length }
+function sourceLine(lines: string[], number: number): string { return lines[number - 1]?.trim().slice(0, 240) ?? '' }
+
+function configurationCandidate(rule: ConfigurationRule, file: string, lines: string[], line: number, detail: string, controlLine?: number): Candidate {
+  const excerpt = sourceLine(lines, line)
+  return {
+    rule: rule.id, severity: rule.severity, file, line, excerpt, rationale: rule.rationale, cwe: rule.cwe,
+    evidence: [
+      { kind: 'pattern', detail, location: { file, line, excerpt, role: 'root_control' } },
+      ...(controlLine ? [{ kind: 'counterevidence' as const, detail: 'The paired security control was configured in the same effective configuration block.', location: { file, line: controlLine, excerpt: sourceLine(lines, controlLine), role: 'expected_control' as const } }] : []),
+    ],
+  }
+}
+
+/** Analyze security-sensitive configuration blocks that require paired controls. */
+function analyzeSecurityConfiguration(file: string, content: string, onlyRules?: Set<string>): Candidate[] {
+  const lines = content.split(/\r?\n/); const candidates: Candidate[] = []
+  const enabled = (rule: ConfigurationRule): boolean => !onlyRules || onlyRules.has(rule.id)
+  if (enabled(CONFIGURATION_RULES.jwt)) {
+    for (const match of content.matchAll(/(?:["']?verify_signature["']?\s*[:=]\s*false|jwt\.(?:decode|verify)\s*\([\s\S]{0,500}?\bverify\s*[:=]\s*false|algorithms\s*[:=]\s*\[[^\]]*['"]none['"])/gi)) {
+      const control = /(?:["']?verify_signature["']?\s*[:=]\s*false|\bverify\s*[:=]\s*false|algorithms\s*[:=]\s*\[[^\]]*['"]none['"])/i.exec(match[0])
+      const line = lineAt(content, (match.index ?? 0) + (control?.index ?? 0))
+      candidates.push(configurationCandidate(CONFIGURATION_RULES.jwt, file, lines, line, 'Configuration analysis found disabled JWT verification or an unsigned none algorithm allowlist.'))
+    }
+  }
+  if (enabled(CONFIGURATION_RULES.cors)) {
+    for (const match of content.matchAll(/\bcors\s*\(\s*\{([\s\S]{0,1200}?)\}\s*\)/gi)) {
+      const block = match[1]
+      const credential = /\b(?:credentials|supportsCredentials)\s*:\s*true\b|Access-Control-Allow-Credentials\s*['":=]+\s*['"]true/i.exec(block)
+      const origin = /\b(?:origin|origins)\s*:\s*(?:['"]\*['"]|true)\b|Access-Control-Allow-Origin\s*['":=]+\s*['"]\*/i.exec(block)
+      if (!credential || !origin) continue
+      const base = (match.index ?? 0) + match[0].indexOf(block); const originLine = lineAt(content, base + (origin.index ?? 0)); const controlLine = lineAt(content, base + (credential.index ?? 0))
+      const candidate = configurationCandidate(CONFIGURATION_RULES.cors, file, lines, originLine, 'Configuration analysis found a wildcard or reflected CORS origin paired with credential support in one CORS policy.')
+      candidate.evidence.push({ kind: 'context', detail: 'Credential support is configured in the same effective CORS policy.', location: { file, line: controlLine, excerpt: sourceLine(lines, controlLine), role: 'expected_control' } })
+      candidates.push(candidate)
+    }
+  }
+  if (enabled(CONFIGURATION_RULES.xml) && languageFor(file) === 'java') {
+    for (const match of content.matchAll(/\b(?:DocumentBuilderFactory|SAXParserFactory|XMLInputFactory)\s+(\w+)\s*=\s*(?:DocumentBuilderFactory\.newInstance|SAXParserFactory\.newInstance|XMLInputFactory\.newFactory)\s*\(\s*\)/g)) {
+      const variable = match[1]; const start = match.index ?? 0; const window = content.slice(start, start + 8_000)
+      const builder = new RegExp(`\\b${variable}\\.(?:newDocumentBuilder|newSAXParser|createXMLStreamReader)\\s*\\(`).exec(window)
+      if (!builder) continue
+      const hardening = new RegExp(`\\b${variable}\\.(?:setFeature|setAttribute|setProperty)\\s*\\([\\s\\S]{0,500}?(?:disallow-doctype-decl|external-general-entities|external-parameter-entities|ACCESS_EXTERNAL_(?:DTD|SCHEMA)|SUPPORT_DTD|IS_SUPPORTING_EXTERNAL_ENTITIES)`, 'i').exec(window.slice(0, builder.index))
+      if (hardening) continue
+      const line = lineAt(content, start + builder.index)
+      candidates.push(configurationCandidate(CONFIGURATION_RULES.xml, file, lines, line, `Configuration analysis found ${variable} creating an XML parser without a recognized external-entity hardening control before parser creation.`))
+    }
+  }
+  const unique = new Map<string, Candidate>(); for (const item of candidates) unique.set(`${item.rule}:${item.file}:${item.line}`, item)
+  return [...unique.values()]
+}
 
 async function collectFiles(root: string, limits: ScanLimits): Promise<{ files: string[]; skipped: number; complete: boolean }> {
   const files: string[] = []; let skipped = 0; let complete = true
@@ -120,6 +175,9 @@ function analyzeText(root: string, file: string, content: string, pass: string, 
     }
     receipts.push({ ruleId: rule.id, pass, matches })
   }
+  const configuration = analyzeSecurityConfiguration(rel, content, onlyRules)
+  candidates.push(...configuration)
+  for (const rule of Object.values(CONFIGURATION_RULES)) if (!onlyRules || onlyRules.has(rule.id)) receipts.push({ ruleId: rule.id, pass, matches: configuration.filter(item => item.rule === rule.id).length })
   return { candidates, receipts }
 }
 
@@ -488,6 +546,14 @@ export async function runDiffScan(workspace: string, base: string | undefined, t
     try { candidates.push(...ciWorkflowDiffCandidates(file, lines, await readFile(join(resolve(workspace), file), 'utf8'))) } catch { /* A deleted or unreadable workflow cannot be analyzed as current configuration. */ }
   }
   const semantic = await semanticDiffCandidates(resolve(workspace), addedLineMap); candidates.push(...semantic.candidates)
+  const configurationRuleIds = new Set(Object.values(CONFIGURATION_RULES).map(rule => rule.id))
+  for (const file of addedSourceMap.keys()) {
+    try {
+      const content = await readFile(join(resolve(workspace), file), 'utf8')
+      const configuration = analyzeText(resolve(workspace), join(resolve(workspace), file), content, 'diff-configuration', configurationRuleIds).candidates
+      candidates.push(...configuration.filter(candidate => candidateTouchesAddedLine(candidate, addedLineMap)))
+    } catch { /* Deleted or unreadable paths cannot provide current configuration evidence. */ }
+  }
   for (const path of [...changedPaths].sort()) { const patch = review.diff.split(`diff --git a/${path} b/${path}`)[1] ?? ''; receipts.push({ path, bytes: Buffer.byteLength(patch, 'utf8'), sha256: sha256(patch), language: languageFor(path) }) }
   for (const rule of [...RULES.map(rule => rule.id), ...REMOVED_CONTROL_RULES.map(rule => rule.id), ...Object.values(CI_WORKFLOW_RULES).map(rule => rule.id)]) ruleReceipts.push({ ruleId: rule, pass: 'diff', matches: candidates.filter(candidate => candidate.rule === rule).length })
   for (const [ruleId, matches] of Object.entries(semantic.counts)) ruleReceipts.push({ ruleId, pass: 'semantic', matches }); if (semantic.parseErrors) ruleReceipts.push({ ruleId: 'ast.diff-semantic-parse-error', pass: 'semantic', matches: semantic.parseErrors })
