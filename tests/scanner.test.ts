@@ -590,6 +590,40 @@ test('diff scan traces same-step untrusted GitHub event environment variables in
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('diff scan traces a job-scoped untrusted GitHub event environment variable into a newly added shell sink', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, '.github', 'workflows'), { recursive: true })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'on:\n  pull_request_target:\njobs:\n  review:\n    env:\n      TITLE: ${{ github.event.pull_request.title }}\n    steps:\n      - run: echo "verified"\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'on:\n  pull_request_target:\njobs:\n  review:\n    env:\n      TITLE: ${{ github.event.pull_request.title }}\n    steps:\n      - run: |\n          printf "%s\\n" "$TITLE"\n')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.deepEqual(scan.findings.map(item => item.ruleId), ['ci.untrusted.event.shell'])
+    const finding = scan.findings[0]
+    assert.equal(finding?.locations[0]?.line, 9)
+    assert.equal(finding?.evidence.some(item => item.location?.line === 6 && item.location.role === 'entrypoint'), true)
+    assert.equal(finding?.evidence.some(item => item.location?.line === 9 && item.location.role === 'sink'), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan keeps trusted, overridden, and other-job environment values out of job-scoped shell findings', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, '.github', 'workflows'), { recursive: true })
+    await writeFile(join(root, '.github', 'workflows', 'safe.yml'), 'on: [pull_request]\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, '.github', 'workflows', 'safe.yml'), 'on:\n  pull_request_target:\njobs:\n  source:\n    env:\n      TITLE: ${{ github.event.pull_request.title }}\n    steps:\n      - run: echo "not used in this job"\n  trusted:\n    env:\n      RELEASE: stable\n    steps:\n      - run: echo "$RELEASE"\n  overridden:\n    env:\n      TITLE: ${{ github.event.pull_request.title }}\n    steps:\n      - env:\n          TITLE: release verification\n        run: echo "$TITLE"\n')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.deepEqual(scan.findings.map(item => ({ ruleId: item.ruleId, locations: item.locations.map(location => location.line) })), [])
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('diff scan does not infer a shell injection path from a trusted step environment variable', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
   try {

@@ -571,6 +571,7 @@ function workflowCandidate(rule: CiWorkflowRule, file: string, line: number, exc
 
 interface WorkflowLine { line: number; source: string; indent: number; text: string }
 interface WorkflowStep { job: string; start: number; end: number; indent: number; fields: WorkflowLine[] }
+interface WorkflowEnvironment { name: string; line: WorkflowLine }
 
 function workflowLines(source: string): WorkflowLine[] {
   return source.split(/\r?\n/).map((source, index) => ({ line: index + 1, source, indent: /^(\s*)/.exec(source)?.[1].length ?? 0, text: source.trim() }))
@@ -584,7 +585,7 @@ function valueAfterKey(line: WorkflowLine, key: string): string | undefined {
 /** Parse only the small, indentation-defined Actions subset needed for job and step trust boundaries. */
 function workflowSteps(source: string): WorkflowStep[] {
   const lines = workflowLines(source); const jobsIndex = lines.findIndex(line => /^jobs\s*:\s*(?:#.*)?$/i.test(line.text)); if (jobsIndex < 0) return []
-  const jobsIndent = lines[jobsIndex].indent; const steps: WorkflowStep[] = []; let job = 'unknown'; let stepStart = -1; let stepIndent = -1
+  const jobsIndent = lines[jobsIndex].indent; const steps: WorkflowStep[] = []; let job = 'unknown'; let stepsIndent = -1; let stepStart = -1; let stepIndent = -1
   const closeStep = (end: number): void => {
     if (stepStart < 0) return
     steps.push({ job, start: lines[stepStart].line, end: lines[Math.max(stepStart, end - 1)].line, indent: stepIndent, fields: lines.slice(stepStart, end) })
@@ -593,8 +594,9 @@ function workflowSteps(source: string): WorkflowStep[] {
   for (let index = jobsIndex + 1; index < lines.length; index++) {
     const line = lines[index]
     if (line.text && line.indent <= jobsIndent) { closeStep(index); break }
-    if (line.text && line.indent === jobsIndent + 2 && /^[A-Za-z0-9_-]+\s*:/.test(line.text)) { closeStep(index); job = line.text.replace(/\s*:.*$/, ''); continue }
-    if (/^-\s+/.test(line.text) && line.indent >= jobsIndent + 4) { closeStep(index); stepStart = index; stepIndent = line.indent }
+    if (line.text && line.indent === jobsIndent + 2 && /^[A-Za-z0-9_-]+\s*:/.test(line.text)) { closeStep(index); job = line.text.replace(/\s*:.*$/, ''); stepsIndent = -1; continue }
+    if (/^steps\s*:\s*(?:#.*)?$/i.test(line.text) && line.indent > jobsIndent + 2) { closeStep(index); stepsIndent = line.indent; continue }
+    if (/^-\s+/.test(line.text) && stepsIndent >= 0 && line.indent === stepsIndent + 2) { closeStep(index); stepStart = index; stepIndent = line.indent }
   }
   closeStep(lines.length)
   return steps
@@ -618,11 +620,11 @@ function runLines(step: WorkflowStep): Array<{ run: WorkflowLine; body: Workflow
   return results
 }
 
-function stepUntrustedEnvironment(step: WorkflowStep): Array<{ name: string; line: WorkflowLine }> {
-  const values: Array<{ name: string; line: WorkflowLine }> = []
+function stepUntrustedEnvironment(step: WorkflowStep): WorkflowEnvironment[] {
+  const values: WorkflowEnvironment[] = []
   for (let index = 0; index < step.fields.length; index++) {
     const environment = step.fields[index]
-    if (!/^env\s*:\s*(?:#.*)?$/i.test(environment.text)) continue
+    if (valueAfterKey(environment, 'env') !== '') continue
     for (let child = index + 1; child < step.fields.length && step.fields[child].indent > environment.indent; child++) {
       const match = /^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/.exec(step.fields[child].text)
       if (match && isUntrustedEvent(match[2])) values.push({ name: match[1], line: step.fields[child] })
@@ -631,18 +633,60 @@ function stepUntrustedEnvironment(step: WorkflowStep): Array<{ name: string; lin
   return values
 }
 
+function stepEnvironmentNames(step: WorkflowStep): Set<string> {
+  const names = new Set<string>()
+  for (let index = 0; index < step.fields.length; index++) {
+    const environment = step.fields[index]
+    if (valueAfterKey(environment, 'env') !== '') continue
+    for (let child = index + 1; child < step.fields.length && step.fields[child].indent > environment.indent; child++) {
+      const match = /^([A-Za-z_][A-Za-z0-9_]*)\s*:/.exec(step.fields[child].text)
+      if (match) names.add(match[1])
+    }
+  }
+  return names
+}
+
+/** Parse direct job-level env mappings only; cross-job and transformed values remain unproven. */
+function jobUntrustedEnvironment(source: string): Map<string, WorkflowEnvironment[]> {
+  const lines = workflowLines(source); const jobsIndex = lines.findIndex(line => /^jobs\s*:\s*(?:#.*)?$/i.test(line.text)); const environments = new Map<string, WorkflowEnvironment[]>()
+  if (jobsIndex < 0) return environments
+  const jobsIndent = lines[jobsIndex].indent
+  for (let index = jobsIndex + 1; index < lines.length;) {
+    const jobLine = lines[index]
+    if (jobLine.text && jobLine.indent <= jobsIndent) break
+    if (!(jobLine.text && jobLine.indent === jobsIndent + 2 && /^[A-Za-z0-9_-]+\s*:/.test(jobLine.text))) { index++; continue }
+    const job = jobLine.text.replace(/\s*:.*$/, ''); let jobEnd = index + 1
+    while (jobEnd < lines.length && (!lines[jobEnd].text || lines[jobEnd].indent > jobsIndent + 2)) jobEnd++
+    const values: WorkflowEnvironment[] = []
+    for (let field = index + 1; field < jobEnd; field++) {
+      const environment = lines[field]
+      if (environment.indent !== jobsIndent + 4 || !/^env\s*:\s*(?:#.*)?$/i.test(environment.text)) continue
+      for (let child = field + 1; child < jobEnd && lines[child].indent > environment.indent; child++) {
+        const match = /^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/.exec(lines[child].text)
+        if (match && isUntrustedEvent(match[2])) values.push({ name: match[1], line: lines[child] })
+      }
+    }
+    if (values.length) environments.set(job, values)
+    index = jobEnd
+  }
+  return environments
+}
+
 function environmentReference(value: string, name: string): boolean {
   const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
   return new RegExp(`(?:\\$${escaped}\\b|\\$\\{${escaped}(?:[?:+\-][^}]*)?\\}|\\$\\{\\{\\s*env\\.${escaped}\\s*\\}\\})`).test(value)
 }
 
-function untrustedShellFlows(step: WorkflowStep): WorkflowShellFlow[] {
+function untrustedShellFlows(step: WorkflowStep, jobEnvironment: WorkflowEnvironment[] = []): WorkflowShellFlow[] {
   const flows: WorkflowShellFlow[] = []
+  const stepEnvironment = stepUntrustedEnvironment(step)
+  const stepOverrides = stepEnvironmentNames(step)
+  const environments = [...stepEnvironment, ...jobEnvironment.filter(environment => !stepOverrides.has(environment.name))]
   for (const { run, body } of runLines(step)) {
     for (const line of body) if (isUntrustedEvent(line.text)) flows.push({ entry: line, sink: line, detail: 'shell command interpolates untrusted GitHub event data directly' })
-    for (const environment of stepUntrustedEnvironment(step)) {
+    for (const environment of environments) {
       const sink = body.find(line => environmentReference(line.text, environment.name))
-      if (sink) flows.push({ entry: environment.line, sink, detail: `shell command references ${environment.name}, which is assigned from untrusted GitHub event data in the same step` })
+      if (sink) flows.push({ entry: environment.line, sink, detail: `shell command references ${environment.name}, which is assigned from untrusted GitHub event data ${stepEnvironment.includes(environment) ? 'in the same step' : `at job scope for ${step.job}`}` })
     }
   }
   const unique = new Map<string, WorkflowShellFlow>(); for (const flow of flows) unique.set(`${flow.entry.line}:${flow.sink.line}`, flow)
@@ -678,9 +722,10 @@ function ciWorkflowDiffCandidates(file: string, added: Array<{ line: number; sou
   if (!isGitHubWorkflow(file)) return []
   const candidates: Candidate[] = []; const currentLines = workflowLines(currentSource); const addedNumbers = new Set(added.map(item => item.line)); const pullRequestTarget = currentLines.find(line => /^pull_request_target\s*(?::|$)/i.test(line.text))
   if (pullRequestTarget) {
+    const jobEnvironment = jobUntrustedEnvironment(currentSource)
     for (const permission of writePermissionLines(currentSource).filter(line => addedLine(line, addedNumbers))) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['write-permissions'], file, permission.line, permission.text.slice(0, 240), `Current pull_request_target trigger at ${file}:${pullRequestTarget.line} has newly added write permission at ${file}:${permission.line}.`, 'root_control'))
     for (const step of workflowSteps(currentSource)) {
-      for (const flow of untrustedShellFlows(step)) { const candidate = workflowShellCandidate(file, flow, addedNumbers); if (candidate) candidates.push(candidate) }
+      for (const flow of untrustedShellFlows(step, jobEnvironment.get(step.job))) { const candidate = workflowShellCandidate(file, flow, addedNumbers); if (candidate) candidates.push(candidate) }
       const checkout = step.fields.find(line => /^-\s*uses\s*:\s*actions\/checkout@/i.test(line.text))
       const untrustedCheckoutField = checkout && step.fields.find(line => /^(?:ref|repository)\s*:/i.test(line.text) && isUntrustedEvent(valueAfterKey(line, 'ref') ?? valueAfterKey(line, 'repository')))
       if (!checkout || !untrustedCheckoutField) continue
