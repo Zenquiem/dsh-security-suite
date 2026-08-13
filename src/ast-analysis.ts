@@ -172,6 +172,52 @@ function exportDeclarationNames(node: AstNode): string[] {
   return Array.isArray(node.declarations) ? node.declarations.map(item => id((item as AstNode).id as AstNode)).filter((value): value is string => Boolean(value)) : []
 }
 
+function requireTarget(node: AstNode | undefined): string | undefined {
+  if (node?.type !== 'CallExpression' || id(node.callee as AstNode) !== 'require') return undefined
+  const argumentsList = (node.arguments ?? []) as AstNode[]
+  return argumentsList.length === 1 ? literal(argumentsList[0]) : undefined
+}
+
+function moduleExportProperty(node: AstNode | undefined): string | undefined {
+  if (!node || (node.type !== 'MemberExpression' && node.type !== 'OptionalMemberExpression')) return undefined
+  const object = memberName(node.object as AstNode)
+  if (object !== 'exports' && object !== 'module.exports') return undefined
+  return node.computed ? literal(node.property as AstNode) : id(node.property as AstNode)
+}
+
+function isModuleExports(node: AstNode | undefined): boolean { return memberName(node) === 'module.exports' }
+
+function addCommonJsImport(target: string, pattern: AstNode | undefined, imports: Map<string, { file: string; exported: string }>, namespaces: Map<string, string>): void {
+  if (!pattern) return
+  if (pattern.type === 'Identifier') { namespaces.set(String(pattern.name), target); return }
+  if (pattern.type !== 'ObjectPattern') return
+  for (const property of (pattern.properties ?? []) as AstNode[]) {
+    if (property.type !== 'Property') continue
+    const exported = property.computed ? literal(property.key as AstNode) : id(property.key as AstNode)
+    const local = id(property.value as AstNode)
+    if (local && exported) imports.set(local, { file: target, exported })
+  }
+}
+
+function addCommonJsExports(statement: AstNode, file: string, functions: Map<string, ModuleFunction>, exports: Map<string, string>): void {
+  if (statement.type !== 'ExpressionStatement') return
+  const expression = statement.expression as AstNode
+  if (expression?.type !== 'AssignmentExpression' || expression.operator !== '=') return
+  const left = expression.left as AstNode; const right = expression.right as AstNode
+  const property = moduleExportProperty(left)
+  if (property) { const local = id(right); if (local && functions.has(local)) exports.set(property, `${file}:${local}`); return }
+  if (!isModuleExports(left)) return
+  const local = id(right)
+  if (local && functions.has(local)) { exports.set('default', `${file}:${local}`); return }
+  if (right.type !== 'ObjectExpression') return
+  for (const entry of (right.properties ?? []) as AstNode[]) {
+    if (entry.type !== 'Property') continue
+    const exported = entry.computed ? literal(entry.key as AstNode) : id(entry.key as AstNode)
+    const localName = id(entry.value as AstNode)
+    if (exported && localName && functions.has(localName)) exports.set(exported, `${file}:${localName}`)
+  }
+}
+
 function createModuleRecord(file: string, source: string, known: Set<string>): { record?: ModuleRecord; parseError?: string } {
   let program: AstNode
   try { program = parse(source, { loc: true, range: true, jsx: true, comment: false }) as unknown as AstNode } catch (error) { return { parseError: error instanceof Error ? error.message : String(error) } }
@@ -189,6 +235,14 @@ function createModuleRecord(file: string, source: string, known: Set<string>): {
       }
       continue
     }
+    if (statement.type === 'VariableDeclaration') {
+      for (const declaration of (statement.declarations ?? []) as AstNode[]) {
+        const specifier = requireTarget(declaration.init as AstNode)
+        const target = specifier ? resolveRelativeModule(file, specifier, known) : undefined
+        if (target) addCommonJsImport(target, declaration.id as AstNode, imports, namespaces)
+      }
+      continue
+    }
     if (statement.type === 'ExportNamedDeclaration') {
       for (const name of exportDeclarationNames(statement.declaration as AstNode)) if (functions.has(name)) exports.set(name, `${file}:${name}`)
       for (const specifier of (statement.specifiers ?? []) as AstNode[]) { const local = id(specifier.local as AstNode); const exported = id(specifier.exported as AstNode); if (local && exported && functions.has(local)) exports.set(exported, `${file}:${local}`) }
@@ -197,6 +251,7 @@ function createModuleRecord(file: string, source: string, known: Set<string>): {
     if (statement.type === 'ExportDefaultDeclaration') {
       const declaration = statement.declaration as AstNode; const local = id(declaration.id as AstNode); if (local && functions.has(local)) exports.set('default', `${file}:${local}`)
     }
+    addCommonJsExports(statement, file, functions, exports)
   }
   return { record: { file, source, program, functions, exports, imports, namespaces } }
 }

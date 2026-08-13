@@ -78,3 +78,24 @@ test('AST module analysis supports namespace imports but does not infer external
   assert.equal(result.candidates.length, 1)
   assert.equal(result.candidates[0]?.file, 'runner.ts')
 })
+
+test('AST module analysis follows static CommonJS destructured and namespace imports into local exports', () => {
+  const result = analyzeJavaScriptModuleGraph([
+    { file: 'route.cjs', source: "const { execute: run } = require('./runner')\nconst helpers = require('./helpers')\nfunction route(req) { run(req.query.command); helpers.launch(req.query.secondary) }\n" },
+    { file: 'runner.cjs', source: 'function execute(command) { exec(command) }\nmodule.exports.execute = execute\n' },
+    { file: 'helpers.js', source: 'function launch(command) { exec(command) }\nexports.launch = launch\n' },
+  ])
+  assert.deepEqual(result.parseErrors, [])
+  assert.equal(result.candidates.length, 2)
+  assert.deepEqual(result.candidates.map(item => item.file).sort(), ['helpers.js', 'runner.cjs'])
+  assert.equal(result.candidates.every(item => item.evidence.some(evidence => evidence.detail.includes('cross-module call-chain'))), true)
+})
+
+test('AST module analysis resolves static CommonJS object and default exports without resolving external or dynamic requires', () => {
+  const result = analyzeJavaScriptModuleGraph([
+    { file: 'route.js', source: "const runner = require('./runner')\nconst external = require('external-runner')\nconst dynamic = require(name)\nfunction route(req) { runner.execute(req.query.command); external.execute(req.query.command); dynamic.execute(req.query.command) }\n" },
+    { file: 'runner.js', source: 'function execute(command) { exec(command) }\nmodule.exports = { execute }\n' },
+  ])
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.file, 'runner.js')
+})
