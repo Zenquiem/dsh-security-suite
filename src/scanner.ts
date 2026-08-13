@@ -176,15 +176,29 @@ function frameworkRouteCandidate(file: string, lines: string[], offset: number, 
   return { rule: ROUTE_AUTHORIZATION_RULE.id, severity: ROUTE_AUTHORIZATION_RULE.severity, file, line, excerpt, rationale: ROUTE_AUTHORIZATION_RULE.rationale, cwe: ROUTE_AUTHORIZATION_RULE.cwe, evidence: [{ kind: 'pattern', detail, location: { file, line, excerpt, role: 'root_control' } }] }
 }
 
+function protectedPythonRouters(source: string): Set<string> {
+  const protectedRouters = new Set<string>(); const routers = new Set<string>()
+  for (const match of source.matchAll(/\b([A-Za-z_]\w*)\s*=\s*APIRouter\s*\(/g)) {
+    const open = (match.index ?? 0) + match[0].lastIndexOf('('); const close = closingParenthesis(source, open); if (close === undefined) continue
+    routers.add(match[1]!); if (explicitAuthorization(source.slice(open + 1, close))) protectedRouters.add(match[1]!)
+  }
+  for (const match of source.matchAll(/\b[A-Za-z_]\w*\.include_router\s*\(/g)) {
+    const open = (match.index ?? 0) + match[0].lastIndexOf('('); const close = closingParenthesis(source, open); if (close === undefined) continue
+    const args = topLevelArguments(source, open + 1, close); if (!explicitAuthorization(source.slice(open + 1, close))) continue
+    for (const argument of args) if (routers.has(argument.text)) protectedRouters.add(argument.text)
+  }
+  return protectedRouters
+}
+
 function analyzePythonRouteAuthorization(file: string, content: string): Candidate[] {
-  const lines = content.split(/\r?\n/); const candidates: Candidate[] = []
+  const lines = content.split(/\r?\n/); const candidates: Candidate[] = []; const protectedRouters = protectedPythonRouters(content)
   for (const match of content.matchAll(/@([A-Za-z_]\w*)\.(?:post|put|patch|delete)\s*\(/gi)) {
-    const start = match.index ?? 0; const open = start + match[0].lastIndexOf('('); const close = closingParenthesis(content, open); if (close === undefined) continue
+    const receiver = match[1]!; const start = match.index ?? 0; const open = start + match[0].lastIndexOf('('); const close = closingParenthesis(content, open); if (close === undefined) continue
     const routeArguments = content.slice(open + 1, close); if (!/^\s*['"]/.test(routeArguments)) continue
     const following = content.slice(close + 1, close + 1 + 2_000); const header = /(?:^|\n)\s*(?:async\s+)?def\s+[A-Za-z_]\w*\s*\(([\s\S]{0,1200}?)\)\s*(?:->[^:\n]+)?\s*:/.exec(following)
     if (!header) continue
-    const decorators = following.slice(0, header.index); const protectedRoute = explicitAuthorization(routeArguments) || explicitAuthorization(decorators) || explicitAuthorization(header[1] ?? '')
-    if (!protectedRoute) candidates.push(frameworkRouteCandidate(file, lines, start, 'FastAPI-style route analysis found a state-changing handler without an explicit route, decorator, or parameter dependency authorization control.'))
+    const decorators = following.slice(0, header.index); const protectedRoute = protectedRouters.has(receiver) || explicitAuthorization(routeArguments) || explicitAuthorization(decorators) || explicitAuthorization(header[1] ?? '')
+    if (!protectedRoute) candidates.push(frameworkRouteCandidate(file, lines, start, 'FastAPI-style route analysis found a state-changing handler without an explicit route, decorator, parameter dependency, or explicit protected-router authorization control.'))
   }
   return candidates
 }
@@ -200,6 +214,26 @@ function contiguousLeadingAnnotations(content: string, position: number): string
   return values.join('\n')
 }
 
+function closingBrace(source: string, open: number): number | undefined {
+  let depth = 0; let quote = ''
+  for (let index = open; index < source.length; index++) {
+    const character = source[index]
+    if (quote) { if (character === quote && source[index - 1] !== '\\') quote = ''; continue }
+    if (character === '"' || character === "'" || character === '`') { quote = character; continue }
+    if (character === '{') depth++
+    if (character === '}' && --depth === 0) return index
+  }
+  return undefined
+}
+
+function classAuthorizationAt(source: string, position: number): boolean {
+  for (const match of source.matchAll(/\bclass\s+[A-Za-z_]\w*(?:\s+(?:extends|implements)\s+[^\{]+)?\s*\{/g)) {
+    const start = match.index ?? 0; const open = start + match[0].lastIndexOf('{'); const close = closingBrace(source, open)
+    if (close !== undefined && position > open && position < close) return explicitAuthorization(contiguousLeadingAnnotations(source, start))
+  }
+  return false
+}
+
 function analyzeJavaRouteAuthorization(file: string, content: string): Candidate[] {
   const lines = content.split(/\r?\n/); const candidates: Candidate[] = []
   const mapping = /@(PostMapping|PutMapping|PatchMapping|DeleteMapping|RequestMapping)\b(?:\s*\(([^)]*)\))?/gi
@@ -210,7 +244,7 @@ function analyzeJavaRouteAuthorization(file: string, content: string): Candidate
     const header = /(?:^|\n)\s*(?:public|protected|private)?\s*(?:static\s+)?[\w<>\[\],? ]+\s+[A-Za-z_]\w*\s*\([^)]*\)\s*(?:throws\s+[\w,. ]+)?\{/.exec(following)
     if (!header) continue
     const annotations = `${contiguousLeadingAnnotations(content, start)}\n${following.slice(0, header.index)}`
-    if (!explicitAuthorization(annotations)) candidates.push(frameworkRouteCandidate(file, lines, start, 'Spring-style route analysis found a state-changing handler without an explicit method authorization annotation.'))
+    if (!classAuthorizationAt(content, start) && !explicitAuthorization(annotations)) candidates.push(frameworkRouteCandidate(file, lines, start, 'Spring-style route analysis found a state-changing handler without an explicit method or enclosing-class authorization annotation.'))
   }
   return candidates
 }
@@ -570,16 +604,60 @@ function isUntrustedEvent(value: string | undefined): boolean { return !!value &
 function isMutableAction(value: string | undefined): boolean { return !!value && /@(?:main|master|develop|next|latest)\s*$/i.test(value) }
 function addedLine(line: WorkflowLine, added: Set<number>): boolean { return added.has(line.line) }
 
-function runEventLines(step: WorkflowStep): WorkflowLine[] {
-  const results: WorkflowLine[] = []
+interface WorkflowShellFlow { entry: WorkflowLine; sink: WorkflowLine; detail: string }
+
+function runLines(step: WorkflowStep): Array<{ run: WorkflowLine; body: WorkflowLine[] }> {
+  const results: Array<{ run: WorkflowLine; body: WorkflowLine[] }> = []
   for (let index = 0; index < step.fields.length; index++) {
     const line = step.fields[index]; const value = valueAfterKey(line, 'run')
     if (value === undefined) continue
-    if (isUntrustedEvent(value)) results.push(line)
-    if (!/^[>|]/.test(value)) continue
-    for (let child = index + 1; child < step.fields.length && step.fields[child].indent > line.indent; child++) if (isUntrustedEvent(step.fields[child].text)) results.push(step.fields[child])
+    const body: WorkflowLine[] = [line]
+    if (/^[>|]/.test(value)) for (let child = index + 1; child < step.fields.length && step.fields[child].indent > line.indent; child++) body.push(step.fields[child])
+    results.push({ run: line, body })
   }
   return results
+}
+
+function stepUntrustedEnvironment(step: WorkflowStep): Array<{ name: string; line: WorkflowLine }> {
+  const values: Array<{ name: string; line: WorkflowLine }> = []
+  for (let index = 0; index < step.fields.length; index++) {
+    const environment = step.fields[index]
+    if (!/^env\s*:\s*(?:#.*)?$/i.test(environment.text)) continue
+    for (let child = index + 1; child < step.fields.length && step.fields[child].indent > environment.indent; child++) {
+      const match = /^([A-Za-z_][A-Za-z0-9_]*)\s*:\s*(.*)$/.exec(step.fields[child].text)
+      if (match && isUntrustedEvent(match[2])) values.push({ name: match[1], line: step.fields[child] })
+    }
+  }
+  return values
+}
+
+function environmentReference(value: string, name: string): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(?:\\$${escaped}\\b|\\$\\{${escaped}(?:[?:+\-][^}]*)?\\}|\\$\\{\\{\\s*env\\.${escaped}\\s*\\}\\})`).test(value)
+}
+
+function untrustedShellFlows(step: WorkflowStep): WorkflowShellFlow[] {
+  const flows: WorkflowShellFlow[] = []
+  for (const { run, body } of runLines(step)) {
+    for (const line of body) if (isUntrustedEvent(line.text)) flows.push({ entry: line, sink: line, detail: 'shell command interpolates untrusted GitHub event data directly' })
+    for (const environment of stepUntrustedEnvironment(step)) {
+      const sink = body.find(line => environmentReference(line.text, environment.name))
+      if (sink) flows.push({ entry: environment.line, sink, detail: `shell command references ${environment.name}, which is assigned from untrusted GitHub event data in the same step` })
+    }
+  }
+  const unique = new Map<string, WorkflowShellFlow>(); for (const flow of flows) unique.set(`${flow.entry.line}:${flow.sink.line}`, flow)
+  return [...unique.values()]
+}
+
+function workflowShellCandidate(file: string, flow: WorkflowShellFlow, added: Set<number>): Candidate | undefined {
+  const anchor = addedLine(flow.sink, added) ? flow.sink : addedLine(flow.entry, added) ? flow.entry : undefined
+  if (!anchor) return undefined
+  const rule = CI_WORKFLOW_RULES['untrusted-shell']
+  return { rule: rule.id, severity: rule.severity, file, line: anchor.line, excerpt: anchor.text.slice(0, 240), rationale: rule.rationale, cwe: rule.cwe, evidence: [
+    { kind: 'pattern', detail: `pull_request_target ${flow.detail}.`, location: { file, line: flow.sink.line, excerpt: flow.sink.text.slice(0, 240), role: 'sink' } },
+    { kind: 'context', detail: 'The event-derived value is the source for this shell execution path.', location: { file, line: flow.entry.line, excerpt: flow.entry.text.slice(0, 240), role: 'entrypoint' } },
+    { kind: 'context', detail: 'This CI/CD workflow finding is anchored to a newly added diff line.', location: { file, line: anchor.line, excerpt: anchor.text.slice(0, 240), role: anchor === flow.sink ? 'sink' : 'entrypoint' } },
+  ] }
 }
 
 function writePermissionLines(source: string): WorkflowLine[] {
@@ -602,7 +680,7 @@ function ciWorkflowDiffCandidates(file: string, added: Array<{ line: number; sou
   if (pullRequestTarget) {
     for (const permission of writePermissionLines(currentSource).filter(line => addedLine(line, addedNumbers))) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['write-permissions'], file, permission.line, permission.text.slice(0, 240), `Current pull_request_target trigger at ${file}:${pullRequestTarget.line} has newly added write permission at ${file}:${permission.line}.`, 'root_control'))
     for (const step of workflowSteps(currentSource)) {
-      for (const run of runEventLines(step).filter(line => addedLine(line, addedNumbers))) candidates.push(workflowCandidate(CI_WORKFLOW_RULES['untrusted-shell'], file, run.line, run.text.slice(0, 240), `Added pull_request_target workflow shell command interpolates untrusted GitHub event data at ${file}:${run.line}.`, 'sink'))
+      for (const flow of untrustedShellFlows(step)) { const candidate = workflowShellCandidate(file, flow, addedNumbers); if (candidate) candidates.push(candidate) }
       const checkout = step.fields.find(line => /^-\s*uses\s*:\s*actions\/checkout@/i.test(line.text))
       const untrustedCheckoutField = checkout && step.fields.find(line => /^(?:ref|repository)\s*:/i.test(line.text) && isUntrustedEvent(valueAfterKey(line, 'ref') ?? valueAfterKey(line, 'repository')))
       if (!checkout || !untrustedCheckoutField) continue

@@ -141,6 +141,49 @@ class Controller {
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment recognizes explicit FastAPI router mounts and Spring class-level authorization without leaking controls', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'mounted.py'), `
+admin = APIRouter()
+sessions = APIRouter(dependencies=[Depends(require_session)])
+public = APIRouter()
+app.include_router(admin, dependencies=[Depends(require_authorization)])
+app.include_router(public)
+
+@admin.post('/users')
+def create_user():
+    return None
+
+@sessions.delete('/current')
+def destroy_session():
+    return None
+
+@public.patch('/profile')
+def update_profile():
+    return None
+`)
+    await writeFile(join(root, 'ClassController.java'), `
+@RestController
+@PreAuthorize("hasRole('ADMIN')")
+class AdminController {
+  @PostMapping("/users")
+  public void create() {}
+}
+
+class PublicController {
+  @PostMapping("/signup")
+  public void signup() {}
+}
+`)
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const routes = result.candidates.filter(item => item.rule === 'missing-authorization-route')
+    assert.deepEqual(routes.map(item => `${item.file}:${item.line}`).sort(), ['ClassController.java:10', 'mounted.py:16'])
+    assert.equal(routes.some(item => item.excerpt.includes('create_user')), false)
+    assert.equal(routes.some(item => item.excerpt.includes('destroy_session')), false)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment records cross-module JavaScript data-flow evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -525,6 +568,40 @@ test('diff scan does not restate an unchanged GitHub Actions workflow risk', asy
     const scan = await runDiffScan(root, undefined, '')
     assert.equal(scan.findings.length, 0)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ci-untrusted-event-shell')?.matches, 0)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces same-step untrusted GitHub event environment variables into shell execution', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, '.github', 'workflows'), { recursive: true })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'on:\n  pull_request_target:\njobs:\n  review:\n    steps:\n      - name: title\n        env:\n          TITLE: ${{ github.event.pull_request.title }}\n        run: echo "verified"\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, '.github', 'workflows', 'review.yml'), 'on:\n  pull_request_target:\njobs:\n  review:\n    steps:\n      - name: title\n        env:\n          TITLE: ${{ github.event.pull_request.title }}\n        run: |\n          printf "%s\\n" "$TITLE"\n')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.deepEqual(scan.findings.map(item => item.ruleId), ['ci.untrusted.event.shell'])
+    const finding = scan.findings[0]
+    assert.equal(finding?.locations[0]?.line, 10)
+    assert.equal(finding?.evidence.some(item => item.location?.line === 8 && item.location.role === 'entrypoint'), true)
+    assert.equal(finding?.evidence.some(item => item.location?.line === 10 && item.location.role === 'sink'), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan does not infer a shell injection path from a trusted step environment variable', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await mkdir(join(root, '.github', 'workflows'), { recursive: true })
+    await writeFile(join(root, '.github', 'workflows', 'safe.yml'), 'on: [pull_request]\n')
+    await execFileAsync('git', ['add', '.'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, '.github', 'workflows', 'safe.yml'), 'on:\n  pull_request_target:\njobs:\n  review:\n    steps:\n      - env:\n          TITLE: release verification\n        run: echo "$TITLE"\n')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.equal(scan.findings.length, 0)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
