@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { applyRemediationProposal, installPreCommitHook, planCandidateValidation, remediationPlan, resumeBulkJob, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, startBulkCsvJob } from '../src/operations.ts'
+import { applyRemediationProposal, installPreCommitHook, loadRemediationRollback, planCandidateValidation, remediationPlan, resumeBulkJob, rollbackRemediationProposal, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, startBulkCsvJob } from '../src/operations.ts'
 import { runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
 import { claimAuditTask, recordValidation } from '../src/workbench.ts'
@@ -131,6 +131,56 @@ test('remediation application requires approval, rejects a stale proposal, and v
     assert.equal(applied.status, 'applied')
     assert.ok(applied.verificationScanId)
     assert.match(await readFile(join(root, 'client.ts'), 'utf8'), /rejectUnauthorized: true/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('safe TLS remediation saves a snapshot-bound rollback record and verifies a restore', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  const original = 'request({ rejectUnauthorized: false })\n'
+  try {
+    await writeFile(join(root, 'client.ts'), original)
+    const scan = await runScan(root, local, 'standard', '', false, state); await saveScan(state, scan)
+    const proposal = await remediationPlan(root, local, scan.id, scan.findings[0].id)
+    assert.equal(proposal.safeToApply, true)
+    const applied = await applyRemediationProposal(root, local, scan.id, proposal.id, true)
+    assert.ok(applied.rollbackId); assert.match(await readFile(join(root, 'client.ts'), 'utf8'), /rejectUnauthorized: true/)
+    const rollback = await loadRemediationRollback(state, applied.rollbackId!)
+    assert.equal(rollback.status, 'available'); assert.equal(rollback.beforeContent, original)
+    await assert.rejects(() => rollbackRemediationProposal(root, local, scan.id, proposal.id, false), /approved/)
+    const restored = await rollbackRemediationProposal(root, local, scan.id, proposal.id, true)
+    assert.equal(restored.status, 'rolled_back'); assert.ok(restored.verificationScanId)
+    assert.equal(await readFile(join(root, 'client.ts'), 'utf8'), original)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('safe JWT remediation is reversible and rollback refuses an altered applied state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'jwt.py'), 'options = {"verify_signature": False}\n')
+    const scan = await runScan(root, local, 'standard', '', false, state); await saveScan(state, scan)
+    const finding = scan.findings.find(item => item.ruleId === 'jwt.verification.disabled'); assert.ok(finding)
+    const proposal = await remediationPlan(root, local, scan.id, finding.id); assert.equal(proposal.safeToApply, true)
+    const applied = await applyRemediationProposal(root, local, scan.id, proposal.id, true)
+    assert.match(await readFile(join(root, 'jwt.py'), 'utf8'), /["']verify_signature["']:\s*True/)
+    await writeFile(join(root, 'jwt.py'), 'options = {"verify_signature": True}\n# reviewed manually\n')
+    await assert.rejects(() => rollbackRemediationProposal(root, local, scan.id, applied.id, true), /stale/)
+    assert.equal((await loadRemediationRollback(state, applied.rollbackId!)).status, 'stale')
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('semantic findings retain a review-only remediation proposal instead of a behavior-changing automatic patch', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await writeFile(join(root, 'app.ts'), 'function route(req) { eval(req.query.code) }\n')
+    const scan = await runScan(root, { ...config, stateDir: state }, 'standard', '', false, state); await saveScan(state, scan)
+    const proposal = await remediationPlan(root, { ...config, stateDir: state }, scan.id, scan.findings[0].id)
+    assert.equal(proposal.safeToApply, false)
+    await assert.rejects(() => applyRemediationProposal(root, { ...config, stateDir: state }, scan.id, proposal.id, true), /No mechanically safe replacement/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

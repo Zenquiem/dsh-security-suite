@@ -17,7 +17,8 @@ const VALIDATION_COMMAND = /^[A-Za-z0-9_./:@=+%, -]+$/
 export interface CommandReceipt { id: string; command: string; cwd: string; exitCode?: number; timedOut: boolean; durationMs: number; stdout: string; stderr: string; snapshotDigest: string; artifactRef?: string }
 export interface CandidateValidationPlan { id: string; scanId: string; candidateId: string; snapshotDigest: string; projectFiles: string[]; commands: Array<{ command: string; reason: string }>; skipped: Array<{ reason: string }>; createdAt: string }
 export interface CandidateValidationPlanRun extends CandidateValidationPlan { approved: true; executedAt: string; receipts: CommandReceipt[]; artifactRef: string }
-export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; createdAt: string; status: 'proposed' | 'applied' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; appliedAt?: string; verificationScanId?: string }
+export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; createdAt: string; status: 'proposed' | 'applied' | 'rolled_back' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; safeToApply: boolean; rationale: string; appliedAt?: string; verificationScanId?: string; rollbackId?: string }
+export interface RemediationRollback { id: string; remediationId: string; scanId: string; file: string; beforeContent: string; beforeSha256: string; appliedSha256: string; appliedSnapshotDigest: string; createdAt: string; status: 'available' | 'rolled_back' | 'stale'; rolledBackAt?: string; verificationScanId?: string }
 
 export interface BulkResult { path: string; scanId?: string; findings?: number; error?: string }
 export interface BulkJob { id: string; createdAt: string; updatedAt: string; mode: 'standard' | 'deep'; threatModel: string; entries: Array<BulkResult & { status: 'pending' | 'completed' | 'failed'; attempts: number }> }
@@ -27,9 +28,12 @@ function safeCommand(command: string): string { const value = command.trim(); if
 function splitCommand(command: string): string[] { return safeCommand(command).split(/\s+/).filter(Boolean) }
 function digest(value: string): string { return createHash('sha256').update(value).digest('hex') }
 function proposalPath(stateDir: string, id: string): string { if (!/^rem_[0-9a-f-]+$/.test(id)) throw new Error('Invalid remediation id.'); return join(stateDir, 'remediations', `${id}.json`) }
+function rollbackPath(stateDir: string, id: string): string { if (!/^rollback_[0-9a-f-]+$/.test(id)) throw new Error('Invalid remediation rollback id.'); return join(stateDir, 'remediation-rollbacks', `${id}.json`) }
 async function atomicWrite(path: string, content: string): Promise<void> { const temporary = `${path}.${randomUUID()}.tmp`; await mkdir(resolve(path, '..'), { recursive: true }); await writeFile(temporary, content, 'utf8'); await rename(temporary, path) }
 async function saveProposal(stateDir: string, proposal: RemediationProposal): Promise<void> { await atomicWrite(proposalPath(stateDir, proposal.id), `${JSON.stringify(proposal, null, 2)}\n`) }
 export async function loadRemediationProposal(stateDir: string, id: string): Promise<RemediationProposal> { return JSON.parse(await readFile(proposalPath(stateDir, id), 'utf8')) as RemediationProposal }
+async function saveRollback(stateDir: string, rollback: RemediationRollback): Promise<void> { await atomicWrite(rollbackPath(stateDir, rollback.id), `${JSON.stringify(rollback, null, 2)}\n`) }
+export async function loadRemediationRollback(stateDir: string, id: string): Promise<RemediationRollback> { return JSON.parse(await readFile(rollbackPath(stateDir, id), 'utf8')) as RemediationRollback }
 function bulkJobPath(stateDir: string, id: string): string { if (!/^bulk_[0-9a-f-]+$/.test(id)) throw new Error('Invalid bulk job id.'); return join(stateDir, 'bulk-jobs', `${id}.json`) }
 async function saveBulkJob(stateDir: string, job: BulkJob): Promise<void> { job.updatedAt = new Date().toISOString(); await atomicWrite(bulkJobPath(stateDir, job.id), `${JSON.stringify(job, null, 2)}\n`) }
 export async function loadBulkJob(stateDir: string, id: string): Promise<BulkJob> { return JSON.parse(await readFile(bulkJobPath(stateDir, id), 'utf8')) as BulkJob }
@@ -193,10 +197,15 @@ export async function installPreCommitHook(workspace: string, approved: boolean)
   return { installed: true, path: hookPath }
 }
 
-function replacementFor(finding: Finding, source: string): string | undefined {
-  if (finding.ruleId === 'tls.verification.disabled') return source.replace(/rejectUnauthorized\s*:\s*false/, 'rejectUnauthorized: true').replace(/verify\s*=\s*False/, 'verify = True').replace(/InsecureSkipVerify\s*:\s*true/, 'InsecureSkipVerify: false')
-  if (finding.ruleId === 'dangerous.dynamic.code') return source.replace(/\beval\s*\(([^)]*)\)/, '/* Replace dynamic evaluation with a fixed operation over validated input: $1 */')
-  if (finding.ruleId === 'hardcoded.secret.marker') return source.replace(/((?:api[_-]?key|secret|password|token|private[_-]?key)\s*[:=]\s*)["'][^"']+["']/i, '$1process.env.APP_SECRET')
+function replacementFor(finding: Finding, source: string): { content: string; rationale: string } | undefined {
+  if (finding.ruleId === 'tls.verification.disabled') {
+    const content = source.replace(/rejectUnauthorized\s*:\s*false/g, 'rejectUnauthorized: true').replace(/verify\s*=\s*False/g, 'verify = True').replace(/InsecureSkipVerify\s*:\s*true/g, 'InsecureSkipVerify: false').replace(/CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)/g, 'CURLOPT_SSL_VERIFYPEER, 1')
+    return content === source ? undefined : { content, rationale: 'This proposal changes only an explicit TLS certificate-verification disablement to its enabled boolean value.' }
+  }
+  if (finding.ruleId === 'jwt.verification.disabled') {
+    const content = source.replace(/(["']?verify_signature["']?\s*[:=]\s*)False/g, '$1True')
+    return content === source ? undefined : { content, rationale: 'This proposal changes only an explicit JWT signature-verification disablement to enabled.' }
+  }
   return undefined
 }
 
@@ -205,9 +214,9 @@ export async function remediationPlan(workspace: string, config: Config, scanId:
   if (!finding) throw new Error('Finding was not found in this scan.')
   const location = finding.locations[0]; const file = resolve(scan.target, location.file); const root = resolve(workspace)
   if (!inside(root, file)) throw new Error('Finding location is outside the active workspace.')
-  const before = await readFile(file, 'utf8'); const after = replacementFor(finding, before)
-  const patch = after && after !== before ? `--- a/${location.file}\n+++ b/${location.file}\n@@ line ${location.line} @@\n- ${location.excerpt}\n+ ${after.split(/\r?\n/)[location.line - 1]?.trim() ?? '<review replacement>'}` : `No mechanically safe replacement is available for ${finding.ruleId}.\nReview ${location.file}:${location.line} and implement: ${finding.remediation}`
-  const proposal: RemediationProposal = { id: `rem_${randomUUID()}`, findingId: finding.id, file: location.file, line: location.line, patch, baseSnapshotDigest: scan.targetSnapshot.snapshotDigest, baseFileSha256: sha256(before), createdAt: new Date().toISOString(), status: 'proposed', requiresApproval: true, requiresReview: true }
+  const before = await readFile(file, 'utf8'); const replacement = replacementFor(finding, before)
+  const patch = replacement ? `--- a/${location.file}\n+++ b/${location.file}\n@@ line ${location.line} @@\n- ${location.excerpt}\n+ ${replacement.content.split(/\r?\n/)[location.line - 1]?.trim() ?? '<review replacement>'}` : `No mechanically safe replacement is available for ${finding.ruleId}.\nReview ${location.file}:${location.line} and implement: ${finding.remediation}`
+  const proposal: RemediationProposal = { id: `rem_${randomUUID()}`, findingId: finding.id, file: location.file, line: location.line, patch, baseSnapshotDigest: scan.targetSnapshot.snapshotDigest, baseFileSha256: sha256(before), createdAt: new Date().toISOString(), status: 'proposed', requiresApproval: true, requiresReview: true, safeToApply: Boolean(replacement), rationale: replacement?.rationale ?? 'The finding requires application-specific review; no semantics-preserving automatic replacement is available.' }
   await saveProposal(getStateDir(config.stateDir), proposal)
   await atomicWrite(join(getStateDir(config.stateDir), 'remediations', `${proposal.id}.json`), `${JSON.stringify(proposal, null, 2)}\n`)
   return proposal
@@ -222,9 +231,24 @@ export async function applyRemediationProposal(workspace: string, config: Config
   const [current, currentSnapshot] = await Promise.all([readFile(file, 'utf8'), snapshotDigestForDirectory(scan.target, config)])
   if (sha256(current) !== proposal.baseFileSha256 || currentSnapshot !== proposal.baseSnapshotDigest) { proposal.status = 'stale'; await saveProposal(getStateDir(config.stateDir), proposal); throw new Error('Remediation proposal is stale because the target snapshot or file changed. Generate a new proposal.') }
   const finding = scan.findings.find(item => item.id === proposal.findingId); if (!finding) throw new Error('Finding was not found in this scan.')
-  const after = replacementFor(finding, current); if (!after || after === current) throw new Error('No mechanically safe replacement is available for this proposal.')
-  await writeFile(file, after, 'utf8'); proposal.status = 'applied'; proposal.appliedAt = new Date().toISOString()
+  const replacement = replacementFor(finding, current); if (!proposal.safeToApply || !replacement || replacement.content === current) throw new Error('No mechanically safe replacement is available for this proposal.')
+  await writeFile(file, replacement.content, 'utf8'); const appliedSnapshotDigest = await snapshotDigestForDirectory(scan.target, config); const rollback: RemediationRollback = { id: `rollback_${randomUUID()}`, remediationId: proposal.id, scanId, file: proposal.file, beforeContent: current, beforeSha256: sha256(current), appliedSha256: sha256(replacement.content), appliedSnapshotDigest, createdAt: new Date().toISOString(), status: 'available' }
+  await saveRollback(getStateDir(config.stateDir), rollback); proposal.status = 'applied'; proposal.appliedAt = new Date().toISOString(); proposal.rollbackId = rollback.id
   const verification = await runScan(scan.target, config, 'standard', scan.threatModel, scan.recipe.scopeRequested, config.stateDir)
   await finalizeAndSaveScan(getStateDir(config.stateDir), verification); proposal.verificationScanId = verification.id; await saveProposal(getStateDir(config.stateDir), proposal)
   return proposal
+}
+
+/** Restore one proposal's exact pre-application content only when its applied state remains intact. */
+export async function rollbackRemediationProposal(workspace: string, config: Config, scanId: string, remediationId: string, approved: boolean): Promise<RemediationRollback> {
+  if (!approved) throw new Error('Rolling back a remediation changes source files. Set approved to true only after reviewing the rollback record.')
+  const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); const proposal = await loadRemediationProposal(state, remediationId)
+  if (proposal.status !== 'applied' || !proposal.rollbackId) throw new Error('Only an applied remediation with an available rollback record can be rolled back.')
+  const rollback = await loadRemediationRollback(state, proposal.rollbackId); if (rollback.remediationId !== proposal.id || rollback.scanId !== scanId || rollback.status !== 'available') throw new Error('Rollback record is unavailable or does not belong to this remediation.')
+  const root = resolve(workspace); const file = resolve(scan.target, rollback.file); if (!inside(root, file)) throw new Error('Rollback target is outside the active workspace.')
+  const [current, snapshot] = await Promise.all([readFile(file, 'utf8'), snapshotDigestForDirectory(scan.target, config)])
+  if (sha256(current) !== rollback.appliedSha256 || snapshot !== rollback.appliedSnapshotDigest) { rollback.status = 'stale'; await saveRollback(state, rollback); throw new Error('Rollback record is stale because the applied file or target snapshot changed.') }
+  await writeFile(file, rollback.beforeContent, 'utf8'); rollback.status = 'rolled_back'; rollback.rolledBackAt = new Date().toISOString()
+  const verification = await runScan(scan.target, config, 'standard', scan.threatModel, scan.recipe.scopeRequested, config.stateDir); await finalizeAndSaveScan(state, verification); rollback.verificationScanId = verification.id; proposal.status = 'rolled_back'; await saveRollback(state, rollback); await saveProposal(state, proposal)
+  return rollback
 }

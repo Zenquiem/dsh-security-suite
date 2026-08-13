@@ -6,7 +6,7 @@ import { SECURITY_REVIEW_GUIDANCE } from './prompt.js'
 import { FULL_SECURITY_WORKFLOW } from './workflows.js'
 import { generateSourceThreatModel, runDiffScan, runScan, resolveSafeTarget } from './scanner.js'
 import { finalizeAndSaveScan, getStateDir, listScans, loadScan, persistInvestigationArtifacts, renderCsv, renderMarkdownReport, saveTriageAnnotation, saveScan, toSarif, verifyScanBundle } from './state.js'
-import { applyRemediationProposal, bulkScan, installPreCommitHook, planCandidateValidation, remediationPlan, rerunSavedScan, resumeBulkJob, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, startBulkCsvJob } from './operations.js'
+import { applyRemediationProposal, bulkScan, installPreCommitHook, planCandidateValidation, remediationPlan, rerunSavedScan, resumeBulkJob, rollbackRemediationProposal, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, startBulkCsvJob } from './operations.js'
 import { cancelInvestigation, claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation, resumeInvestigation } from './workbench.js'
 import { generateHardeningPortfolio, importFindings, triageImportedFinding } from './analysis.js'
 import { createTracking, previewTracking } from './tracking.js'
@@ -327,14 +327,20 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: 'security_remediation_plan', description: 'Generate a review-required patch proposal for one saved finding. It never modifies source files.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Finding identifier.' } },
-    output: { schema: { type: 'object', properties: { id: { type: 'string' }, findingId: { type: 'string' }, file: { type: 'string' }, line: { type: 'number' }, patch: { type: 'string' }, baseSnapshotDigest: { type: 'string' }, status: { type: 'string' }, requiresApproval: { type: 'boolean' }, requiresReview: { type: 'boolean' } }, required: ['id', 'findingId', 'file', 'line', 'patch', 'baseSnapshotDigest', 'status', 'requiresApproval', 'requiresReview'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.patch ?? '' }] },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, findingId: { type: 'string' }, file: { type: 'string' }, line: { type: 'number' }, patch: { type: 'string' }, baseSnapshotDigest: { type: 'string' }, status: { type: 'string' }, requiresApproval: { type: 'boolean' }, requiresReview: { type: 'boolean' }, safeToApply: { type: 'boolean' }, rationale: { type: 'string' } }, required: ['id', 'findingId', 'file', 'line', 'patch', 'baseSnapshotDigest', 'status', 'requiresApproval', 'requiresReview', 'safeToApply', 'rationale'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.patch ?? '' }] },
     async execute(args) { return remediationPlan(process.cwd(), config, args.scan_id, args.finding_id) },
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_apply_remediation', description: 'Apply one generated remediation only after explicit approval. It rejects stale targets, writes the exact safe replacement, then runs a focused native rescan and records the verification scan.', parameters: { scan_id: { type: 'string', required: true, description: 'Source scan identifier.' }, remediation_id: { type: 'string', required: true, description: 'Identifier from security_remediation_plan.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the patch and approving the source change.' } },
-    output: { schema: { type: 'object', properties: { id: { type: 'string' }, findingId: { type: 'string' }, status: { type: 'string' }, appliedAt: { type: 'string' }, verificationScanId: { type: 'string' } }, required: ['id', 'findingId', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    name: 'security_apply_remediation', description: 'Apply one explicitly reviewable safe remediation only after approval. It rejects stale targets, saves an exact rollback record, rescans, and records the verification scan.', parameters: { scan_id: { type: 'string', required: true, description: 'Source scan identifier.' }, remediation_id: { type: 'string', required: true, description: 'Identifier from security_remediation_plan.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the patch and approving the source change.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, findingId: { type: 'string' }, status: { type: 'string' }, appliedAt: { type: 'string' }, verificationScanId: { type: 'string' }, rollbackId: { type: 'string' } }, required: ['id', 'findingId', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args) { return applyRemediationProposal(process.cwd(), config, args.scan_id, args.remediation_id, args.approved) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_rollback_remediation', description: 'Restore the exact pre-application content for one approved remediation only after explicit approval. It refuses a changed applied state, then runs a verification rescan and saves the rollback receipt.', parameters: { scan_id: { type: 'string', required: true, description: 'Source scan identifier.' }, remediation_id: { type: 'string', required: true, description: 'Applied remediation identifier.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the rollback record and approving the source change.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, remediationId: { type: 'string' }, scanId: { type: 'string' }, file: { type: 'string' }, status: { type: 'string' }, rolledBackAt: { type: 'string' }, verificationScanId: { type: 'string' } }, required: ['id', 'remediationId', 'scanId', 'file', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return rollbackRemediationProposal(process.cwd(), config, args.scan_id, args.remediation_id, args.approved) },
   }))
 
   ctx.tools.register(defineTool({
