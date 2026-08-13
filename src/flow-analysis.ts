@@ -1,7 +1,15 @@
+import { dirname, join, normalize } from 'node:path'
 import type { Evidence, Severity } from './contracts.js'
 import type { Candidate } from './scanner.js'
 
 interface FlowRule { id: string; title: string; cwe: string; severity: Severity; rationale: string; sink: RegExp }
+interface FlowModule { file: string; source: string }
+interface FlowFunction { id: string; file: string; name: string; params: string[]; start: number; end: number; lines: string[] }
+interface SinkResult { rule: FlowRule; line: number; excerpt: string }
+interface ImportTarget { file: string; exported: string }
+interface ParsedModule { file: string; source: string; lines: string[]; functions: FlowFunction[]; imports: Map<string, ImportTarget>; namespaces: Map<string, string>; packageKey?: string }
+
+export interface FlowGraphAnalysis { candidates: Candidate[] }
 
 const PYTHON_RULES: FlowRule[] = [
   { id: 'dangerous-dynamic-code', title: 'Dynamic code execution from request data', cwe: 'CWE-95', severity: 'high', rationale: 'Request-derived data reaches Python dynamic evaluation.', sink: /\b(?:eval|exec)\s*\(/ },
@@ -16,17 +24,163 @@ const GO_RULES: FlowRule[] = [
   { id: 'ssrf-request-sink', title: 'Outbound request from request data', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects an outbound network destination.', sink: /\b(?:http\.(?:Get|Post)|client\.Do)\s*\(/ },
 ]
 
-function expressionTainted(expression: string, tainted: Set<string>, sources: RegExp): boolean { return sources.test(expression) || [...tainted].some(name => new RegExp(`\\b${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`).test(expression)) }
-function candidate(rule: FlowRule, file: string, line: number, excerpt: string): Candidate { const evidence: Evidence[] = [{ kind: 'pattern', detail: `Local flow analysis resolved sensitive operation for ${rule.id}.`, location: { file, line, excerpt, role: 'sink' } }, { kind: 'context', detail: 'Local flow analysis resolved request-derived data in the sensitive operation.', location: { file, line, excerpt, role: 'entrypoint' } }]; return { rule: rule.id, severity: rule.severity, file, line, excerpt, rationale: rule.rationale, cwe: rule.cwe, evidence } }
+const PYTHON_SOURCE = /\b(?:request\.(?:args|form|json|data|values|headers)|input\s*\()/i
+const GO_SOURCE = /\b(?:r\.(?:URL\.Query\(\)\.Get|FormValue|PostFormValue)|c\.Query|ctx\.Query)\s*\(/
+const IDENTIFIER = /[A-Za-z_]\w*/g
 
-function analyze(source: string, file: string, rules: FlowRule[], sourcePattern: RegExp, assignment: RegExp): Candidate[] {
-  const lines = source.split(/\r?\n/); const tainted = new Set<string>(); const assigned: Array<{ name: string; expression: string }> = []
-  for (const line of lines) { const match = assignment.exec(line); assignment.lastIndex = 0; if (match) assigned.push({ name: match[1], expression: match[2] }) }
-  for (let pass = 0; pass <= assigned.length; pass++) { let changed = false; for (const item of assigned) if (!tainted.has(item.name) && expressionTainted(item.expression, tainted, sourcePattern)) { tainted.add(item.name); changed = true } if (!changed) break }
-  const candidates: Candidate[] = []
-  for (const [index, line] of lines.entries()) for (const rule of rules) if (rule.sink.test(line) && expressionTainted(line, tainted, sourcePattern)) candidates.push(candidate(rule, file, index + 1, line.trim().slice(0, 240)))
+function escaped(value: string): string { return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') }
+function identifiers(value: string): string[] { return value.match(IDENTIFIER) ?? [] }
+function expressionTainted(expression: string, tainted: Set<string>, sources: RegExp): boolean {
+  sources.lastIndex = 0
+  if (sources.test(expression)) return true
+  return [...tainted].some(name => new RegExp(`\\b${escaped(name)}\\b`).test(expression))
+}
+function evidence(rule: FlowRule, file: string, line: number, excerpt: string, detail: string, propagation?: { file: string; line: number; excerpt: string }): Candidate {
+  const values: Evidence[] = [
+    { kind: 'pattern', detail: `Structured ${detail} resolved sensitive operation for ${rule.id}.`, location: { file, line, excerpt, role: 'sink' } },
+    { kind: 'context', detail: `Structured ${detail} resolved request-derived data in the sensitive operation.`, location: propagation ? { ...propagation, role: 'propagation' } : { file, line, excerpt, role: 'entrypoint' } },
+  ]
+  return { rule: rule.id, severity: rule.severity, file, line, excerpt, rationale: rule.rationale, cwe: rule.cwe, evidence: values }
+}
+
+function assignment(line: string, language: 'python' | 'go'): { name: string; value: string } | undefined {
+  const match = language === 'python' ? /^\s*([A-Za-z_]\w*)\s*=\s*(.+)$/ .exec(line) : /^\s*([A-Za-z_]\w*)\s*:?=\s*(.+)$/ .exec(line)
+  return match ? { name: match[1], value: match[2] } : undefined
+}
+
+function splitArguments(value: string): string[] {
+  const result: string[] = []; let start = 0; let depth = 0; let quote = ''
+  for (let index = 0; index < value.length; index++) {
+    const character = value[index]
+    if (quote) { if (character === quote && value[index - 1] !== '\\') quote = ''; continue }
+    if (character === '"' || character === "'") { quote = character; continue }
+    if (character === '(' || character === '[' || character === '{') depth++
+    if (character === ')' || character === ']' || character === '}') depth--
+    if (character === ',' && depth === 0) { const item = value.slice(start, index).trim(); if (item) result.push(item); start = index + 1 }
+  }
+  const final = value.slice(start).trim(); if (final) result.push(final); return result
+}
+
+function calls(line: string, _language: 'python' | 'go'): Array<{ name: string; args: string[] }> {
+  const result: Array<{ name: string; args: string[] }> = []; const pattern = /\b([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)?)\s*\(/g
+  for (const match of line.matchAll(pattern)) {
+    const open = (match.index ?? 0) + match[0].lastIndexOf('('); let depth = 0; let close = -1; let quote = ''
+    for (let index = open; index < line.length; index++) {
+      const character = line[index]
+      if (quote) { if (character === quote && line[index - 1] !== '\\') quote = ''; continue }
+      if (character === '"' || character === "'") { quote = character; continue }
+      if (character === '(') depth++
+      if (character === ')') { depth--; if (depth === 0) { close = index; break } }
+    }
+    if (close > open) result.push({ name: match[1], args: splitArguments(line.slice(open + 1, close)) })
+  }
+  return result
+}
+
+function candidateKey(item: Candidate): string { return `${item.rule}:${item.file}:${item.line}:${item.excerpt}` }
+
+function pythonFunctions(file: string, source: string): FlowFunction[] {
+  const lines = source.split(/\r?\n/); const starts: Array<{ name: string; params: string[]; start: number; indent: number }> = []
+  for (const [index, value] of lines.entries()) {
+    const match = /^(\s*)(?:async\s+)?def\s+([A-Za-z_]\w*)\s*\(([^)]*)\)\s*(?:->[^:]+)?\s*:/.exec(value)
+    if (!match) continue
+    starts.push({ name: match[2], params: match[3].split(',').map(item => item.trim().replace(/=.*/, '').replace(/^[*]+/, '')).filter(item => /^[A-Za-z_]\w*$/.test(item)), start: index, indent: match[1].length })
+  }
+  return starts.map((item, index) => {
+    let end = lines.length
+    for (let cursor = item.start + 1; cursor < lines.length; cursor++) {
+      const value = lines[cursor]; if (!value.trim() || /^\s*#/.test(value)) continue
+      const indentation = value.match(/^\s*/)?.[0].length ?? 0
+      if (indentation <= item.indent) { end = cursor; break }
+    }
+    return { id: `${file}:${item.name}`, file, name: item.name, params: item.params, start: item.start, end, lines: lines.slice(item.start, end) }
+  })
+}
+
+function goFunctions(file: string, source: string): FlowFunction[] {
+  const lines = source.split(/\r?\n/); const result: FlowFunction[] = []
+  for (const [start, value] of lines.entries()) {
+    const match = /^\s*func\s+(?:\([^)]*\)\s*)?([A-Za-z_]\w*)\s*\(([^)]*)\)/.exec(value); if (!match) continue
+    const params = match[2].split(',').map(item => item.trim().split(/\s+/)[0]).filter(item => /^[A-Za-z_]\w*$/.test(item)); let depth = 0; let opened = false; let end = start + 1
+    for (let cursor = start; cursor < lines.length; cursor++) { for (const character of lines[cursor]) { if (character === '{') { depth++; opened = true }; if (character === '}') depth-- }; if (opened && depth === 0) { end = cursor + 1; break } }
+    result.push({ id: `${file}:${match[1]}`, file, name: match[1], params, start, end, lines: lines.slice(start, end) })
+  }
+  return result
+}
+
+function pythonImports(file: string, source: string, known: Set<string>): { imports: Map<string, ImportTarget>; namespaces: Map<string, string> } {
+  const imports = new Map<string, ImportTarget>(); const namespaces = new Map<string, string>()
+  const resolveModule = (specifier: string): string | undefined => {
+    const levels = /^\.+/.exec(specifier)?.[0].length ?? 0; const plain = specifier.slice(levels).replaceAll('.', '/')
+    let base = dirname(file); for (let level = 1; level < levels; level++) base = dirname(base)
+    const candidate = normalize(join(base, `${plain}.py`)); if (levels && known.has(candidate)) return candidate
+    const modulePath = `${specifier.replace(/^\.+/, '').replaceAll('.', '/')}.py`; const matches = [...known].filter(path => path === modulePath || path.endsWith(`/${modulePath}`))
+    return matches.length === 1 ? matches[0] : undefined
+  }
+  for (const line of source.split(/\r?\n/)) {
+    const from = /^\s*from\s+([.A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)\s+import\s+(.+)$/.exec(line)
+    if (from) { const target = resolveModule(from[1]); if (!target) continue; for (const part of from[2].split(',')) { const [exported, alias] = part.trim().split(/\s+as\s+/); if (/^[A-Za-z_]\w*$/.test(exported)) imports.set(alias ?? exported, { file: target, exported }) }; continue }
+    const direct = /^\s*import\s+([A-Za-z_]\w*(?:\.[A-Za-z_]\w*)*)(?:\s+as\s+([A-Za-z_]\w*))?/.exec(line)
+    if (direct) { const target = resolveModule(direct[1]); if (target) namespaces.set(direct[2] ?? direct[1].split('.').at(-1)!, target) }
+  }
+  return { imports, namespaces }
+}
+
+function goPackage(source: string): string | undefined { return /^\s*package\s+([A-Za-z_]\w*)/m.exec(source)?.[1] }
+
+function resolveCall(module: ParsedModule, call: string, functions: Map<string, FlowFunction>, language: 'python' | 'go'): FlowFunction | undefined {
+  const [receiver, member] = call.includes('.') ? call.split('.', 2) : [undefined, call]
+  if (language === 'python' && receiver) { const target = module.namespaces.get(receiver); return target ? functions.get(`${target}:${member}`) : undefined }
+  if (!receiver) { const imported = module.imports.get(member); if (imported) return functions.get(`${imported.file}:${imported.exported}`); const local = functions.get(`${module.file}:${member}`); if (local) return local; if (language === 'go' && module.packageKey) return functions.get(`${module.packageKey}:${member}`) }
+  return undefined
+}
+
+function summaries(modules: Map<string, ParsedModule>, functions: Map<string, FlowFunction>, language: 'python' | 'go', rules: FlowRule[], sources: RegExp): Map<string, Map<number, SinkResult[]>> {
+  const summary = new Map<string, Map<number, SinkResult[]>>([...functions.values()].map(fn => [fn.id, new Map()]))
+  const add = (fn: FlowFunction, index: number, sink: SinkResult): boolean => { const entries = summary.get(fn.id)?.get(index) ?? []; const key = `${sink.rule.id}:${sink.line}`; if (entries.some(item => `${item.rule.id}:${item.line}` === key)) return false; summary.get(fn.id)?.set(index, [...entries, sink]); return true }
+  for (let pass = 0; pass < functions.size * Math.max(2, functions.size) + 1; pass++) {
+    let changed = false
+    for (const fn of functions.values()) for (const [index, parameter] of fn.params.entries()) {
+      const tainted = new Set([parameter]); const assigns: Array<{ name: string; value: string }> = []
+      for (const value of fn.lines) { const item = assignment(value, language); if (item) assigns.push(item) }
+      for (let fixpoint = 0; fixpoint <= assigns.length; fixpoint++) { let propagated = false; for (const item of assigns) if (!tainted.has(item.name) && expressionTainted(item.value, tainted, sources)) { tainted.add(item.name); propagated = true }; if (!propagated) break }
+      const module = modules.get(fn.file); if (!module) continue
+      for (const [offset, value] of fn.lines.entries()) {
+        for (const rule of rules) { rule.sink.lastIndex = 0; if (rule.sink.test(value) && expressionTainted(value, tainted, sources)) changed = add(fn, index, { rule, line: fn.start + offset + 1, excerpt: value.trim().slice(0, 240) }) || changed }
+        for (const call of calls(value, language)) { const target = resolveCall(module, call.name, functions, language); if (!target) continue; for (const [targetIndex] of target.params.entries()) if (call.args[targetIndex] && expressionTainted(call.args[targetIndex], tainted, sources)) for (const sink of summary.get(target.id)?.get(targetIndex) ?? []) changed = add(fn, index, sink) || changed }
+      }
+    }
+    if (!changed) break
+  }
+  return summary
+}
+
+function graph(inputs: FlowModule[], language: 'python' | 'go'): FlowGraphAnalysis {
+  const extension = language === 'python' ? '.py' : '.go'; const normalized = inputs.filter(input => input.file.endsWith(extension)).map(input => ({ ...input, file: normalize(input.file) })); const known = new Set(normalized.map(input => input.file)); const modules = new Map<string, ParsedModule>()
+  for (const input of normalized) { const parsed = language === 'python' ? pythonFunctions(input.file, input.source) : goFunctions(input.file, input.source); const imports = language === 'python' ? pythonImports(input.file, input.source, known) : { imports: new Map<string, ImportTarget>(), namespaces: new Map<string, string>() }; const packageName = language === 'go' ? goPackage(input.source) : undefined; modules.set(input.file, { file: input.file, source: input.source, lines: input.source.split(/\r?\n/), functions: parsed, imports: imports.imports, namespaces: imports.namespaces, packageKey: packageName ? `${normalize(dirname(input.file))}:${packageName}` : undefined }) }
+  const functions = new Map<string, FlowFunction>(); for (const module of modules.values()) for (const fn of module.functions) { functions.set(fn.id, fn); if (language === 'go' && module.packageKey) functions.set(`${module.packageKey}:${fn.name}`, fn) }
+  const rules = language === 'python' ? PYTHON_RULES : GO_RULES; const sources = language === 'python' ? PYTHON_SOURCE : GO_SOURCE; const summary = summaries(modules, functions, language, rules, sources); const candidates: Candidate[] = []
+  for (const module of modules.values()) {
+    const tainted = new Set<string>(); const assigns: Array<{ name: string; value: string }> = []
+    for (const value of module.lines) { const item = assignment(value, language); if (item) assigns.push(item) }
+    for (let pass = 0; pass <= assigns.length; pass++) { let changed = false; for (const item of assigns) if (!tainted.has(item.name) && expressionTainted(item.value, tainted, sources)) { tainted.add(item.name); changed = true }; if (!changed) break }
+    for (const [index, value] of module.lines.entries()) for (const call of calls(value, language)) {
+      const target = resolveCall(module, call.name, functions, language); if (!target) continue
+      for (const [parameter] of target.params.entries()) if (call.args[parameter] && expressionTainted(call.args[parameter], tainted, sources)) for (const sink of summary.get(target.id)?.get(parameter) ?? []) candidates.push(evidence(sink.rule, target.file, sink.line, sink.excerpt, `${language} cross-function data-flow`, { file: module.file, line: index + 1, excerpt: value.trim().slice(0, 240) }))
+    }
+  }
+  const unique = new Map<string, Candidate>(); for (const item of candidates) unique.set(candidateKey(item), item); return { candidates: [...unique.values()] }
+}
+
+function local(source: string, file: string, language: 'python' | 'go'): Candidate[] {
+  const rules = language === 'python' ? PYTHON_RULES : GO_RULES; const sources = language === 'python' ? PYTHON_SOURCE : GO_SOURCE; const lines = source.split(/\r?\n/); const tainted = new Set<string>(); const assigned: Array<{ name: string; value: string }> = []
+  for (const value of lines) { const item = assignment(value, language); if (item) assigned.push(item) }
+  for (let pass = 0; pass <= assigned.length; pass++) { let changed = false; for (const item of assigned) if (!tainted.has(item.name) && expressionTainted(item.value, tainted, sources)) { tainted.add(item.name); changed = true }; if (!changed) break }
+  const candidates: Candidate[] = []; for (const [index, value] of lines.entries()) for (const rule of rules) { rule.sink.lastIndex = 0; if (rule.sink.test(value) && expressionTainted(value, tainted, sources)) candidates.push(evidence(rule, file, index + 1, value.trim().slice(0, 240), `${language} local data-flow`)) }
   return candidates
 }
 
-export function analyzePythonFlow(source: string, file: string): Candidate[] { return analyze(source, file, PYTHON_RULES, /\b(?:request\.(?:args|form|json|data|values|headers)|input\s*\()/i, /^\s*([A-Za-z_]\w*)\s*=\s*(.+)$/) }
-export function analyzeGoFlow(source: string, file: string): Candidate[] { return analyze(source, file, GO_RULES, /\b(?:r\.(?:URL\.Query\(\)\.Get|FormValue|PostFormValue)|c\.Query|ctx\.Query)\s*\(/, /^\s*([A-Za-z_]\w*)\s*:?=\s*(.+)$/) }
+export function analyzePythonFlow(source: string, file: string): Candidate[] { return local(source, file, 'python') }
+export function analyzeGoFlow(source: string, file: string): Candidate[] { return local(source, file, 'go') }
+export function analyzePythonModuleGraph(inputs: FlowModule[]): FlowGraphAnalysis { return graph(inputs, 'python') }
+export function analyzeGoPackageGraph(inputs: FlowModule[]): FlowGraphAnalysis { return graph(inputs, 'go') }

@@ -6,7 +6,7 @@ import { promisify } from 'node:util'
 import type { CandidateDisposition, Confidence, Evidence, FileReceipt, Finding, Preflight, RuleReceipt, ScanActivity, ScanRecord, Severity, TargetSnapshot } from './contracts.js'
 import { candidateId, createScanId, findingId, getStateDir, scanArtifactDir, sealScan, sha256 } from './state.js'
 import { analyzeJavaScriptAst, analyzeJavaScriptModuleGraph, type JavaScriptModule } from './ast-analysis.js'
-import { analyzeGoFlow, analyzePythonFlow } from './flow-analysis.js'
+import { analyzeGoFlow, analyzeGoPackageGraph, analyzePythonFlow, analyzePythonModuleGraph } from './flow-analysis.js'
 
 export interface ScanLimits { maxFiles: number; maxFileBytes: number }
 export interface Candidate { rule: string; severity: Severity; file: string; line: number; excerpt: string; rationale: string; cwe: string; evidence: Evidence[] }
@@ -85,7 +85,7 @@ function analyzeText(root: string, file: string, content: string, pass: string, 
 }
 
 export async function assessDirectory(directory: string, limits: ScanLimits, deep = false): Promise<ScanResult> {
-  const root = resolve(directory); const { files, skipped, complete } = await collectFiles(root, limits); const candidates: Candidate[] = []; const ruleReceipts: RuleReceipt[] = []; const fileReceipts: FileReceipt[] = []; const policyFiles: string[] = []; const modules: JavaScriptModule[] = []; const passes = deep ? [['baseline', undefined], ['injection', new Set(['dangerous-dynamic-code', 'shell-command-construction', 'unsafe-deserialization'])], ['boundaries', new Set(['path-traversal-sink', 'ssrf-request-sink', 'tls-verification-disabled', 'weak-randomness-security', 'hardcoded-secret-marker'])]] as const : [['baseline', undefined]] as const
+  const root = resolve(directory); const { files, skipped, complete } = await collectFiles(root, limits); const candidates: Candidate[] = []; const ruleReceipts: RuleReceipt[] = []; const fileReceipts: FileReceipt[] = []; const policyFiles: string[] = []; const modules: JavaScriptModule[] = []; const pythonModules: Array<{ file: string; source: string }> = []; const goModules: Array<{ file: string; source: string }> = []; const passes = deep ? [['baseline', undefined], ['injection', new Set(['dangerous-dynamic-code', 'shell-command-construction', 'unsafe-deserialization'])], ['boundaries', new Set(['path-traversal-sink', 'ssrf-request-sink', 'tls-verification-disabled', 'weak-randomness-security', 'hardcoded-secret-marker'])]] as const : [['baseline', undefined]] as const
   for (const file of files) {
     const content = await readFile(file, 'utf8'); const rel = relative(root, file)
     fileReceipts.push({ path: rel, bytes: Buffer.byteLength(content, 'utf8'), sha256: hash(content), language: languageFor(file) })
@@ -98,12 +98,18 @@ export async function assessDirectory(directory: string, limits: ScanLimits, dee
       ruleReceipts.push({ ruleId: 'ast.local-taint', pass: 'semantic', matches: ast.candidates.length })
       if (ast.parseError) ruleReceipts.push({ ruleId: 'ast.parse-error', pass: 'semantic', matches: 1 })
     }
-    if (extname(file) === '.py') { const semantic = analyzePythonFlow(content, rel); candidates.push(...semantic); ruleReceipts.push({ ruleId: 'python.local-taint', pass: 'semantic', matches: semantic.length }) }
-    if (extname(file) === '.go') { const semantic = analyzeGoFlow(content, rel); candidates.push(...semantic); ruleReceipts.push({ ruleId: 'go.local-taint', pass: 'semantic', matches: semantic.length }) }
+    if (extname(file) === '.py') { const semantic = analyzePythonFlow(content, rel); candidates.push(...semantic); pythonModules.push({ file: rel, source: content }); ruleReceipts.push({ ruleId: 'python.local-taint', pass: 'semantic', matches: semantic.length }) }
+    if (extname(file) === '.go') { const semantic = analyzeGoFlow(content, rel); candidates.push(...semantic); goModules.push({ file: rel, source: content }); ruleReceipts.push({ ruleId: 'go.local-taint', pass: 'semantic', matches: semantic.length }) }
   }
   const moduleGraph = analyzeJavaScriptModuleGraph(modules)
   candidates.push(...moduleGraph.candidates)
   ruleReceipts.push({ ruleId: 'ast.cross-module-taint', pass: 'semantic', matches: moduleGraph.candidates.length })
+  const pythonGraph = analyzePythonModuleGraph(pythonModules)
+  candidates.push(...pythonGraph.candidates)
+  ruleReceipts.push({ ruleId: 'python.cross-module-taint', pass: 'semantic', matches: pythonGraph.candidates.length })
+  const goGraph = analyzeGoPackageGraph(goModules)
+  candidates.push(...goGraph.candidates)
+  ruleReceipts.push({ ruleId: 'go.cross-file-taint', pass: 'semantic', matches: goGraph.candidates.length })
   return { root, filesScanned: files.length, filesSkipped: skipped, candidates, receipts: fileReceipts, ruleReceipts, policyFiles, complete }
 }
 

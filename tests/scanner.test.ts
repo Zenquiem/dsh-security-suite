@@ -36,6 +36,21 @@ test('directory assessment records cross-module JavaScript data-flow evidence', 
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment records Python and Go cross-file data-flow evidence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'route.py'), 'from runner import execute\ndef route():\n    execute(request.args.get("cmd"))\n')
+    await writeFile(join(root, 'runner.py'), 'import subprocess\ndef execute(command):\n    subprocess.run(command, shell=True)\n')
+    await writeFile(join(root, 'route.go'), 'package app\nfunc Route(r Request) { Execute(r.FormValue("cmd")) }\n')
+    await writeFile(join(root, 'runner.go'), 'package app\nfunc Execute(command string) { exec.Command("sh", "-c", command) }\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    assert.equal(result.candidates.some(item => item.rule === 'shell-command-construction' && item.file === 'runner.py' && item.evidence.some(evidence => evidence.detail.includes('cross-function'))), true)
+    assert.equal(result.candidates.some(item => item.rule === 'shell-command-construction' && item.file === 'runner.go' && item.evidence.some(evidence => evidence.detail.includes('cross-function'))), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'python.cross-module-taint' && item.matches === 1), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'go.cross-file-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('resolveSafeTarget rejects paths outside the workspace', () => {
   assert.throws(() => resolveSafeTarget('/workspace', '../outside'), /inside the current workspace/)
 })
