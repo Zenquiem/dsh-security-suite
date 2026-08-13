@@ -54,6 +54,19 @@ test('directory assessment records cross-module CommonJS data-flow evidence', as
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment follows a CommonJS default function export', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await mkdir(join(root, 'lib'))
+    await writeFile(join(root, 'route.cjs'), "const execute = require('./lib/runner')\nfunction route(req) { execute(req.query.command) }\n")
+    await writeFile(join(root, 'lib', 'runner.cjs'), 'function execute(command) { exec(command) }\nmodule.exports = execute\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidate = result.candidates.find(item => item.rule === 'shell-command-construction' && item.file === 'lib/runner.cjs')
+    assert.ok(candidate)
+    assert.equal(candidate.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('scan findings preserve structured entrypoint, propagation, and sink locations from native flow evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))

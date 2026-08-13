@@ -189,7 +189,13 @@ function isModuleExports(node: AstNode | undefined): boolean { return memberName
 
 function addCommonJsImport(target: string, pattern: AstNode | undefined, imports: Map<string, { file: string; exported: string }>, namespaces: Map<string, string>): void {
   if (!pattern) return
-  if (pattern.type === 'Identifier') { namespaces.set(String(pattern.name), target); return }
+  if (pattern.type === 'Identifier') {
+    const local = String(pattern.name)
+    // The binding may be invoked as a default-exported function or accessed as a namespace.
+    namespaces.set(local, target)
+    imports.set(local, { file: target, exported: 'default' })
+    return
+  }
   if (pattern.type !== 'ObjectPattern') return
   for (const property of (pattern.properties ?? []) as AstNode[]) {
     if (property.type !== 'Property') continue

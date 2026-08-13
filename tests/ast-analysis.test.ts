@@ -99,3 +99,14 @@ test('AST module analysis resolves static CommonJS object and default exports wi
   assert.equal(result.candidates.length, 1)
   assert.equal(result.candidates[0]?.file, 'runner.js')
 })
+
+test('AST module analysis follows a static CommonJS default function export', () => {
+  const result = analyzeJavaScriptModuleGraph([
+    { file: 'route.cjs', source: "const execute = require('./runner')\nfunction route(req) { execute(req.query.command) }\n" },
+    { file: 'runner.cjs', source: 'function execute(command) { exec(command) }\nmodule.exports = execute\n' },
+  ])
+  assert.deepEqual(result.parseErrors, [])
+  assert.equal(result.candidates.length, 1)
+  assert.equal(result.candidates[0]?.file, 'runner.cjs')
+  assert.equal(result.candidates[0]?.evidence.some(item => item.detail.includes('cross-module call-chain')), true)
+})
