@@ -15,11 +15,12 @@ const WORKERS_PER_ROUND = 6
 const jobWrites = new Map<string, Promise<void>>()
 export interface DeepCandidateInput { ruleId: string; title: string; severity: Severity; cwe: string; file: string; line: number; rootCause: string }
 export interface DeepCandidate extends DeepCandidateInput { id: string; workerId: string; workerIds: string[]; reportIds: string[]; excerpt: string; fingerprint: string; reportedAt: string }
-export interface DeepWorkerReport { threatModel: string; reviewedPaths: string[]; deferred: Array<{ path: string; reason: string }>; coverageSummary: string; reportedAt: string }
+export interface DeepWorkerReport { threatModel: string; reviewedWorkItemIds: string[]; deferred: Array<{ workItemId: string; reason: string }>; coverageSummary: string; reportedAt: string }
 export type DeepReviewLens = 'entrypoints_and_authorization' | 'injection_and_execution' | 'data_and_serialization' | 'network_and_trust_boundaries' | 'secrets_and_cryptography' | 'build_and_supply_chain'
 export interface DeepWorker { id: string; round: number; lens?: DeepReviewLens; status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed'; token: string; sessionId?: string; transcript?: string; error?: string; candidateIds: string[]; report?: DeepWorkerReport }
 export interface DeepRound { number: number; workerIds: string[]; candidateCount: number; novelty: number; status: 'running' | 'complete' | 'incomplete'; artifactRefs?: string[] }
-export interface DeepWorkItem { path: string; sha256: string; language: string; priority: number; riskSignals: string[] }
+/** An immutable, bounded source region. IDs deliberately bind file, snapshot, and range. */
+export interface DeepWorkItem { id: string; path: string; sha256: string; language: string; startLine: number; endLine: number; priority: number; riskSignals: string[] }
 export interface CanonicalThreatModel { artifactRef: string; digest: string; workerIds: string[]; createdAt: string }
 export interface DeepDiscoveryJob { id: string; scanId: string; target: string; createdAt: string; updatedAt: string; lifecycle: 'queued' | 'running' | 'saturated' | 'capped' | 'incomplete' | 'cancelled' | 'failed'; maxRounds: number; worklist: DeepWorkItem[]; worklistDigest: string; rounds: DeepRound[]; workers: DeepWorker[]; candidates: DeepCandidate[]; canonicalThreatModel?: CanonicalThreatModel }
 
@@ -54,7 +55,8 @@ async function atomic(path: string, content: string): Promise<void> { await mkdi
 async function save(state: string, job: DeepDiscoveryJob): Promise<void> { job.updatedAt = new Date().toISOString(); await atomic(jobPath(state, job.id), `${JSON.stringify(job, null, 2)}\n`) }
 export async function loadDeepDiscoveryJob(config: Config, id: string): Promise<DeepDiscoveryJob> {
   const job = JSON.parse(await readFile(jobPath(getStateDir(config.stateDir), id), 'utf8')) as DeepDiscoveryJob
-  // Jobs written before prioritization remain resumable, with an explicitly neutral score.
+  // Old path-level jobs cannot provide region-level closure, so make their gap explicit.
+  if (job.worklist.some(item => !item.id || !Number.isInteger(item.startLine) || !Number.isInteger(item.endLine))) throw new Error('This deep-discovery job predates region-level coverage. Start a new deep discovery job from the saved scan.')
   job.worklist = job.worklist.map(item => ({ ...item, priority: Number.isFinite(item.priority) ? item.priority : 0, riskSignals: Array.isArray(item.riskSignals) ? item.riskSignals : [] }))
   return job
 }
@@ -94,10 +96,14 @@ async function prioritizedWorklist(scan: ScanRecord): Promise<DeepWorkItem[]> {
   const rows = await Promise.all(scan.coverage.receipts.map(async receipt => {
     const source = resolve(scan.target, receipt.path); if (!inside(scan.target, source)) throw new Error('Scan receipt path is outside the scan target.')
     const content = await readFile(source, 'utf8'); if (sha256(content) !== receipt.sha256) throw new Error(`Source file changed after scan receipt: ${receipt.path}. Create a follow-up scan before deep discovery.`)
-    const signals = riskSignals(receipt.path, content)
-    return { path: receipt.path, sha256: receipt.sha256, language: receipt.language, priority: signals.length, riskSignals: signals }
+    const lines = content.split(/\r?\n/); if (lines.length > 1 && lines.at(-1) === '') lines.pop(); const regions: DeepWorkItem[] = []
+    for (let start = 1; start <= Math.max(1, lines.length); start += 200) {
+      const end = Math.min(lines.length || 1, start + 199); const region = lines.slice(start - 1, end).join('\n'); const signals = riskSignals(receipt.path, region)
+      regions.push({ id: `region_${sha256(`${receipt.path}:${receipt.sha256}:${start}:${end}`).slice(0, 24)}`, path: receipt.path, sha256: receipt.sha256, language: receipt.language, startLine: start, endLine: end, priority: signals.length * 100 + (start === 1 ? 1 : 0), riskSignals: signals })
+    }
+    return regions
   }))
-  return rows.sort((left, right) => right.priority - left.priority || left.path.localeCompare(right.path))
+  return rows.flat().sort((left, right) => right.priority - left.priority || left.path.localeCompare(right.path) || left.startLine - right.startLine)
 }
 
 export async function createDeepDiscoveryJob(config: Config, scanId: string, maxRounds = 10): Promise<DeepDiscoveryJob> {
@@ -116,6 +122,7 @@ export async function reportDeepCandidate(config: Config, jobId: string, workerI
     if (job.lifecycle !== 'running') throw new Error('Deep discovery job is not accepting candidates.')
     const worker = job.workers.find(item => item.id === workerId); if (!worker || worker.token !== token || worker.status !== 'running') throw new Error('Deep discovery worker claim is invalid.')
     if (!/^[a-z][a-z0-9.-]{2,100}$/.test(input.ruleId) || !input.title.trim() || !input.cwe.trim() || !Number.isInteger(input.line) || input.line < 1) throw new Error('Candidate fields are invalid.')
+    const workItem = job.worklist.find(item => item.path === input.file && input.line >= item.startLine && input.line <= item.endLine); if (!workItem) throw new Error('Candidate location is outside the authoritative deep-discovery worklist region.')
     const source = resolve(job.target, input.file); if (!inside(job.target, source)) throw new Error('Candidate location is outside the deep-scan target.')
     const lines = (await readFile(source, 'utf8')).split(/\r?\n/); const excerpt = lines[input.line - 1]?.trim().slice(0, 240); if (!excerpt) throw new Error('Candidate location does not identify a readable source line.')
     const fingerprint = sha256(`${input.ruleId}:${input.file}:${excerpt.replace(/\s+/g, ' ')}`); const reportId = `deepreport_${sha256(`${job.id}:${workerId}:${fingerprint}`).slice(0, 24)}`; const existing = job.candidates.find(item => item.fingerprint === fingerprint)
@@ -124,17 +131,17 @@ export async function reportDeepCandidate(config: Config, jobId: string, workerI
   })
 }
 
-export async function reportDeepWorker(config: Config, jobId: string, workerId: string, token: string, input: { threatModel: string; reviewedPaths: string[]; deferred: Array<{ path: string; reason: string }>; coverageSummary: string }): Promise<DeepWorkerReport> {
+export async function reportDeepWorker(config: Config, jobId: string, workerId: string, token: string, input: { threatModel: string; reviewedWorkItemIds: string[]; deferred: Array<{ workItemId: string; reason: string }>; coverageSummary: string }): Promise<DeepWorkerReport> {
   return updateJob(config, jobId, job => {
     if (job.lifecycle !== 'running') throw new Error('Deep discovery job is not accepting worker reports.')
     const worker = job.workers.find(item => item.id === workerId); if (!worker || worker.token !== token || worker.status !== 'running') throw new Error('Deep discovery worker claim is invalid.')
     if (input.threatModel.trim().length < 40 || input.coverageSummary.trim().length < 10) throw new Error('Worker threat model and coverage summary must contain substantive evidence.')
-    const required = new Set(job.worklist.map(item => item.path)); const reviewed = new Set(input.reviewedPaths)
-    const deferred = new Map(input.deferred.map(item => [item.path, item.reason.trim()] as const))
-    if ([...reviewed].some(path => !required.has(path)) || [...deferred.keys()].some(path => !required.has(path))) throw new Error('Worker coverage report contains a path outside the authoritative worklist.')
-    for (const path of required) if (!reviewed.has(path) && !deferred.has(path)) throw new Error(`Worker coverage report leaves authoritative worklist path unclosed: ${path}`)
-    if ([...deferred.values()].some(reason => reason.length < 3)) throw new Error('Deferred worklist paths require a concrete reason.')
-    const report: DeepWorkerReport = { threatModel: input.threatModel.trim().slice(0, 100_000), reviewedPaths: [...reviewed].sort(), deferred: [...deferred.entries()].map(([path, reason]) => ({ path, reason })).sort((left, right) => left.path.localeCompare(right.path)), coverageSummary: input.coverageSummary.trim().slice(0, 20_000), reportedAt: new Date().toISOString() }
+    const required = new Set(job.worklist.map(item => item.id)); const reviewed = new Set(input.reviewedWorkItemIds)
+    const deferred = new Map(input.deferred.map(item => [item.workItemId, item.reason.trim()] as const))
+    if ([...reviewed].some(id => !required.has(id)) || [...deferred.keys()].some(id => !required.has(id))) throw new Error('Worker coverage report contains a region outside the authoritative worklist.')
+    for (const id of required) if (!reviewed.has(id) && !deferred.has(id)) throw new Error(`Worker coverage report leaves authoritative worklist region unclosed: ${id}`)
+    if ([...deferred.values()].some(reason => reason.length < 3)) throw new Error('Deferred worklist regions require a concrete reason.')
+    const report: DeepWorkerReport = { threatModel: input.threatModel.trim().slice(0, 100_000), reviewedWorkItemIds: [...reviewed].sort(), deferred: [...deferred.entries()].map(([workItemId, reason]) => ({ workItemId, reason })).sort((left, right) => left.workItemId.localeCompare(right.workItemId)), coverageSummary: input.coverageSummary.trim().slice(0, 20_000), reportedAt: new Date().toISOString() }
     worker.report = report; return report
   })
 }
@@ -151,13 +158,12 @@ export async function getDeepWorklist(config: Config, jobId: string, workerId: s
   return { digest: job.worklistDigest, items: job.worklist }
 }
 
-export async function readDeepSource(config: Config, jobId: string, workerId: string, token: string, path: string, startLine = 1, endLine = 400): Promise<{ path: string; startLine: number; endLine: number; content: string; sha256: string }> {
+export async function readDeepSource(config: Config, jobId: string, workerId: string, token: string, workItemId: string): Promise<{ id: string; path: string; startLine: number; endLine: number; content: string; sha256: string }> {
   const job = await loadDeepDiscoveryJob(config, jobId); activeWorker(job, workerId, token)
-  const item = job.worklist.find(row => row.path === path); if (!item) throw new Error('Source path is not in the authoritative deep-discovery worklist.')
-  const start = Math.max(1, Math.floor(startLine)); const end = Math.max(start, Math.min(start + 399, Math.floor(endLine)))
+  const item = job.worklist.find(row => row.id === workItemId); if (!item) throw new Error('Source region is not in the authoritative deep-discovery worklist.')
   const source = resolve(job.target, item.path); if (!inside(job.target, source)) throw new Error('Source path is outside the deep-scan target.')
   const content = await readFile(source, 'utf8'); const digest = sha256(content); if (digest !== item.sha256) throw new Error('Source file changed after the authoritative deep-discovery worklist was created.')
-  const lines = content.split(/\r?\n/); return { path: item.path, startLine: start, endLine: Math.min(end, lines.length), content: lines.slice(start - 1, end).join('\n'), sha256: digest }
+  const lines = content.split(/\r?\n/); return { id: item.id, path: item.path, startLine: item.startLine, endLine: item.endLine, content: lines.slice(item.startLine - 1, item.endLine).join('\n'), sha256: digest }
 }
 
 /** Read a bounded, scan-receipted source range for centralized deep validation or attack-path workers. */
@@ -171,7 +177,7 @@ export async function readScanSource(config: Config, scanId: string, path: strin
 }
 
 function transcript(agent: { session: { deriveMessages(): Array<{ role: string; content: Array<{ type: string; text?: string }> }> } }): string { return agent.session.deriveMessages().filter(message => message.role === 'assistant').flatMap(message => message.content.filter(block => block.type === 'text' || block.type === 'reasoning').map(block => block.text ?? '')).join('\n\n').slice(-200_000) }
-function brief(job: DeepDiscoveryJob, worker: DeepWorker): string { const lens = worker.lens ? `${worker.lens}: ${LENS_GUIDANCE[worker.lens]}` : 'legacy neutral review lens'; return `You are one of six independent DSH security discovery workers. Your assigned independent review lens is ${lens} You have exactly four DSH tools: security_deep_get_worklist, security_deep_read_source, security_deep_report_candidate, and security_deep_report_worker. Do not modify source, validate or fix findings, or use external services. Call security_deep_get_worklist with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}; confirm its digest is ${job.worklistDigest}; then inspect every returned path with security_deep_read_source in descending priority order, using risk signals as review leads rather than proof. Independently create a source-evidenced worker threat model; do not use another worker's analysis. For every distinct candidate with a concrete local source line, call security_deep_report_candidate with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, stable rule_id, title, severity, CWE, workspace-relative file, line, and root_cause. When all worklist rows are closed, call security_deep_report_worker with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, your worker threat model, every reviewed path, explicit deferred rows with reasons, and a coverage summary. A worker run without that report is incomplete. Report only candidates you can support with source evidence.` }
+function brief(job: DeepDiscoveryJob, worker: DeepWorker): string { const lens = worker.lens ? `${worker.lens}: ${LENS_GUIDANCE[worker.lens]}` : 'legacy neutral review lens'; return `You are one of six independent DSH security discovery workers. Your assigned independent review lens is ${lens} You have exactly four DSH tools: security_deep_get_worklist, security_deep_read_source, security_deep_report_candidate, and security_deep_report_worker. Do not modify source, validate or fix findings, or use external services. Call security_deep_get_worklist with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}; confirm its digest is ${job.worklistDigest}; then inspect every returned immutable source region with security_deep_read_source by work_item_id in descending priority order, using risk signals as review leads rather than proof. Independently create a source-evidenced worker threat model; do not use another worker's analysis. For every distinct candidate with a concrete local source line, call security_deep_report_candidate with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, stable rule_id, title, severity, CWE, workspace-relative file, line, and root_cause. When all worklist regions are closed, call security_deep_report_worker with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, your worker threat model, every reviewed_work_item_id, explicit deferred work_item_id rows with reasons, and a coverage summary. A worker run without that report is incomplete. Report only candidates you can support with source evidence.` }
 
 function cancelled(signal: AbortSignal | undefined): boolean { return signal?.aborted === true }
 
@@ -230,13 +236,13 @@ async function persistRoundArtifacts(scan: ScanRecord, job: DeepDiscoveryJob, ro
     const base = `artifacts/02_discovery/deep/round-${String(round.number).padStart(2, '0')}/${worker.id}`; const report = worker.report
     if (!report) continue
     refs.push(await writeArtifact(scan, `${base}/threat_model.md`, `${report.threatModel}\n`))
-    refs.push(await writeArtifact(scan, `${base}/coverage.json`, `${JSON.stringify({ worklistDigest: job.worklistDigest, reviewedPaths: report.reviewedPaths, deferred: report.deferred, summary: report.coverageSummary }, null, 2)}\n`))
+    refs.push(await writeArtifact(scan, `${base}/coverage.json`, `${JSON.stringify({ worklistDigest: job.worklistDigest, reviewedWorkItemIds: report.reviewedWorkItemIds, deferred: report.deferred, summary: report.coverageSummary }, null, 2)}\n`))
     const candidates = job.candidates.filter(candidate => candidate.workerIds.includes(worker.id))
     refs.push(await writeArtifact(scan, `${base}/candidates.jsonl`, `${candidates.map(candidate => JSON.stringify(candidate)).join('\n')}\n`))
-    refs.push(await writeArtifact(scan, `${base}/summary.md`, `# Deep Discovery Worker ${worker.id}\n\n- Status: ${worker.status}\n- Reviewed: ${report.reviewedPaths.length}\n- Deferred: ${report.deferred.length}\n- Candidates: ${candidates.length}\n\n${report.coverageSummary}\n`))
+    refs.push(await writeArtifact(scan, `${base}/summary.md`, `# Deep Discovery Worker ${worker.id}\n\n- Status: ${worker.status}\n- Reviewed regions: ${report.reviewedWorkItemIds.length}\n- Deferred regions: ${report.deferred.length}\n- Candidates: ${candidates.length}\n\n${report.coverageSummary}\n`))
     if (worker.transcript) refs.push(await writeArtifact(scan, `${base}/transcript.md`, `${worker.transcript}\n`))
   }
-  const ledger = job.workers.filter(worker => worker.round <= round.number).map(worker => JSON.stringify({ round: worker.round, workerId: worker.id, status: worker.status, hasReport: Boolean(worker.report), reviewed: worker.report?.reviewedPaths.length ?? 0, deferred: worker.report?.deferred.length ?? 0, candidateIds: worker.candidateIds })).join('\n')
+  const ledger = job.workers.filter(worker => worker.round <= round.number).map(worker => JSON.stringify({ round: worker.round, workerId: worker.id, status: worker.status, hasReport: Boolean(worker.report), reviewedRegions: worker.report?.reviewedWorkItemIds.length ?? 0, deferredRegions: worker.report?.deferred.length ?? 0, candidateIds: worker.candidateIds })).join('\n')
   refs.push(await writeArtifact(scan, 'artifacts/02_discovery/work_ledger.jsonl', `${ledger}\n`))
   const canonical = job.candidates.map(candidate => ({ id: candidate.id, fingerprint: candidate.fingerprint, ruleId: candidate.ruleId, title: candidate.title, file: candidate.file, line: candidate.line, workerIds: candidate.workerIds, reportIds: candidate.reportIds }))
   const merge = { jobId: job.id, round: round.number, workers: workers.map(worker => ({ id: worker.id, status: worker.status, report: Boolean(worker.report), candidateIds: worker.candidateIds })), canonicalCandidates: canonical, novelty: round.novelty }
@@ -244,12 +250,12 @@ async function persistRoundArtifacts(scan: ScanRecord, job: DeepDiscoveryJob, ro
   refs.push(await writeArtifact(scan, 'artifacts/04_reconciliation/deduped_candidates.jsonl', `${canonical.map(candidate => JSON.stringify(candidate)).join('\n')}\n`))
   refs.push(await writeArtifact(scan, 'artifacts/04_reconciliation/dedupe_report.md', `# Deep Discovery Reconciliation\n\n- Job: \`${job.id}\`\n- Completed rounds: ${job.rounds.filter(item => item.status === 'complete').length}\n- Canonical candidates: ${canonical.length}\n\n${canonical.map(candidate => `- \`${candidate.id}\`: ${candidate.ruleId} at ${candidate.file}:${candidate.line}; absorbed workers ${candidate.workerIds.join(', ')}.`).join('\n')}\n`))
   const closures = job.worklist.map(item => {
-    const completed = workers.filter(worker => worker.report?.reviewedPaths.includes(item.path)).map(worker => worker.id)
-    const deferred = workers.flatMap(worker => worker.report?.deferred.filter(row => row.path === item.path).map(row => `${worker.id}: ${row.reason}`) ?? [])
-    return `| \`${item.path}\` | ${item.language} | ${completed.length}/${workers.length} | ${deferred.length ? deferred.join('; ') : 'none'} |`
+    const completed = workers.filter(worker => worker.report?.reviewedWorkItemIds.includes(item.id)).map(worker => worker.id)
+    const deferred = workers.flatMap(worker => worker.report?.deferred.filter(row => row.workItemId === item.id).map(row => `${worker.id}: ${row.reason}`) ?? [])
+    return `| \`${item.path}:${item.startLine}-${item.endLine}\` | ${item.language} | ${item.riskSignals.join(', ') || 'none'} | ${completed.length}/${workers.length} | ${deferred.length ? deferred.join('; ') : 'none'} |`
   })
-  refs.push(await writeArtifact(scan, 'artifacts/03_coverage/repository_coverage_ledger.md', `# Repository Coverage Ledger\n\n- Authoritative worklist digest: \`${job.worklistDigest}\`\n- Round: ${round.number}\n\n| Surface | Language | Worker closures | Deferred |\n| --- | --- | --- | --- |\n${closures.join('\n')}\n`))
-  refs.push(await writeArtifact(scan, 'artifacts/03_coverage/reviewed_surfaces.md', `# Reviewed Surfaces\n\n${job.worklist.map(item => `- \`${item.path}\` (${item.language}): reviewed by ${workers.filter(worker => worker.report?.reviewedPaths.includes(item.path)).length}/${workers.length} workers.`).join('\n')}\n`))
+  refs.push(await writeArtifact(scan, 'artifacts/03_coverage/repository_coverage_ledger.md', `# Repository Coverage Ledger\n\n- Authoritative worklist digest: \`${job.worklistDigest}\`\n- Round: ${round.number}\n\n| Source region | Language | Risk signals | Worker closures | Deferred |\n| --- | --- | --- | --- | --- |\n${closures.join('\n')}\n`))
+  refs.push(await writeArtifact(scan, 'artifacts/03_coverage/reviewed_surfaces.md', `# Reviewed Surfaces\n\n${job.worklist.map(item => `- \`${item.path}:${item.startLine}-${item.endLine}\` (${item.language}): reviewed by ${workers.filter(worker => worker.report?.reviewedWorkItemIds.includes(item.id)).length}/${workers.length} workers.`).join('\n')}\n`))
   return refs
 }
 

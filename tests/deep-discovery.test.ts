@@ -45,7 +45,7 @@ function deepWorkerContext(config: { stateDir: string }, reports: boolean, failA
               const token = /claim_token ([0-9a-f-]+)/.exec(prompt)?.[1]
               if (!jobId || !workerId || !token) throw new Error('worker brief was incomplete')
               await reportDeepCandidate(config, jobId, workerId, token, { ruleId: 'custom.delegated-sink', title: 'Delegated sink', severity: 'high', cwe: 'CWE-78', file: 'app.ts', line: 1, rootCause: 'The worker found a source-backed sink.' })
-              if (closesCoverage) await reportDeepWorker(config, jobId, workerId, token, { threatModel: 'The worker independently models remote request input crossing command execution and filesystem trust boundaries.', reviewedPaths: ['app.ts'], deferred: [], coverageSummary: 'Reviewed the complete authoritative source worklist and found one source-backed candidate.' })
+              if (closesCoverage) { const worklist = await getDeepWorklist(config, jobId, workerId, token); await reportDeepWorker(config, jobId, workerId, token, { threatModel: 'The worker independently models remote request input crossing command execution and filesystem trust boundaries.', reviewedWorkItemIds: worklist.items.map(item => item.id), deferred: [], coverageSummary: 'Reviewed every authoritative source region and found one source-backed candidate.' }) }
             },
             session: { deriveMessages: () => [{ role: 'assistant', content: [{ type: 'text', text: 'review complete' }] }] },
           },
@@ -78,8 +78,8 @@ test('deep discovery creates six native DSH workers per round and only saturates
     const persisted = await loadScan(state, scan.id)
     assert.equal(persisted.findings.some(finding => finding.ruleId === 'custom.delegated-sink'), true)
     assert.equal(persisted.tasks.some(task => task.focus.includes('Delegated sink')), true)
-    const coverage = JSON.parse(await readFile(join(persisted.artifacts.directory, 'artifacts', '02_discovery', 'deep', 'round-01', 'worker_1_1', 'coverage.json'), 'utf8')) as { reviewedPaths: string[] }
-    assert.deepEqual(coverage.reviewedPaths, ['app.ts'])
+    const coverage = JSON.parse(await readFile(join(persisted.artifacts.directory, 'artifacts', '02_discovery', 'deep', 'round-01', 'worker_1_1', 'coverage.json'), 'utf8')) as { reviewedWorkItemIds: string[] }
+    assert.equal(coverage.reviewedWorkItemIds.length, 1)
     assert.equal(result.rounds[0]?.artifactRefs?.some(path => path.endsWith('merge.json')), true)
     assert.match(await readFile(join(persisted.artifacts.directory, 'artifacts', '03_coverage', 'repository_coverage_ledger.md'), 'utf8'), /app\.ts/)
     assert.match(await readFile(join(persisted.artifacts.directory, 'artifacts', '04_reconciliation', 'dedupe_report.md'), 'utf8'), /absorbed workers/)
@@ -97,10 +97,33 @@ test('deep worklists freeze risk-prioritized source evidence and fail closed if 
     const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
     const job = await createDeepDiscoveryJob(config, scan.id)
     assert.equal(job.worklist[0]?.path, 'api.ts')
+    assert.equal(job.worklist[0]?.startLine, 1)
+    assert.equal(job.worklist[0]?.endLine, 1)
     assert.equal(job.worklist[0]?.priority > job.worklist[1]!.priority, true)
     assert.equal(job.worklist[0]?.riskSignals.includes('execution or query sink'), true)
     await writeFile(join(root, 'api.ts'), 'export const changed = true\n')
     await assert.rejects(() => createDeepDiscoveryJob(config, scan.id), /changed after scan receipt/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('deep worklists split large files into immutable source regions and bind candidates to a region', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 100_000, stateDir: state }
+  try {
+    const lines = Array.from({ length: 401 }, (_, index) => index === 250 ? 'function h(req) { return eval(req.query.code) }' : `const line${index + 1} = ${index + 1}`)
+    await writeFile(join(root, 'app.ts'), `${lines.join('\n')}\n`)
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    const job = await createDeepDiscoveryJob(config, scan.id)
+    assert.deepEqual(job.worklist.filter(item => item.path === 'app.ts').map(item => [item.startLine, item.endLine]), [[201, 400], [1, 200], [401, 401]])
+    job.lifecycle = 'running'; job.workers.push({ id: 'worker_1_1', round: 1, status: 'running', token: 'claim', candidateIds: [] })
+    await writeFile(join(state, 'deep-discovery', `${job.id}.json`), `${JSON.stringify(job)}\n`)
+    const region = job.worklist.find(item => item.path === 'app.ts' && item.startLine === 201)!
+    const source = await readDeepSource(config, job.id, 'worker_1_1', 'claim', region.id)
+    assert.equal(source.startLine, 201)
+    assert.equal(source.endLine, 400)
+    assert.match(source.content, /eval/)
+    await assert.rejects(() => reportDeepCandidate(config, job.id, 'worker_1_1', 'claim', { ruleId: 'custom.outside-region', title: 'Outside receipt', severity: 'high', cwe: 'CWE-78', file: 'app.ts', line: 999, rootCause: 'This line does not exist in the immutable region list.' }), /region/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
@@ -116,7 +139,8 @@ test('worker closure rejects an incomplete authoritative worklist', async () => 
     const job = await createDeepDiscoveryJob(config, scan.id)
     job.lifecycle = 'running'; job.workers.push({ id: 'worker_1_1', round: 1, status: 'running', token: 'claim', candidateIds: [] })
     await writeFile(join(state, 'deep-discovery', `${job.id}.json`), `${JSON.stringify(job)}\n`)
-    await assert.rejects(() => reportDeepWorker(config, job.id, 'worker_1_1', 'claim', { threatModel: 'The independent model identifies untrusted inputs crossing route, command, and storage trust boundaries.', reviewedPaths: ['app.ts'], deferred: [], coverageSummary: 'Only one file was reviewed.' }), /unclosed: other\.ts/)
+    const worklist = await getDeepWorklist(config, job.id, 'worker_1_1', 'claim')
+    await assert.rejects(() => reportDeepWorker(config, job.id, 'worker_1_1', 'claim', { threatModel: 'The independent model identifies untrusted inputs crossing route, command, and storage trust boundaries.', reviewedWorkItemIds: [worklist.items.find(item => item.path === 'app.ts')!.id], deferred: [], coverageSummary: 'Only one source region was reviewed.' }), /region unclosed/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
@@ -133,11 +157,11 @@ test('claimed workers can read only the immutable authoritative worklist and sou
     await writeFile(join(state, 'deep-discovery', `${job.id}.json`), `${JSON.stringify(job)}\n`)
     const worklist = await getDeepWorklist(config, job.id, 'worker_1_1', 'claim')
     assert.equal(worklist.items[0]?.path, 'app.ts')
-    const source = await readDeepSource(config, job.id, 'worker_1_1', 'claim', 'app.ts')
+    const source = await readDeepSource(config, job.id, 'worker_1_1', 'claim', worklist.items[0]!.id)
     assert.match(source.content, /value = 1/)
     await assert.rejects(() => readDeepSource(config, job.id, 'worker_1_1', 'claim', '../outside.ts'), /authoritative/)
     await writeFile(join(root, 'app.ts'), 'const changed = 2\n')
-    await assert.rejects(() => readDeepSource(config, job.id, 'worker_1_1', 'claim', 'app.ts'), /changed after/)
+    await assert.rejects(() => readDeepSource(config, job.id, 'worker_1_1', 'claim', worklist.items[0]!.id), /changed after/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
