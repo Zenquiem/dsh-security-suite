@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -352,6 +352,14 @@ test('completed scan persists canonical artifacts and candidate-ledger phase rec
     assert.equal(loaded.findings[0].ledger.some(row => row.phase === 'discovery'), true)
     assert.equal(loaded.findings[0].ledger.some(row => row.phase === 'validation'), true)
     assert.equal(loaded.findings[0].ledger.some(row => row.phase === 'attack_path'), true)
+    const reportable = loaded.findings.find(finding => finding.disposition === 'reportable')
+    assert.ok(reportable?.writeup)
+    assert.match(await readFile(join(loaded.artifacts.directory, reportable.writeup.reportPath), 'utf8'), /No executable PoC is generated/)
+    assert.match(await readFile(join(loaded.artifacts.directory, loaded.artifacts.report!), 'utf8'), new RegExp(reportable.writeup.reportPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
+    await rm(join(loaded.artifacts.directory, reportable.writeup.reportPath))
+    const afterDeletion = await verifyScanBundle(loaded)
+    assert.equal(afterDeletion.valid, false)
+    assert.equal(afterDeletion.errors.some(error => error.includes(reportable.writeup!.reportPath)), true)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

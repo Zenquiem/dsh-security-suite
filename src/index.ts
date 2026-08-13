@@ -5,7 +5,7 @@ import { Config, type Config as PluginConfig } from './config.js'
 import { SECURITY_REVIEW_GUIDANCE } from './prompt.js'
 import { FULL_SECURITY_WORKFLOW } from './workflows.js'
 import { generateSourceThreatModel, runDiffScan, runScan, resolveSafeTarget } from './scanner.js'
-import { finalizeAndSaveScan, getStateDir, listScans, loadScan, persistInvestigationArtifacts, renderCsv, renderMarkdownReport, saveTriageAnnotation, saveScan, toSarif, verifyScanBundle } from './state.js'
+import { finalizeAndSaveScan, getStateDir, listScans, loadScan, persistInvestigationArtifacts, renderCsv, renderFindingWriteup, renderMarkdownReport, saveTriageAnnotation, saveScan, toSarif, verifyScanBundle } from './state.js'
 import { applyRemediationProposal, bulkScan, installPreCommitHook, planCandidateValidation, remediationPlan, rerunSavedScan, resumeBulkJob, rollbackRemediationProposal, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, startBulkCsvJob } from './operations.js'
 import { cancelInvestigation, claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation, resumeInvestigation } from './workbench.js'
 import { generateHardeningPortfolio, importFindings, triageImportedFinding } from './analysis.js'
@@ -282,7 +282,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
   ctx.tools.register(defineTool({
     name: 'security_finding_writeup', description: 'Render a complete vulnerability report from a validated saved finding. It preserves unresolved proof gaps rather than inventing exploitation.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Finding identifier.' } },
     output: { schema: { type: 'object', properties: { markdown: { type: 'string' } }, required: ['markdown'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.markdown ?? '' }] },
-    async execute(args) { const scan = await loadScan(getStateDir(config.stateDir), args.scan_id); const finding = scan.findings.find(item => item.id === args.finding_id); if (!finding) throw new Error('Finding was not found in this scan.'); const location = finding.locations[0]; return { markdown: `# ${finding.title}\n\n## Summary\n${finding.rootCause}\n\n## Severity and Confidence\n- Severity: ${finding.severity}\n- Confidence: ${finding.confidence}\n- CWE: ${finding.cwe}\n\n## Affected Location\n\`${location.file}:${location.line}\`\n\n\`\`\`\n${location.excerpt}\n\`\`\`\n\n## Validation\n${finding.validation}\n\n## Attack Path and Preconditions\n${finding.attackPath}\n\n## Impact\n${finding.impact}\n\n## Counterevidence and Limitations\n${finding.counterevidence}\n\n## Remediation\n${finding.remediation}\n` } },
+    async execute(args) { const scan = await loadScan(getStateDir(config.stateDir), args.scan_id); const finding = scan.findings.find(item => item.id === args.finding_id); if (!finding) throw new Error('Finding was not found in this scan.'); return { markdown: renderFindingWriteup(scan, finding) } },
   }))
 
   ctx.tools.register(defineTool({

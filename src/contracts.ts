@@ -67,6 +67,12 @@ export interface Finding {
   ledger: CandidateLedgerEntry[]
   validationRecord?: ValidationRecord
   attackPathRecord?: AttackPathRecord
+  writeup?: {
+    reportPath: string
+    generatedAt: string
+    evidenceDigest: string
+    poc: { status: 'not_generated'; rationale: string }
+  }
 }
 
 export interface FileReceipt { path: string; bytes: number; sha256: string; language: string }
