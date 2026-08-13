@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { applyRemediationProposal, installPreCommitHook, remediationPlan, resumeBulkJob, runCandidateValidation, runIsolatedValidation, startBulkCsvJob } from '../src/operations.ts'
+import { applyRemediationProposal, installPreCommitHook, planCandidateValidation, remediationPlan, resumeBulkJob, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, startBulkCsvJob } from '../src/operations.ts'
 import { runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
 import { claimAuditTask, recordValidation } from '../src/workbench.ts'
@@ -71,6 +71,44 @@ test('candidate validation attaches an isolated receipt to the claimed candidate
     assert.equal(finding.ledger.some(item => item.artifactRef === receipt.artifactRef), true)
     assert.match(await readFile(join(attached.artifacts.directory, receipt.artifactRef ?? ''), 'utf8'), /node --version/)
     await recordValidation(local, scan.id, candidate.candidateId, { conclusion: 'suppressed', method: 'test', attacker: 'none', entryPoint: 'test fixture', trustBoundary: 'isolated copy', rootControl: 'eval call', sink: 'eval', impact: 'none', directEvidence: 'The isolated command is attached as supporting evidence.', counterevidence: 'No reachable route was established.', limitations: 'The command does not exercise an HTTP route.', confidence: 'medium' }, claim.claimToken)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('candidate validation plan is preflight-derived, approval-gated, and retains every command outcome', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'package.json'), '{"scripts":{"test":"node --version","build":"node --invalid-option"}}\n')
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, scan)
+    const candidate = scan.findings[0]; const plan = await planCandidateValidation(local, scan.id, candidate.candidateId)
+    assert.deepEqual(plan.commands.map(item => item.command), ['npm test', 'npm run build'])
+    const claim = await claimAuditTask(local, scan.id, 'validator', 'validation'); assert.ok(claim)
+    await assert.rejects(() => runCandidateValidationPlan(root, local, scan.id, candidate.candidateId, claim.claimToken, false), /approved/)
+    const run = await runCandidateValidationPlan(root, local, scan.id, candidate.candidateId, claim.claimToken, true)
+    assert.equal(run.receipts.length, 2)
+    assert.equal(run.receipts[0].exitCode, 0)
+    assert.notEqual(run.receipts[1].exitCode, 0)
+    const attached = await loadScan(state, scan.id); const finding = attached.findings.find(item => item.candidateId === candidate.candidateId)
+    assert.ok(finding); assert.equal(finding.disposition, 'discovered')
+    assert.equal(finding.evidence.filter(item => item.kind === 'test').length, 2)
+    assert.equal(finding.ledger.some(item => item.artifactRef === run.artifactRef), true)
+    assert.match(await readFile(join(attached.artifacts.directory, run.artifactRef), 'utf8'), /npm run build/)
+    assert.equal(await readFile(join(root, 'app.ts'), 'utf8'), 'function h(req) { return eval(req.query.code) }\n')
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('candidate validation plan reports an explicit skip when no manifest maps to a command', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, scan)
+    const plan = await planCandidateValidation(local, scan.id, scan.findings[0].candidateId)
+    assert.deepEqual(plan.commands, [])
+    assert.match(plan.skipped[0]?.reason ?? '', /No recognized project manifest/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

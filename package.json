@@ -1,6 +1,6 @@
 {
   "name": "dsh-security-suite",
-  "version": "0.13.0",
+  "version": "0.14.0",
   "description": "Security assessment workflows for DeepSeek Harness",
   "license": "Apache-2.0",
   "type": "module",

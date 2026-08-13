@@ -15,6 +15,8 @@ const MAX_COMMAND_OUTPUT = 256_000
 const VALIDATION_COMMAND = /^[A-Za-z0-9_./:@=+%, -]+$/
 
 export interface CommandReceipt { id: string; command: string; cwd: string; exitCode?: number; timedOut: boolean; durationMs: number; stdout: string; stderr: string; snapshotDigest: string; artifactRef?: string }
+export interface CandidateValidationPlan { id: string; scanId: string; candidateId: string; snapshotDigest: string; projectFiles: string[]; commands: Array<{ command: string; reason: string }>; skipped: Array<{ reason: string }>; createdAt: string }
+export interface CandidateValidationPlanRun extends CandidateValidationPlan { approved: true; executedAt: string; receipts: CommandReceipt[]; artifactRef: string }
 export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; createdAt: string; status: 'proposed' | 'applied' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; appliedAt?: string; verificationScanId?: string }
 
 export interface BulkResult { path: string; scanId?: string; findings?: number; error?: string }
@@ -75,6 +77,59 @@ export async function runCandidateValidation(workspace: string, config: Config, 
   currentTask.receipt = `test:${receipt.id}`
   await persistInvestigationArtifacts(state, reloaded); await saveScan(state, reloaded)
   return attached
+}
+
+/**
+ * Create a read-only validation plan from scan-time preflight evidence. It never
+ * invents commands or reads a changed target to decide what should execute.
+ */
+export async function planCandidateValidation(config: Config, scanId: string, candidateId: string): Promise<CandidateValidationPlan> {
+  const scan = await loadScan(getStateDir(config.stateDir), scanId)
+  if (!scan.findings.some(item => item.candidateId === candidateId)) throw new Error('Candidate was not found in this scan.')
+  const commands = [...new Set(scan.preflight.suggestedCommands.map(command => safeCommand(command)))].map(command => ({ command, reason: `Suggested by scan-time project preflight for ${scan.preflight.projectFiles.join(', ')}.` }))
+  const skipped = commands.length ? [] : [{ reason: scan.preflight.projectFiles.length ? 'Recognized project manifests did not map to a bounded local validation command.' : 'No recognized project manifest was present during scan preflight.' }]
+  return { id: `plan_${randomUUID()}`, scanId, candidateId, snapshotDigest: scan.targetSnapshot.snapshotDigest, projectFiles: [...scan.preflight.projectFiles], commands, skipped, createdAt: new Date().toISOString() }
+}
+
+async function executeValidationCommands(target: string, commands: string[], timeoutMs: number, snapshotDigest: string): Promise<CommandReceipt[]> {
+  const timeout = Math.max(1_000, Math.min(timeoutMs, 600_000)); const copyRoot = await mkdtemp(join(tmpdir(), 'dsh-security-suite-validation-plan-')); const copyTarget = join(copyRoot, 'target')
+  try {
+    await cp(target, copyTarget, { recursive: true, dereference: false, filter: source => !source.split(sep).some(part => ['.git', 'node_modules', 'dist', 'build', 'coverage'].includes(part)) })
+    const receipts: CommandReceipt[] = []
+    for (const command of commands) {
+      const args = splitCommand(command); const started = Date.now(); let stdout = ''; let stderr = ''; let exitCode: number | undefined; let timedOut = false
+      try { const result = await execFileAsync(args[0], args.slice(1), { cwd: copyTarget, timeout, maxBuffer: MAX_COMMAND_OUTPUT, encoding: 'utf8', windowsHide: true }); stdout = result.stdout; stderr = result.stderr; exitCode = 0 } catch (error: unknown) { const value = error as { stdout?: string; stderr?: string; code?: number | string; killed?: boolean; message?: string }; stdout = value.stdout ?? ''; stderr = value.stderr ?? (value.message ?? ''); exitCode = typeof value.code === 'number' ? value.code : undefined; timedOut = Boolean(value.killed) }
+      receipts.push({ id: `cmd_${randomUUID()}`, command: args.join(' '), cwd: '.', exitCode, timedOut, durationMs: Date.now() - started, stdout: stdout.slice(0, MAX_COMMAND_OUTPUT), stderr: stderr.slice(0, MAX_COMMAND_OUTPUT), snapshotDigest })
+    }
+    return receipts
+  } finally { await rm(copyRoot, { recursive: true, force: true }) }
+}
+
+/** Execute only a persisted-preflight plan, retaining every command outcome as candidate evidence. */
+export async function runCandidateValidationPlan(workspace: string, config: Config, scanId: string, candidateId: string, claimToken: string, approved: boolean, timeoutMs = 120_000): Promise<CandidateValidationPlanRun> {
+  if (!approved) throw new Error('Executing a validation plan can run project test/build scripts. Set approved to true only after reviewing the planned commands.')
+  const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId)
+  if (scan.lifecycle === 'completed') throw new Error('Completed scans cannot accept new validation evidence.')
+  const finding = scan.findings.find(item => item.candidateId === candidateId); if (!finding) throw new Error('Candidate was not found in this scan.')
+  const task = scan.tasks.find(item => item.candidateId === candidateId && item.phase === 'validation' && item.status === 'claimed')
+  if (!task || task.claim?.token !== claimToken) throw new Error('Claim token does not own this candidate validation task.')
+  const plan = await planCandidateValidation(config, scanId, candidateId)
+  if (!plan.commands.length) throw new Error(`No bounded validation command is available: ${plan.skipped.map(item => item.reason).join(' ')}`)
+  const before = await snapshotDigestForDirectory(scan.target, config); if (before !== plan.snapshotDigest) throw new Error('Target changed since this scan. Create a follow-up scan before executing validation.')
+  const receipts = await executeValidationCommands(resolve(scan.target), plan.commands.map(item => item.command), timeoutMs, plan.snapshotDigest)
+  const after = await snapshotDigestForDirectory(scan.target, config); if (after !== plan.snapshotDigest) throw new Error('Target changed during isolated validation; receipts were not attached to this scan.')
+  const reloaded = await loadScan(state, scanId); const currentFinding = reloaded.findings.find(item => item.candidateId === candidateId); const currentTask = reloaded.tasks.find(item => item.id === task.id)
+  if (!currentFinding || !currentTask || currentTask.status !== 'claimed' || currentTask.claim?.token !== claimToken) throw new Error('Candidate validation task changed while commands were running; receipts were not attached.')
+  const attached = receipts.map(receipt => ({ ...receipt, artifactRef: `artifacts/05_findings/${candidateId}/validation_artifacts/${receipt.id}.json` }))
+  for (const receipt of attached) await writeArtifact(reloaded, receipt.artifactRef!, `${JSON.stringify(receipt, null, 2)}\n`)
+  const artifactRef = `artifacts/05_findings/${candidateId}/validation_artifacts/${plan.id}.json`; const run: CandidateValidationPlanRun = { ...plan, approved: true, executedAt: new Date().toISOString(), receipts: attached, artifactRef }
+  await writeArtifact(reloaded, artifactRef, `${JSON.stringify(run, null, 2)}\n`)
+  const outcomes = attached.map(receipt => receipt.timedOut ? `${receipt.command}: timed out` : receipt.exitCode === 0 ? `${receipt.command}: passed` : `${receipt.command}: failed`).join('; ')
+  for (const receipt of attached) currentFinding.evidence.push({ kind: 'test', detail: `Planned isolated validation command \`${receipt.command}\` ${receipt.timedOut ? 'timed out' : receipt.exitCode === 0 ? 'completed successfully' : `exited with ${receipt.exitCode ?? 'an unknown status'}`}; interpret this receipt with source and runtime context.`, artifactRef: receipt.artifactRef })
+  currentFinding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition: 'discovered', summary: `Executed preflight-derived validation plan ${plan.id}: ${outcomes}. Final validation conclusion remains pending.`, artifactRef })
+  currentTask.receipt = `validation-plan:${plan.id}`
+  await persistInvestigationArtifacts(state, reloaded); await saveScan(state, reloaded)
+  return run
 }
 
 export async function rerunSavedScan(workspace: string, config: Config, scanId: string): Promise<ScanRecord> {
