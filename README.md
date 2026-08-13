@@ -37,6 +37,8 @@ The scanner inventories eligible source files deterministically, skips dependenc
 
 JavaScript/TypeScript request destructuring is a supported source form: aliases introduced by `const { body } = req` or `const { query: q } = request` participate in local and relative-module flow summaries. Destructuring from a non-request object does not establish attacker control.
 
+Ruby deserialization analysis follows request-derived values through same-directory local wrappers into `YAML.load`, `Psych.load`, and `Marshal.load`. `safe_load`, static data, and unrelated parser methods remain unproven.
+
 ## Tool Surface
 
 SARIF imports retain their rule id, CWE, message, severity, and physical file/line. Imported triage returns `affected` only when a compatible native local-analysis candidate matches that cited location; a readable file alone is never confirmation. Every completed scan with reportable findings also generates a derived `hardening/hardening.md` and `hardening/hardening.json` portfolio from those findings and their detailed reports; the main report links the portfolio and bundle verification rejects a missing or stale portfolio.

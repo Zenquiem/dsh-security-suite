@@ -38,6 +38,7 @@ const RULES: Record<Language, Rule[]> = {
     { id: 'path-traversal-sink', cwe: 'CWE-22', severity: 'medium', rationale: 'Request-derived data reaches a Ruby filesystem API.', sink: /\b(?:File\.(?:read|write|open|delete)|IO\.read)\s*\(/ },
     { id: 'ssrf-request-sink', cwe: 'CWE-918', severity: 'medium', rationale: 'Request-derived data selects a Ruby outbound request destination.', sink: /\b(?:Net::HTTP\.(?:get|get_response|post)|URI\.open)\s*\(/ },
     { id: 'sql-injection-query-construction', cwe: 'CWE-89', severity: 'high', rationale: 'Request-derived data reaches a Ruby SQL query-text API.', sink: /\b(?:connection|db|database)\.(?:execute|exec_query|select_all|find_by_sql)\s*\(/i },
+    { id: 'unsafe-deserialization', cwe: 'CWE-502', severity: 'high', rationale: 'Request-derived data reaches a Ruby object deserializer without a proven safe parser boundary.', sink: /\b(?:YAML|Psych|Marshal)\.load\s*\(/ },
   ],
   c: [
     { id: 'shell-command-construction', cwe: 'CWE-78', severity: 'high', rationale: 'Externally controlled data reaches a native process execution API.', sink: /\b(?:system|popen|execl|execv|execve)\s*\(/ },
@@ -84,17 +85,24 @@ function splitArguments(value: string): string[] {
   const last = value.slice(start).trim(); if (last) result.push(last); return result
 }
 
-function calls(value: string): Array<{ name: string; args: string[] }> {
-  const results: Array<{ name: string; args: string[] }> = []; const pattern = /\b(?:[A-Za-z_]\w*(?:::\w+|\.\w+)*\.)?([A-Za-z_]\w*)\s*\(/g
-  for (const match of value.matchAll(pattern)) { const open = (match.index ?? 0) + match[0].lastIndexOf('('); let depth = 0; let quote = ''; let close = -1; for (let index = open; index < value.length; index++) { const character = value[index]; if (quote) { if (character === quote && value[index - 1] !== '\\') quote = ''; continue }; if (character === '"' || character === "'") { quote = character; continue }; if (character === '(') depth++; if (character === ')') { depth--; if (depth === 0) { close = index; break } } }; if (close > open) results.push({ name: match[1], args: splitArguments(value.slice(open + 1, close)) }) }
+function calls(value: string): Array<{ name: string; qualified: string; args: string[] }> {
+  const results: Array<{ name: string; qualified: string; args: string[] }> = []; const pattern = /\b((?:[A-Za-z_]\w*(?:::\w+|\.\w+)*\.)?)([A-Za-z_]\w*)\s*\(/g
+  for (const match of value.matchAll(pattern)) { const open = (match.index ?? 0) + match[0].lastIndexOf('('); let depth = 0; let quote = ''; let close = -1; for (let index = open; index < value.length; index++) { const character = value[index]; if (quote) { if (character === quote && value[index - 1] !== '\\') quote = ''; continue }; if (character === '"' || character === "'") { quote = character; continue }; if (character === '(') depth++; if (character === ')') { depth--; if (depth === 0) { close = index; break } } }; if (close > open) results.push({ name: match[2], qualified: `${match[1] ?? ''}${match[2]}`, args: splitArguments(value.slice(open + 1, close)) }) }
   return results
 }
 
 function sinkTainted(value: string, rule: Rule, tainted: Set<string>, source: RegExp, language: Language, deserializers = new Set<string>()): boolean {
   if (rule.id === 'unsafe-deserialization') {
-    if (language !== 'java') return false
-    const reader = /\b([A-Za-z_]\w*)\.readObject\s*\(/.exec(value)?.[1]
-    return Boolean(reader && deserializers.has(reader))
+    if (language === 'java') {
+      const reader = /\b([A-Za-z_]\w*)\.readObject\s*\(/.exec(value)?.[1]
+      return Boolean(reader && deserializers.has(reader))
+    }
+    if (language === 'ruby') {
+      rule.sink.lastIndex = 0
+      if (!rule.sink.test(value)) return false
+      return calls(value).some(call => /^(?:YAML|Psych|Marshal)\.load$/.test(call.qualified) && Boolean(call.args[0]) && sourceTainted(call.args[0], tainted, source))
+    }
+    return false
   }
   if (rule.id === 'sql-injection-query-construction') {
     rule.sink.lastIndex = 0

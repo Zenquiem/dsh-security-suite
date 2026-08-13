@@ -305,6 +305,20 @@ test('directory assessment records request-derived Java ObjectInputStream eviden
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment records request-derived Ruby deserialization evidence and excludes safe loaders', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'handler.rb'), 'def load_unsafe(payload)\n YAML.load(payload)\nend\ndef load_safe(payload)\n YAML.safe_load(payload)\nend\ndef route\n load_unsafe(params[:payload])\n load_safe(params[:safe])\nend\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'unsafe-deserialization')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.file, 'handler.rb')
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink' && item.location.line === 2), true)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'propagation' && item.location.line === 8), true)
+    assert.equal(result.ruleReceipts.some(item => item.ruleId === 'ruby.structured-taint' && item.matches === 1), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment traces Go data flow through a static local-module import', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -537,6 +551,24 @@ test('diff scan traces an added Java request stream into an unchanged ObjectInpu
     assert.equal(findings[0]?.locations[0]?.line, 4)
     assert.equal(findings[0]?.evidence.some(item => item.location?.line === 6 && item.location.role === 'propagation'), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'java.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan traces an added Ruby request value into an unchanged YAML loader', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'handler.rb'), 'def load(payload)\n YAML.load(payload)\nend\ndef route\n nil\nend\n')
+    await execFileAsync('git', ['add', 'handler.rb'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'handler.rb'), 'def load(payload)\n YAML.load(payload)\nend\ndef route\n load(params[:payload])\nend\n')
+    const scan = await runDiffScan(root, undefined, '')
+    const findings = scan.findings.filter(item => item.ruleId === 'unsafe.deserialization')
+    assert.equal(findings.length, 1)
+    assert.equal(findings[0]?.locations[0]?.line, 2)
+    assert.equal(findings[0]?.evidence.some(item => item.location?.line === 5 && item.location.role === 'propagation'), true)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'ruby.diff-semantic-taint')?.matches, 1)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

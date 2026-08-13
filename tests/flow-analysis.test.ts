@@ -156,6 +156,12 @@ test('Java structured deserialization analysis excludes trusted streams and read
   assert.equal(result.candidates.some(item => item.rule === 'unsafe-deserialization'), false)
 })
 
+test('Ruby structured analysis traces request data into supported unsafe deserializers and excludes safe or unrelated parsers', () => {
+  const result = analyzeStructuredFlow([{ file: 'handler.rb', source: 'def parse_yaml(payload)\n YAML.load(payload)\nend\ndef parse_marshal(payload)\n Marshal.load(payload)\nend\ndef parse_safe(payload)\n YAML.safe_load(payload)\nend\ndef parse_other(payload)\n parser.load(payload)\nend\ndef route\n parse_yaml(params[:yaml])\n parse_marshal(params[:marshal])\n parse_safe(params[:safe])\n parse_other(params[:other])\nend\n' }], 'ruby')
+  assert.deepEqual(result.candidates.map(item => item.rule), ['unsafe-deserialization', 'unsafe-deserialization'])
+  assert.equal(result.candidates.every(item => item.evidence.some(evidence => evidence.detail.includes('structured function data-flow'))), true)
+})
+
 test('C# structured SSRF analysis does not treat a request body sent to a fixed destination as SSRF', () => {
   const result = analyzeStructuredFlow([{ file: 'Handler.cs', source: 'class Handler {\n void outbound(string body) { client.PostAsync("https://api.example.test/events", body); }\n void route(HttpRequest Request) { outbound(Request.Body); }\n}' }], 'csharp')
   assert.equal(result.candidates.some(item => item.rule === 'ssrf-request-sink'), false)
