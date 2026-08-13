@@ -221,9 +221,9 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_plan_candidate_validation', description: 'Preview a read-only, candidate-specific validation plan from the scan-time project preflight. It contains only bounded local commands already derived from the detected manifest and does not execute anything.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' }, candidate_id: { type: 'string', required: true, description: 'Candidate identifier.' } },
-    output: { schema: { type: 'object', properties: { id: { type: 'string' }, scanId: { type: 'string' }, candidateId: { type: 'string' }, snapshotDigest: { type: 'string' }, projectFiles: { type: 'array', items: { type: 'string' } }, commands: { type: 'array', items: { type: 'object', properties: { command: { type: 'string' }, reason: { type: 'string' } }, required: ['command', 'reason'], additionalProperties: false } }, skipped: { type: 'array', items: { type: 'object', properties: { reason: { type: 'string' } }, required: ['reason'], additionalProperties: false } }, createdAt: { type: 'string' } }, required: ['id', 'scanId', 'candidateId', 'snapshotDigest', 'projectFiles', 'commands', 'skipped', 'createdAt'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-    async execute(args) { return planCandidateValidation(config, args.scan_id, args.candidate_id) },
+    name: 'security_plan_candidate_validation', description: 'Preview a read-only, candidate-specific validation plan from frozen scan context. It identifies runnable isolated project checks and explicitly records the setup/authorization evidence required before realistic interface reproduction, debugger tracing, or sanitizer checks. It never invents or executes commands.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' }, candidate_id: { type: 'string', required: true, description: 'Candidate identifier.' } },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return JSON.parse(JSON.stringify(await planCandidateValidation(config, args.scan_id, args.candidate_id))) as Record<string, JsonValue> },
   }))
 
   ctx.tools.register(defineTool({

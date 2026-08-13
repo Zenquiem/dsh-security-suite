@@ -102,6 +102,9 @@ test('candidate validation plan is preflight-derived, approval-gated, and retain
     const scan = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, scan)
     const candidate = scan.findings[0]; const plan = await planCandidateValidation(local, scan.id, candidate.candidateId)
     assert.deepEqual(plan.commands.map(item => item.command), ['npm test', 'npm run build'])
+    assert.equal(plan.strategies.find(strategy => strategy.method === 'isolated_project_checks')?.status, 'runnable_with_approval')
+    assert.equal(plan.strategies.find(strategy => strategy.method === 'source_trace')?.status, 'available_without_execution')
+    assert.equal(plan.strategies.some(strategy => strategy.method === 'debugger_trace' && strategy.status === 'runnable_with_approval'), false)
     const claim = await claimAuditTask(local, scan.id, 'validator', 'validation'); assert.ok(claim)
     await assert.rejects(() => runCandidateValidationPlan(root, local, scan.id, candidate.candidateId, claim.claimToken, false), /approved/)
     const run = await runCandidateValidationPlan(root, local, scan.id, candidate.candidateId, claim.claimToken, true)
@@ -126,6 +129,7 @@ test('candidate validation plan reports an explicit skip when no manifest maps t
     const scan = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, scan)
     const plan = await planCandidateValidation(local, scan.id, scan.findings[0].candidateId)
     assert.deepEqual(plan.commands, [])
+    assert.equal(plan.strategies.find(strategy => strategy.method === 'isolated_project_checks')?.status, 'not_applicable')
     assert.match(plan.skipped[0]?.reason ?? '', /No recognized project manifest/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
