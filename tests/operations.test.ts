@@ -52,6 +52,24 @@ test('isolated validation records a command receipt without modifying the source
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
+test('isolated validation propagates DSH cancellation to the child process without recording a failed receipt', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await writeFile(join(root, 'app.ts'), 'eval(input)\n')
+    await writeFile(join(root, 'wait.js'), 'setTimeout(() => {}, 5000)\n')
+    const scan = await runScan(root, { ...config, stateDir: state }, 'standard', '', false, state)
+    for (const finding of scan.findings) { finding.disposition = 'suppressed'; finding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition: 'suppressed', summary: 'Static control review.' }) }
+    scan.lifecycle = 'completed'; scan.completedAt = new Date().toISOString(); await finalizeAndSaveScan(state, scan)
+    const controller = new AbortController(); const started = Date.now()
+    const pending = runIsolatedValidation(root, { ...config, stateDir: state }, scan.id, 'node wait.js', 10_000, controller.signal)
+    setTimeout(() => controller.abort('cancel validation'), 100)
+    await assert.rejects(pending, error => (error as { name?: string }).name === 'AbortError')
+    assert.ok(Date.now() - started < 2_000)
+    assert.equal((await verifyScanBundle(await loadScan(state, scan.id))).valid, true)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
 test('candidate validation attaches an isolated receipt to the claimed candidate ledger without deciding the finding', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))

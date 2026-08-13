@@ -38,15 +38,22 @@ function bulkJobPath(stateDir: string, id: string): string { if (!/^bulk_[0-9a-f
 async function saveBulkJob(stateDir: string, job: BulkJob): Promise<void> { job.updatedAt = new Date().toISOString(); await atomicWrite(bulkJobPath(stateDir, job.id), `${JSON.stringify(job, null, 2)}\n`) }
 export async function loadBulkJob(stateDir: string, id: string): Promise<BulkJob> { return JSON.parse(await readFile(bulkJobPath(stateDir, id), 'utf8')) as BulkJob }
 
-export async function runIsolatedValidation(workspace: string, config: Config, scanId: string, command: string, timeoutMs = 120_000): Promise<CommandReceipt> {
+function rethrowIfCancelled(signal: AbortSignal | undefined, error?: unknown): void {
+  if (signal?.aborted || (error as { name?: string } | undefined)?.name === 'AbortError') throw error ?? new DOMException('Validation was cancelled.', 'AbortError')
+}
+
+export async function runIsolatedValidation(workspace: string, config: Config, scanId: string, command: string, timeoutMs = 120_000, signal?: AbortSignal): Promise<CommandReceipt> {
+  signal?.throwIfAborted()
   const scan = await loadScan(getStateDir(config.stateDir), scanId); const root = resolve(workspace); const target = resolve(scan.target)
   if (!inside(root, target)) throw new Error('Saved scan target is outside the active workspace.')
   const args = splitCommand(command); const timeout = Math.max(1_000, Math.min(timeoutMs, 600_000)); const copyRoot = await mkdtemp(join(tmpdir(), 'dsh-security-suite-validation-'))
   const copyTarget = join(copyRoot, 'target')
   const started = Date.now(); let stdout = ''; let stderr = ''; let exitCode: number | undefined; let timedOut = false
   try {
+    signal?.throwIfAborted()
     await cp(target, copyTarget, { recursive: true, dereference: false, filter: source => !source.split(sep).some(part => ['.git', 'node_modules', 'dist', 'build', 'coverage'].includes(part)) })
-    try { const result = await execFileAsync(args[0], args.slice(1), { cwd: copyTarget, timeout, maxBuffer: MAX_COMMAND_OUTPUT, encoding: 'utf8', windowsHide: true }); stdout = result.stdout; stderr = result.stderr; exitCode = 0 } catch (error: unknown) { const value = error as { stdout?: string; stderr?: string; code?: number | string; killed?: boolean }; stdout = value.stdout ?? ''; stderr = value.stderr ?? ''; exitCode = typeof value.code === 'number' ? value.code : undefined; timedOut = Boolean(value.killed) }
+    signal?.throwIfAborted()
+    try { const result = await execFileAsync(args[0], args.slice(1), { cwd: copyTarget, timeout, maxBuffer: MAX_COMMAND_OUTPUT, encoding: 'utf8', windowsHide: true, signal }); stdout = result.stdout; stderr = result.stderr; exitCode = 0 } catch (error: unknown) { rethrowIfCancelled(signal, error); const value = error as { stdout?: string; stderr?: string; code?: number | string; killed?: boolean }; stdout = value.stdout ?? ''; stderr = value.stderr ?? ''; exitCode = typeof value.code === 'number' ? value.code : undefined; timedOut = Boolean(value.killed) }
     const receipt: CommandReceipt = { id: `cmd_${randomUUID()}`, command: args.join(' '), cwd: '.', exitCode, timedOut, durationMs: Date.now() - started, stdout: stdout.slice(0, MAX_COMMAND_OUTPUT), stderr: stderr.slice(0, MAX_COMMAND_OUTPUT), snapshotDigest: await snapshotDigestForDirectory(target, config) }
     const receiptPath = join(getStateDir(config.stateDir), 'validation-receipts', `${receipt.id}.json`)
     await atomicWrite(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`)
@@ -61,14 +68,15 @@ export async function runIsolatedValidation(workspace: string, config: Config, s
  * A command receipt is evidence only; the reviewer still records the final
  * source/runtime conclusion with recordValidation.
  */
-export async function runCandidateValidation(workspace: string, config: Config, scanId: string, candidateId: string, claimToken: string, command: string, timeoutMs = 120_000): Promise<CommandReceipt> {
+export async function runCandidateValidation(workspace: string, config: Config, scanId: string, candidateId: string, claimToken: string, command: string, timeoutMs = 120_000, signal?: AbortSignal): Promise<CommandReceipt> {
+  signal?.throwIfAborted()
   const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId)
   if (scan.lifecycle === 'completed') throw new Error('Completed scans cannot accept new validation evidence.')
   const finding = scan.findings.find(item => item.candidateId === candidateId); if (!finding) throw new Error('Candidate was not found in this scan.')
   const task = scan.tasks.find(item => item.candidateId === candidateId && item.phase === 'validation' && item.status === 'claimed')
   if (!task || task.claim?.token !== claimToken) throw new Error('Claim token does not own this candidate validation task.')
   const currentSnapshot = await snapshotDigestForDirectory(scan.target, config); if (currentSnapshot !== scan.targetSnapshot.snapshotDigest) throw new Error('Target changed since this scan. Create a follow-up scan before attaching validation evidence.')
-  const receipt = await runIsolatedValidation(workspace, config, scanId, command, timeoutMs)
+  const receipt = await runIsolatedValidation(workspace, config, scanId, command, timeoutMs, signal)
   if (receipt.snapshotDigest !== scan.targetSnapshot.snapshotDigest) throw new Error('Target changed during isolated validation; the receipt was retained externally but was not attached to this scan.')
   const reloaded = await loadScan(state, scanId); const currentFinding = reloaded.findings.find(item => item.candidateId === candidateId); const currentTask = reloaded.tasks.find(item => item.id === task.id)
   if (!currentFinding || !currentTask || currentTask.status !== 'claimed' || currentTask.claim?.token !== claimToken) throw new Error('Candidate validation task changed while the command was running; the receipt was retained externally but was not attached.')
@@ -95,14 +103,16 @@ export async function planCandidateValidation(config: Config, scanId: string, ca
   return { id: `plan_${randomUUID()}`, scanId, candidateId, snapshotDigest: scan.targetSnapshot.snapshotDigest, projectFiles: [...scan.preflight.projectFiles], commands, skipped, createdAt: new Date().toISOString() }
 }
 
-async function executeValidationCommands(target: string, commands: string[], timeoutMs: number, snapshotDigest: string): Promise<CommandReceipt[]> {
+async function executeValidationCommands(target: string, commands: string[], timeoutMs: number, snapshotDigest: string, signal?: AbortSignal): Promise<CommandReceipt[]> {
   const timeout = Math.max(1_000, Math.min(timeoutMs, 600_000)); const copyRoot = await mkdtemp(join(tmpdir(), 'dsh-security-suite-validation-plan-')); const copyTarget = join(copyRoot, 'target')
   try {
+    signal?.throwIfAborted()
     await cp(target, copyTarget, { recursive: true, dereference: false, filter: source => !source.split(sep).some(part => ['.git', 'node_modules', 'dist', 'build', 'coverage'].includes(part)) })
     const receipts: CommandReceipt[] = []
     for (const command of commands) {
+      signal?.throwIfAborted()
       const args = splitCommand(command); const started = Date.now(); let stdout = ''; let stderr = ''; let exitCode: number | undefined; let timedOut = false
-      try { const result = await execFileAsync(args[0], args.slice(1), { cwd: copyTarget, timeout, maxBuffer: MAX_COMMAND_OUTPUT, encoding: 'utf8', windowsHide: true }); stdout = result.stdout; stderr = result.stderr; exitCode = 0 } catch (error: unknown) { const value = error as { stdout?: string; stderr?: string; code?: number | string; killed?: boolean; message?: string }; stdout = value.stdout ?? ''; stderr = value.stderr ?? (value.message ?? ''); exitCode = typeof value.code === 'number' ? value.code : undefined; timedOut = Boolean(value.killed) }
+      try { const result = await execFileAsync(args[0], args.slice(1), { cwd: copyTarget, timeout, maxBuffer: MAX_COMMAND_OUTPUT, encoding: 'utf8', windowsHide: true, signal }); stdout = result.stdout; stderr = result.stderr; exitCode = 0 } catch (error: unknown) { rethrowIfCancelled(signal, error); const value = error as { stdout?: string; stderr?: string; code?: number | string; killed?: boolean; message?: string }; stdout = value.stdout ?? ''; stderr = value.stderr ?? (value.message ?? ''); exitCode = typeof value.code === 'number' ? value.code : undefined; timedOut = Boolean(value.killed) }
       receipts.push({ id: `cmd_${randomUUID()}`, command: args.join(' '), cwd: '.', exitCode, timedOut, durationMs: Date.now() - started, stdout: stdout.slice(0, MAX_COMMAND_OUTPUT), stderr: stderr.slice(0, MAX_COMMAND_OUTPUT), snapshotDigest })
     }
     return receipts
@@ -110,7 +120,8 @@ async function executeValidationCommands(target: string, commands: string[], tim
 }
 
 /** Execute only a persisted-preflight plan, retaining every command outcome as candidate evidence. */
-export async function runCandidateValidationPlan(workspace: string, config: Config, scanId: string, candidateId: string, claimToken: string, approved: boolean, timeoutMs = 120_000): Promise<CandidateValidationPlanRun> {
+export async function runCandidateValidationPlan(workspace: string, config: Config, scanId: string, candidateId: string, claimToken: string, approved: boolean, timeoutMs = 120_000, signal?: AbortSignal): Promise<CandidateValidationPlanRun> {
+  signal?.throwIfAborted()
   if (!approved) throw new Error('Executing a validation plan can run project test/build scripts. Set approved to true only after reviewing the planned commands.')
   const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId)
   if (scan.lifecycle === 'completed') throw new Error('Completed scans cannot accept new validation evidence.')
@@ -120,7 +131,7 @@ export async function runCandidateValidationPlan(workspace: string, config: Conf
   const plan = await planCandidateValidation(config, scanId, candidateId)
   if (!plan.commands.length) throw new Error(`No bounded validation command is available: ${plan.skipped.map(item => item.reason).join(' ')}`)
   const before = await snapshotDigestForDirectory(scan.target, config); if (before !== plan.snapshotDigest) throw new Error('Target changed since this scan. Create a follow-up scan before executing validation.')
-  const receipts = await executeValidationCommands(resolve(scan.target), plan.commands.map(item => item.command), timeoutMs, plan.snapshotDigest)
+  const receipts = await executeValidationCommands(resolve(scan.target), plan.commands.map(item => item.command), timeoutMs, plan.snapshotDigest, signal)
   const after = await snapshotDigestForDirectory(scan.target, config); if (after !== plan.snapshotDigest) throw new Error('Target changed during isolated validation; receipts were not attached to this scan.')
   const reloaded = await loadScan(state, scanId); const currentFinding = reloaded.findings.find(item => item.candidateId === candidateId); const currentTask = reloaded.tasks.find(item => item.id === task.id)
   if (!currentFinding || !currentTask || currentTask.status !== 'claimed' || currentTask.claim?.token !== claimToken) throw new Error('Candidate validation task changed while commands were running; receipts were not attached.')
