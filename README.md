@@ -22,7 +22,7 @@ Deep workers are DSH-native child agents. Their scoped tool view is restricted t
 | Threat model, attack-path write-up, DSH-local reports | `security_threat_model_template`, `security_finding_writeup`, and state tools |
 | GitHub, Jira, Linear tracking | Exact preview, GitHub duplicate lookup, and explicit one-at-a-time creation with durable receipts |
 
-The plugin does not require an external security vendor credential. Any future GitHub, Jira, or Linear write integration remains explicitly approval-gated and must use the user-configured provider credentials.
+The plugin does not require an external security vendor credential. Any GitHub, Jira, or Linear write integration is gated by DSH's native one-shot user-approval service and must use the user-configured provider credentials. The model-facing `approved: true` field is only an acknowledgement that the proposed action was reviewed; it is never an authorization grant. Profiles without a DSH approval route fail closed for every source, hook, command-plan, and third-party write.
 
 Deep delegated discovery is available only through DSH's native agent runtime. `security_deep_discovery_capability` reports whether the active profile can provide that runtime. `security_start_deep_discovery` creates exactly six independent worker agents per round. All workers receive one immutable, exhaustive source worklist and must submit an independent threat model, a closure for every worklist row, source-backed candidates, and explicit deferrals. The suite saves worker artifacts, coverage ledger, reconciliation records, and absorbed-candidate provenance before it can record saturation after a fully completed zero-novelty round. DSH call cancellation disposes active workers and records a cancelled, incomplete round without merging its candidates; `security_resume_deep_discovery` starts fresh independent workers and merges only completed-round evidence. If the installed DSH profile cannot create or drive subagents, the job fails explicitly; it does not substitute a local static pass or any external agent runtime.
 
@@ -40,9 +40,9 @@ The scanner inventories eligible source files deterministically, skips dependenc
 - `security_cancel_investigation` and `security_resume_investigation` preserve task recovery; claims use expiring leases.
 - `security_run_validation` executes a simple command in a disposable copy and saves its receipt; `security_remediation_plan`, `security_apply_remediation`, and `security_rollback_remediation` provide an approval-gated, stale-safe and reversible repair lifecycle.
 - `security_run_candidate_validation` binds one disposable test/build receipt to a claimed candidate-validation task and its ledger. It records evidence only; the final validation conclusion remains an explicit source-backed review step.
-- `security_plan_candidate_validation` previews preflight-derived commands; `security_run_candidate_validation_plan` approval-gates their isolated execution and preserves every per-command receipt.
-- `security_install_precommit_hook` changes a repository only when `approved: true` is explicitly supplied; it preserves an existing hook.
-- `security_tracking_preview` builds the exact GitHub, Jira, or Linear issue and can perform provider-scoped, read-only duplicate lookup. `security_create_tracking_issue` requires approval, blocks duplicate local writes, verifies every successful provider write by readback, and saves a token-free receipt.
+- `security_plan_candidate_validation` previews preflight-derived commands; `security_run_candidate_validation_plan` requires both reviewed acknowledgement and DSH one-shot user approval before isolated execution, then preserves every per-command receipt.
+- `security_install_precommit_hook`, `security_apply_remediation`, and `security_rollback_remediation` require both reviewed acknowledgement and DSH one-shot user approval for each write; a missing approval route fails closed.
+- `security_tracking_preview` builds the exact GitHub, Jira, or Linear issue and can perform provider-scoped, read-only duplicate lookup. `security_create_tracking_issue` requires reviewed acknowledgement plus DSH one-shot user approval, blocks duplicate local writes, verifies every successful provider write by readback, and saves a token-free receipt.
 
 ## Install
 

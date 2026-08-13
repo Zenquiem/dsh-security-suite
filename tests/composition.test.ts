@@ -1,6 +1,9 @@
 import assert from 'node:assert/strict'
 import { execFile } from 'node:child_process'
 import { existsSync } from 'node:fs'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { promisify } from 'node:util'
 import test from 'node:test'
@@ -55,4 +58,57 @@ test('the built npm entrypoint registers and executes through the real DSH tool 
     await fiber.dispose()
   }
   assert.equal(ctx.tools.get('security_deep_discovery_capability'), undefined)
+})
+
+test('write tools require DSH user approval in addition to approved: true', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-security-suite-approval-'))
+  const previousDirectory = process.cwd()
+  const ctx = new Context()
+  new SystemPrompt(ctx, {})
+  new ToolRegistry(ctx, {})
+  let approvalRequests = 0
+  ctx.provide('approval', {
+    async request() {
+      approvalRequests += 1
+      return 'allowed-once'
+    },
+  })
+  const fiber = await ctx.plugin({ name, inject, apply }, { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: '' })
+  try {
+    process.chdir(workspace)
+    const missingAcknowledgement = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'approval-false' as never, name: 'security_install_precommit_hook', arguments: { approved: false }, agent: {} as never })
+    assert.equal(missingAcknowledgement.isError, true)
+    assert.match(missingAcknowledgement.isError ? missingAcknowledgement.error.message : '', /requires approved: true/)
+    assert.equal(approvalRequests, 0)
+    assert.equal(existsSync(join(workspace, '.git', 'hooks', 'pre-commit')), false)
+
+    const approved = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'approval-allowed' as never, name: 'security_install_precommit_hook', arguments: { approved: true }, agent: {} as never })
+    assert.equal(approved.isError, false, approved.isError ? approved.error.message : '')
+    assert.equal(approvalRequests, 1)
+    assert.match(await readFile(join(workspace, '.git', 'hooks', 'pre-commit'), 'utf8'), /dsh run/)
+  } finally {
+    process.chdir(previousDirectory)
+    await fiber.dispose()
+    await rm(workspace, { recursive: true, force: true })
+  }
+})
+
+test('write tools fail closed when their DSH approval route is unavailable', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-security-suite-no-approval-'))
+  const previousDirectory = process.cwd()
+  const ctx = new Context()
+  new SystemPrompt(ctx, {})
+  new ToolRegistry(ctx, {})
+  const fiber = await ctx.plugin({ name, inject, apply }, { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: '' })
+  try {
+    process.chdir(workspace)
+    const denied = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'approval-unavailable' as never, name: 'security_install_precommit_hook', arguments: { approved: true }, agent: {} as never })
+    assert.equal(denied.isError, true)
+    assert.match(denied.isError ? denied.error.message : '', /Install the suite pre-commit hook/)
+    assert.equal(existsSync(join(workspace, '.git', 'hooks', 'pre-commit')), false)
+  } finally {
+    process.chdir(previousDirectory)
+    await fiber.dispose()
+    await rm(workspace, { recursive: true, force: true })
+  }
 })

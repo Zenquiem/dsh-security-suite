@@ -16,6 +16,18 @@ export const name = 'dsh-security-suite'
 export const inject = ['tools', 'systemPrompt']
 export { Config }
 
+const WRITE_ACTION_APPROVALS: Readonly<Record<string, string>> = {
+  security_run_candidate_validation_plan: 'Run the reviewed candidate validation plan in an isolated copy. It can execute local project commands and attach their receipts to the investigation.',
+  security_apply_remediation: 'Apply the reviewed remediation patch to the workspace source tree and create a rollback record.',
+  security_rollback_remediation: 'Restore the recorded source bytes for the reviewed remediation and create a verification scan.',
+  security_install_precommit_hook: 'Install the suite pre-commit hook in this repository.',
+  security_create_tracking_issue: 'Create one external security tracking issue using the supplied provider credentials.',
+}
+
+function hasExplicitApproval(argumentsValue: unknown): boolean {
+  return typeof argumentsValue === 'object' && argumentsValue !== null && (argumentsValue as Record<string, unknown>).approved === true
+}
+
 /**
  * DSH's value-schema DSL represents object requiredness on each property,
  * whereas JSON Schema represents it as an object-level list. Keep the tool
@@ -42,6 +54,18 @@ const defineTool = ((options: unknown) => {
 
 export function apply(ctx: Context, config: PluginConfig): void {
   if (!config.enabled) return
+
+  // `ask` is resolved by DSH's native approval seam. It is deliberately a
+  // registry policy, rather than a tool-body convention, so model arguments
+  // alone cannot authorize a filesystem or third-party-system write.
+  ctx.on('tools/pre-execute', async (exec, next) => {
+    const reason = WRITE_ACTION_APPROVALS[exec.name]
+    if (!reason) return next()
+    if (!hasExplicitApproval(exec.arguments)) {
+      return { kind: 'deny', reason: `tool "${exec.name}" requires approved: true after the proposed action has been reviewed` }
+    }
+    return { kind: 'ask', reason }
+  })
 
   ctx.systemPrompt.section({
     name: 'dsh-security-suite:review-guidance',
@@ -129,7 +153,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_run_candidate_validation_plan', description: 'Execute the scan-time preflight validation commands in one disposable copy and attach every command outcome to one claimed candidate task. Requires explicit approval and records evidence only; it never infers the final security conclusion.', parameters: { scan_id: { type: 'string', required: true, description: 'Open investigation scan identifier.' }, candidate_id: { type: 'string', required: true, description: 'Candidate identifier.' }, claim_token: { type: 'string', required: true, description: 'Validation task claim token.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing security_plan_candidate_validation output.' }, timeout_ms: { type: 'number', description: 'Per-command timeout from 1,000 to 600,000 ms; default 120,000.' } },
+    name: 'security_run_candidate_validation_plan', description: 'Execute the scan-time preflight validation commands in one disposable copy and attach every command outcome to one claimed candidate task. Requires reviewed acknowledgement plus DSH one-shot user approval and records evidence only; it never infers the final security conclusion.', parameters: { scan_id: { type: 'string', required: true, description: 'Open investigation scan identifier.' }, candidate_id: { type: 'string', required: true, description: 'Candidate identifier.' }, claim_token: { type: 'string', required: true, description: 'Validation task claim token.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing security_plan_candidate_validation output; this does not replace DSH user approval.' }, timeout_ms: { type: 'number', description: 'Per-command timeout from 1,000 to 600,000 ms; default 120,000.' } },
     output: { schema: { type: 'object', properties: { id: { type: 'string' }, scanId: { type: 'string' }, candidateId: { type: 'string' }, snapshotDigest: { type: 'string' }, commands: { type: 'array', items: { type: 'object', properties: { command: { type: 'string' }, reason: { type: 'string' } }, required: ['command', 'reason'], additionalProperties: false } }, receipts: { type: 'array', items: { type: 'object', properties: { id: { type: 'string' }, command: { type: 'string' }, timedOut: { type: 'boolean' }, durationMs: { type: 'number' }, stdout: { type: 'string' }, stderr: { type: 'string' }, snapshotDigest: { type: 'string' }, artifactRef: { type: 'string' } }, required: ['id', 'command', 'timedOut', 'durationMs', 'stdout', 'stderr', 'snapshotDigest', 'artifactRef'], additionalProperties: false } }, artifactRef: { type: 'string' } }, required: ['id', 'scanId', 'candidateId', 'snapshotDigest', 'commands', 'receipts', 'artifactRef'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args, exec) { return runCandidateValidationPlan(process.cwd(), config, args.scan_id, args.candidate_id, args.claim_token, args.approved, args.timeout_ms ?? 120_000, exec.signal) },
   }))
@@ -338,19 +362,19 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_apply_remediation', description: 'Apply one explicitly reviewable safe remediation only after approval. It rejects stale targets, saves an exact rollback record, rescans, and records the verification scan.', parameters: { scan_id: { type: 'string', required: true, description: 'Source scan identifier.' }, remediation_id: { type: 'string', required: true, description: 'Identifier from security_remediation_plan.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the patch and approving the source change.' } },
+    name: 'security_apply_remediation', description: 'Apply one explicitly reviewable safe remediation only after reviewed acknowledgement plus DSH one-shot user approval. It rejects stale targets, saves an exact rollback record, rescans, and records the verification scan.', parameters: { scan_id: { type: 'string', required: true, description: 'Source scan identifier.' }, remediation_id: { type: 'string', required: true, description: 'Identifier from security_remediation_plan.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the patch; this does not replace DSH user approval.' } },
     output: { schema: { type: 'object', properties: { id: { type: 'string' }, findingId: { type: 'string' }, status: { type: 'string' }, appliedAt: { type: 'string' }, verificationScanId: { type: 'string' }, rollbackId: { type: 'string' } }, required: ['id', 'findingId', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args) { return applyRemediationProposal(process.cwd(), config, args.scan_id, args.remediation_id, args.approved) },
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_rollback_remediation', description: 'Restore the exact pre-application content for one approved remediation only after explicit approval. It refuses a changed applied state, then runs a verification rescan and saves the rollback receipt.', parameters: { scan_id: { type: 'string', required: true, description: 'Source scan identifier.' }, remediation_id: { type: 'string', required: true, description: 'Applied remediation identifier.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the rollback record and approving the source change.' } },
+    name: 'security_rollback_remediation', description: 'Restore the exact pre-application content for one approved remediation only after reviewed acknowledgement plus DSH one-shot user approval. It refuses a changed applied state, then runs a verification rescan and saves the rollback receipt.', parameters: { scan_id: { type: 'string', required: true, description: 'Source scan identifier.' }, remediation_id: { type: 'string', required: true, description: 'Applied remediation identifier.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the rollback record; this does not replace DSH user approval.' } },
     output: { schema: { type: 'object', properties: { id: { type: 'string' }, remediationId: { type: 'string' }, scanId: { type: 'string' }, file: { type: 'string' }, status: { type: 'string' }, rolledBackAt: { type: 'string' }, verificationScanId: { type: 'string' } }, required: ['id', 'remediationId', 'scanId', 'file', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args) { return rollbackRemediationProposal(process.cwd(), config, args.scan_id, args.remediation_id, args.approved) },
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_install_precommit_hook', description: 'Install the suite pre-commit review hook only after explicit approval. It preserves an existing hook and never overwrites it.', parameters: { approved: { type: 'boolean', required: true, description: 'Set true only after reviewing and approving the repository change.' } },
+    name: 'security_install_precommit_hook', description: 'Install the suite pre-commit review hook only after reviewed acknowledgement plus DSH one-shot user approval. It preserves an existing hook and never overwrites it.', parameters: { approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the repository change; this does not replace DSH user approval.' } },
     output: { schema: { type: 'object', properties: { installed: { type: 'boolean' }, path: { type: 'string' }, reason: { type: 'string' } }, required: ['installed', 'path'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args) { return installPreCommitHook(process.cwd(), args.approved) },
   }))
@@ -362,7 +386,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_create_tracking_issue', description: 'Create exactly one GitHub, Jira, or Linear issue only after explicit approval. It performs provider-scoped duplicate detection, prevents duplicate local writes, verifies the created issue by readback, and persists a token-free receipt.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Reportable finding identifier.' }, provider: { type: 'string', required: true, enum: ['github', 'jira', 'linear'], description: 'External tracker.' }, token: { type: 'string', required: true, description: 'Provider credential used only for this request.' }, repository: { type: 'string', description: 'GitHub repository owner/name.' }, endpoint: { type: 'string', description: 'Jira base URL or Linear GraphQL endpoint.' }, project: { type: 'string', description: 'Jira project key or Linear team id.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing security_tracking_preview output.' } },
+    name: 'security_create_tracking_issue', description: 'Create exactly one GitHub, Jira, or Linear issue only after reviewed acknowledgement plus DSH one-shot user approval. It performs provider-scoped duplicate detection, prevents duplicate local writes, verifies the created issue by readback, and persists a token-free receipt.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Reportable finding identifier.' }, provider: { type: 'string', required: true, enum: ['github', 'jira', 'linear'], description: 'External tracker.' }, token: { type: 'string', required: true, description: 'Provider credential used only for this request.' }, repository: { type: 'string', description: 'GitHub repository owner/name.' }, endpoint: { type: 'string', description: 'Jira base URL or Linear GraphQL endpoint.' }, project: { type: 'string', description: 'Jira project key or Linear team id.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing security_tracking_preview output; this does not replace DSH user approval.' } },
     output: { schema: { type: 'object', properties: { id: { type: 'string' }, provider: { type: 'string' }, status: { type: 'string' }, writeSucceeded: { type: 'boolean' }, externalId: { type: 'string' }, url: { type: 'string' }, duplicateOf: { type: 'string' }, error: { type: 'string' } }, required: ['id', 'provider', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args) { return createTracking(config, { provider: args.provider as 'github' | 'jira' | 'linear', scanId: args.scan_id, findingId: args.finding_id, token: args.token, repository: args.repository, endpoint: args.endpoint, project: args.project, approved: args.approved }) },
   }))
