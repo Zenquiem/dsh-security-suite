@@ -8,6 +8,13 @@ test('Python local flow resolves request-derived values at command and SSRF sink
   assert.deepEqual(analyzePythonFlow(source, 'app.py').map(item => item.rule).sort(), ['shell-command-construction', 'ssrf-request-sink'])
 })
 
+test('Python SSRF analysis distinguishes destination arguments from request payloads', () => {
+  const source = 'payload = request.json\nrequests.post("https://api.example.test/events", json=payload)\ntarget = request.args.get("target")\nrequests.request("GET", target, json=payload)\n'
+  const result = analyzePythonFlow(source, 'outbound.py')
+  assert.deepEqual(result.map(item => item.rule), ['ssrf-request-sink'])
+  assert.equal(result[0]?.line, 4)
+})
+
 test('Go local flow resolves request-derived values at filesystem and command sinks', () => {
   const source = 'name := r.URL.Query().Get("name")\npath := "/tmp/" + name\nos.ReadFile(path)\nexec.Command("sh", "-c", name)\n'
   assert.deepEqual(analyzeGoFlow(source, 'main.go').map(item => item.rule).sort(), ['path-traversal-sink', 'shell-command-construction'])
@@ -97,6 +104,16 @@ for (const item of structuredCases) test(`${item.language} structured analysis t
   assert.equal(result.candidates.length, 1)
   assert.equal(result.candidates[0]?.rule, 'shell-command-construction')
   assert.equal(result.candidates[0]?.evidence.some(evidence => evidence.detail.includes('structured function data-flow')), true)
+})
+
+test('Java structured SSRF analysis follows a request-derived URL destination', () => {
+  const result = analyzeStructuredFlow([{ file: 'Handler.java', source: 'class Handler {\n void outbound(String url) { new URL(url); }\n void route(Request request) { outbound(request.getParameter("url")); }\n}' }], 'java')
+  assert.deepEqual(result.candidates.map(item => item.rule), ['ssrf-request-sink'])
+})
+
+test('C# structured SSRF analysis does not treat a request body sent to a fixed destination as SSRF', () => {
+  const result = analyzeStructuredFlow([{ file: 'Handler.cs', source: 'class Handler {\n void outbound(string body) { client.PostAsync("https://api.example.test/events", body); }\n void route(HttpRequest Request) { outbound(Request.Body); }\n}' }], 'csharp')
+  assert.equal(result.candidates.some(item => item.rule === 'ssrf-request-sink'), false)
 })
 
 test('structured analysis does not report a static call to a sensitive Java wrapper', () => {

@@ -97,10 +97,19 @@ function localFunctions(program: AstNode): FunctionRecord[] {
   return records
 }
 
+function propertyName(node: AstNode | undefined): string { return node?.computed ? literal(node.key as AstNode).toLowerCase() : id(node?.key as AstNode)?.toLowerCase() ?? '' }
+
+function outboundDestinationArguments(argumentsList: AstNode[]): AstNode[] {
+  const first = argumentsList[0]
+  if (!first || first.type !== 'ObjectExpression') return first ? [first] : []
+  const destinations = new Set(['url', 'uri', 'href', 'host', 'hostname', 'baseurl'])
+  return ((first.properties ?? []) as AstNode[]).flatMap(property => property.type === 'Property' && destinations.has(propertyName(property)) ? [property.value as AstNode] : [])
+}
+
 function sinkFor(node: AstNode): Array<{ rule: AstRule; sink: string; argumentsList: AstNode[] }> {
   if (node.type !== 'CallExpression') return []
   const sink = memberName(node.callee as AstNode).toLowerCase(); const final = sink.split('.').at(-1) ?? sink; const argumentsList = (node.arguments ?? []) as AstNode[]
-  return AST_RULES.filter(rule => rule.sinks.includes(final) && (rule.id !== 'ssrf-request-sink' || /(?:fetch|axios|request|http|https)/.test(sink))).map(rule => ({ rule, sink, argumentsList }))
+  return AST_RULES.filter(rule => rule.sinks.includes(final) && (rule.id !== 'ssrf-request-sink' || /(?:fetch|axios|request|http|https)/.test(sink))).map(rule => ({ rule, sink, argumentsList: rule.id === 'ssrf-request-sink' ? outboundDestinationArguments(argumentsList) : argumentsList }))
 }
 
 /** Fixed-point summaries for named local functions: parameter index -> reachable sink. */

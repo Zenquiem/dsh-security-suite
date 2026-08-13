@@ -77,6 +77,21 @@ function calls(line: string, _language: 'python' | 'go'): Array<{ name: string; 
   return result
 }
 
+function sinkTainted(value: string, rule: FlowRule, tainted: Set<string>, sources: RegExp, language: 'python' | 'go'): boolean {
+  if (rule.id !== 'ssrf-request-sink') return expressionTainted(value, tainted, sources)
+  for (const call of calls(value, language)) {
+    rule.sink.lastIndex = 0
+    if (!rule.sink.test(`${call.name}(`)) continue
+    // Python request(method, url, ...) places its destination second; ordinary
+    // get/post and Go http.Get/Post place it first. client.Do receives a request
+    // object and is intentionally not treated as a proven URL flow here.
+    const index = language === 'python' && /\.(?:request)$/.test(call.name) ? 1 : 0
+    if (call.name === 'client.Do') continue
+    if (call.args[index] && expressionTainted(call.args[index], tainted, sources)) return true
+  }
+  return false
+}
+
 function candidateKey(item: Candidate): string { return `${item.rule}:${item.file}:${item.line}:${item.excerpt}` }
 
 function pythonFunctions(file: string, source: string): FlowFunction[] {
@@ -180,7 +195,7 @@ function summaries(modules: Map<string, ParsedModule>, functions: Map<string, Fl
       for (let fixpoint = 0; fixpoint <= assigns.length; fixpoint++) { let propagated = false; for (const item of assigns) if (!tainted.has(item.name) && expressionTainted(item.value, tainted, sources)) { tainted.add(item.name); propagated = true }; if (!propagated) break }
       const module = modules.get(fn.file); if (!module) continue
       for (const [offset, value] of fn.lines.entries()) {
-        for (const rule of rules) { rule.sink.lastIndex = 0; if (rule.sink.test(value) && expressionTainted(value, tainted, sources)) changed = add(fn, index, { rule, line: fn.start + offset + 1, excerpt: value.trim().slice(0, 240) }) || changed }
+        for (const rule of rules) { rule.sink.lastIndex = 0; if (rule.sink.test(value) && sinkTainted(value, rule, tainted, sources, language)) changed = add(fn, index, { rule, line: fn.start + offset + 1, excerpt: value.trim().slice(0, 240) }) || changed }
         for (const call of calls(value, language)) { const target = resolveCall(module, call.name, functions, language); if (!target) continue; for (const [targetIndex] of target.params.entries()) if (call.args[targetIndex] && expressionTainted(call.args[targetIndex], tainted, sources)) for (const sink of summary.get(target.id)?.get(targetIndex) ?? []) changed = add(fn, index, sink) || changed }
       }
     }
@@ -214,7 +229,7 @@ function local(source: string, file: string, language: 'python' | 'go'): Candida
   const rules = language === 'python' ? PYTHON_RULES : GO_RULES; const sources = language === 'python' ? PYTHON_SOURCE : GO_SOURCE; const lines = source.split(/\r?\n/); const tainted = new Set<string>(); const assigned: Array<{ name: string; value: string }> = []
   for (const value of lines) { const item = assignment(value, language); if (item) assigned.push(item) }
   for (let pass = 0; pass <= assigned.length; pass++) { let changed = false; for (const item of assigned) if (!tainted.has(item.name) && expressionTainted(item.value, tainted, sources)) { tainted.add(item.name); changed = true }; if (!changed) break }
-  const candidates: Candidate[] = []; for (const [index, value] of lines.entries()) for (const rule of rules) { rule.sink.lastIndex = 0; if (rule.sink.test(value) && expressionTainted(value, tainted, sources)) candidates.push(evidence(rule, file, index + 1, value.trim().slice(0, 240), `${language} local data-flow`)) }
+  const candidates: Candidate[] = []; for (const [index, value] of lines.entries()) for (const rule of rules) { rule.sink.lastIndex = 0; if (rule.sink.test(value) && sinkTainted(value, rule, tainted, sources, language)) candidates.push(evidence(rule, file, index + 1, value.trim().slice(0, 240), `${language} local data-flow`)) }
   return candidates
 }
 

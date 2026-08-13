@@ -33,6 +33,18 @@ test('AST analysis does not treat static sensitive calls as request-derived find
   assert.equal(result.candidates.length, 0)
 })
 
+test('AST analysis treats only outbound destinations, not request payloads, as SSRF-sensitive', () => {
+  const result = analyzeJavaScriptAst(`
+    function route(req) {
+      fetch('https://api.example.test/events', { method: 'POST', body: req.body.payload })
+      axios.request({ url: req.query.target, data: req.body.payload })
+      request({ url: req.query.secondary, headers: { authorization: req.headers.authorization } })
+    }
+  `, 'outbound.ts')
+  assert.deepEqual(result.candidates.map(candidate => candidate.rule), ['ssrf-request-sink', 'ssrf-request-sink'])
+  assert.deepEqual(result.candidates.map(candidate => candidate.line), [4, 5])
+})
+
 test('AST analysis follows request input through named local helper calls to a sensitive sink', () => {
   const result = analyzeJavaScriptAst(`
     function executeTemplate(command) { exec(command) }

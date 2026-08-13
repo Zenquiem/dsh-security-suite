@@ -82,6 +82,31 @@ function calls(value: string): Array<{ name: string; args: string[] }> {
   return results
 }
 
+function sinkTainted(value: string, rule: Rule, tainted: Set<string>, source: RegExp, language: Language): boolean {
+  if (rule.id !== 'ssrf-request-sink') {
+    rule.sink.lastIndex = 0
+    return rule.sink.test(value) && sourceTainted(value, tainted, source)
+  }
+  rule.sink.lastIndex = 0
+  if (!rule.sink.test(value)) return false
+  for (const call of calls(value)) {
+    const names: Record<Language, Set<string>> = {
+      java: new Set(['URL', 'create', 'getForObject', 'exchange']), csharp: new Set(['GetAsync', 'GetStringAsync', 'PostAsync', 'SendAsync']),
+      php: new Set(['curl_setopt', 'file_get_contents']), ruby: new Set(['get', 'get_response', 'post', 'open']), c: new Set(), cpp: new Set(), rust: new Set(['get', 'post', 'request']),
+    }
+    if (!names[language].has(call.name)) continue
+    // curl_setopt(handle, CURLOPT_URL, value) is the sole supported sink whose
+    // destination is not first. Request-object APIs stay unresolved by design.
+    if (language === 'php' && call.name === 'curl_setopt') {
+      if (/CURLOPT_URL/.test(call.args[1] ?? '') && call.args[2] && sourceTainted(call.args[2], tainted, source)) return true
+      continue
+    }
+    if ((language === 'csharp' && call.name === 'SendAsync') || (language === 'rust' && call.name === 'request')) continue
+    if (call.args[0] && sourceTainted(call.args[0], tainted, source)) return true
+  }
+  return false
+}
+
 function paramNames(value: string, language?: Language): string[] {
   if (language === 'rust') return value.split(',').map(item => item.trim().replace(/^&(?:mut\s+)?/, '').replace(/^mut\s+/, '').match(/^([A-Za-z_]\w*)\s*(?::|$)/)?.[1] ?? '').filter(item => /^[A-Za-z_]\w*$/.test(item) && item !== 'self')
   return value.split(',').map(item => (item.match(/\$?[A-Za-z_]\w*\s*(?:=[^,]*)?$/)?.[0] ?? '').replace(/^\$/, '').replace(/\s*=.*$/, '').trim()).filter(item => /^[A-Za-z_]\w*$/.test(item))
@@ -119,9 +144,26 @@ export function analyzeStructuredFlow(inputs: ModuleInput[], language: Language)
   const lookup = (file: string, name: string): FunctionRecord | undefined => byDirectory.get(dirname(file))?.get(name)
   const summaries = new Map<string, Map<number, Sink[]>>([...byId.values()].map(fn => [fn.id, new Map()])); const rules = RULES[language]; const source = SOURCES[language]
   const add = (fn: FunctionRecord, index: number, sink: Sink): boolean => { const values = summaries.get(fn.id)?.get(index) ?? []; const key = `${sink.rule.id}:${sink.line}`; if (values.some(item => `${item.rule.id}:${item.line}` === key)) return false; summaries.get(fn.id)?.set(index, [...values, sink]); return true }
-  for (let pass = 0; pass < byId.size * Math.max(2, byId.size) + 1; pass++) { let changed = false; for (const fn of byId.values()) for (const [parameterIndex, parameter] of fn.params.entries()) { const tainted = new Set([parameter]); const assignments = fn.lines.map(value => variableAssignment(value, language)).filter((item): item is { name: string; expression: string } => Boolean(item)); for (let round = 0; round <= assignments.length; round++) { let propagated = false; for (const item of assignments) if (!tainted.has(item.name) && sourceTainted(item.expression, tainted, source)) { tainted.add(item.name); propagated = true }; if (!propagated) break }
-    for (const [offset, value] of fn.lines.entries()) { for (const rule of rules) { rule.sink.lastIndex = 0; if (rule.sink.test(value) && sourceTainted(value, tainted, source)) changed = add(fn, parameterIndex, { rule, line: fn.start + offset + 1, excerpt: value.trim().slice(0, 240) }) || changed }; for (const call of calls(value)) { const target = lookup(fn.file, call.name); if (!target) continue; for (const [targetIndex] of target.params.entries()) if (call.args[targetIndex] && sourceTainted(call.args[targetIndex], tainted, source)) for (const sink of summaries.get(target.id)?.get(targetIndex) ?? []) changed = add(fn, parameterIndex, sink) || changed } }
-  }; if (!changed) break }
+  for (let pass = 0; pass < byId.size * Math.max(2, byId.size) + 1; pass++) {
+    let changed = false
+    for (const fn of byId.values()) for (const [parameterIndex, parameter] of fn.params.entries()) {
+      const tainted = new Set([parameter])
+      const assignments = fn.lines.map(value => variableAssignment(value, language)).filter((item): item is { name: string; expression: string } => Boolean(item))
+      for (let round = 0; round <= assignments.length; round++) {
+        let propagated = false
+        for (const item of assignments) if (!tainted.has(item.name) && sourceTainted(item.expression, tainted, source)) { tainted.add(item.name); propagated = true }
+        if (!propagated) break
+      }
+      for (const [offset, value] of fn.lines.entries()) {
+        for (const rule of rules) if (sinkTainted(value, rule, tainted, source, language)) changed = add(fn, parameterIndex, { rule, line: fn.start + offset + 1, excerpt: value.trim().slice(0, 240) }) || changed
+        for (const call of calls(value)) {
+          const target = lookup(fn.file, call.name); if (!target) continue
+          for (const [targetIndex] of target.params.entries()) if (call.args[targetIndex] && sourceTainted(call.args[targetIndex], tainted, source)) for (const sink of summaries.get(target.id)?.get(targetIndex) ?? []) changed = add(fn, parameterIndex, sink) || changed
+        }
+      }
+    }
+    if (!changed) break
+  }
   const candidates: Candidate[] = []; for (const module of modules.values()) { const tainted = new Set<string>(); const assignments = module.lines.map(value => variableAssignment(value, language)).filter((item): item is { name: string; expression: string } => Boolean(item)); for (let round = 0; round <= assignments.length; round++) { let propagated = false; for (const item of assignments) if (!tainted.has(item.name) && sourceTainted(item.expression, tainted, source)) { tainted.add(item.name); propagated = true }; if (!propagated) break }
     for (const [line, value] of module.lines.entries()) for (const call of calls(value)) { const target = lookup(module.file, call.name); if (!target) continue; for (const [parameterIndex] of target.params.entries()) if (call.args[parameterIndex] && sourceTainted(call.args[parameterIndex], tainted, source)) for (const sink of summaries.get(target.id)?.get(parameterIndex) ?? []) candidates.push(candidate(sink.rule, target.file, sink.line, sink.excerpt, language, { file: module.file, line: line + 1, excerpt: value.trim().slice(0, 240) })) }
   }
