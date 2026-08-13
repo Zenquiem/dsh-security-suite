@@ -3,9 +3,10 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { createDeepDiscoveryJob, getDeepWorklist, loadDeepDiscoveryJob, readDeepSource, reportDeepCandidate, reportDeepWorker, runDeepDiscovery } from '../src/deep-discovery.ts'
+import { createDeepClosureJob, createDeepDiscoveryJob, getDeepWorklist, loadDeepDiscoveryJob, readDeepSource, readScanSource, reportDeepCandidate, reportDeepWorker, runDeepClosure, runDeepDiscovery } from '../src/deep-discovery.ts'
 import { runScan } from '../src/scanner.ts'
 import { loadScan, saveScan } from '../src/state.ts'
+import { claimAuditTask, recordAttackPath, recordValidation } from '../src/workbench.ts'
 
 test('deep candidate reports require the exact active worker token and readable source location', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
@@ -117,6 +118,79 @@ test('claimed workers can read only the immutable authoritative worklist and sou
     await assert.rejects(() => readDeepSource(config, job.id, 'worker_1_1', 'claim', '../outside.ts'), /authoritative/)
     await writeFile(join(root, 'app.ts'), 'const changed = 2\n')
     await assert.rejects(() => readDeepSource(config, job.id, 'worker_1_1', 'claim', 'app.ts'), /changed after/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+function deepClosureContext(config: { stateDir: string }, phase: 'validation' | 'attack_path') {
+  let created = 0; const restrictions: string[][] = []
+  const ctx = { agents: { async create(options: { setup?: (ctx: { tools: { restrict(filter: { allow: string[] }): void }; systemPrompt: { section(section: { name: string }): void } }) => void }) {
+    const index = ++created; let prompt = ''
+    options.setup?.({ tools: { restrict(filter) { restrictions.push(filter.allow) } }, systemPrompt: { section() {} } })
+    return { agent: { followup(message: { content: Array<{ text?: string }> }) { prompt = message.content[0]?.text ?? '' }, async whenIdle() {
+      if (index !== 1) return
+      const scanId = /scan_id (scan_[0-9a-f-]+)/.exec(prompt)?.[1]; const owner = /owner (closure_[a-z_]+_\d+_\d+)/.exec(prompt)?.[1]
+      if (!scanId || !owner) throw new Error('closure worker brief was incomplete')
+      while (true) {
+        const task = await claimAuditTask(config as never, scanId, owner, phase)
+        if (!task) return
+        if (phase === 'validation') await recordValidation(config as never, scanId, task.candidateId, { conclusion: 'reportable', method: 'static', attacker: 'Remote caller able to provide a request parameter.', entryPoint: 'Request handler input.', trustBoundary: 'Untrusted request to application execution.', rootControl: 'Dynamic execution control.', sink: 'Dynamic code execution.', impact: 'Remote caller-controlled code execution.', directEvidence: 'Request-derived input reaches the reported execution operation.', counterevidence: 'No sanitizing or authorization control was found in the reviewed path.', limitations: 'Runtime reproduction was not performed in this isolated closure phase.', confidence: 'medium' }, task.claimToken)
+        else await recordAttackPath(config as never, scanId, task.candidateId, { attacker: 'Remote caller.', entryPoint: 'HTTP request parameter.', preconditions: 'The handler is reachable in the supported runtime.', dataflow: 'Request parameter -> dynamic execution control.', outcome: 'Attacker-controlled execution.', severityRationale: 'Remote input reaches a sensitive execution sink.', changeConditions: 'Lower severity if a complete upstream authorization boundary is established.' }, task.claimToken)
+      }
+    }, session: { deriveMessages: () => [{ role: 'assistant', content: [{ type: 'text', text: 'closure complete' }] }] } }, async dispose() {} }
+  } } }
+  return { ctx, count: () => created, restrictions }
+}
+
+test('centralized deep closure uses six restricted DSH workers and closes persistent validation then attack-path tasks', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    assert.equal(scan.tasks.filter(task => task.phase === 'validation').length > 0, true)
+    const validationJob = await createDeepClosureJob(config, scan.id, 'validation'); const validation = deepClosureContext(config, 'validation'); const validationResult = await runDeepClosure(validation.ctx as never, config, validationJob.id)
+    assert.equal(validation.count(), 6)
+    assert.equal(validationResult.lifecycle, 'completed')
+    assert.deepEqual(validation.restrictions[0], ['security_claim_audit_task', 'security_get_scan', 'security_read_scan_source', 'security_record_validation'])
+    const attackJob = await createDeepClosureJob(config, scan.id, 'attack_path'); const attack = deepClosureContext(config, 'attack_path'); const attackResult = await runDeepClosure(attack.ctx as never, config, attackJob.id)
+    assert.equal(attack.count(), 6)
+    assert.equal(attackResult.lifecycle, 'completed')
+    assert.deepEqual(attack.restrictions[0], ['security_claim_audit_task', 'security_get_scan', 'security_read_scan_source', 'security_record_attack_path'])
+    const closed = await loadScan(state, scan.id)
+    assert.equal(closed.findings.every(finding => finding.ledger.some(row => row.phase === 'validation') && (finding.disposition !== 'reportable' || finding.ledger.some(row => row.phase === 'attack_path'))), true)
+    assert.match(await readFile(join(closed.artifacts.directory, 'artifacts', '04_reconciliation', `deep-validation-closure-${validationJob.id}.json`), 'utf8'), /completed/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('centralized source reads fail closed when a scan-receipted file changes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'const original = 1\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    assert.match((await readScanSource(config, scan.id, 'app.ts')).content, /original/)
+    await writeFile(join(root, 'app.ts'), 'const changed = 2\n')
+    await assert.rejects(() => readScanSource(config, scan.id, 'app.ts'), /changed after/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('cancelled centralized deep closure preserves completed receipts and resumes with a fresh worker round', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    const job = await createDeepClosureJob(config, scan.id, 'validation'); const controller = new AbortController(); let created = 0; let releaseCreated!: () => void; const allCreated = new Promise<void>(resolve => { releaseCreated = resolve })
+    const stalled = { agents: { async create(options: { setup?: (ctx: { tools: { restrict(): void }; systemPrompt: { section(): void } }) => void }) { options.setup?.({ tools: { restrict() {} }, systemPrompt: { section() {} } }); if (++created === 6) releaseCreated(); return { agent: { followup() {}, async whenIdle() { await new Promise<void>(() => undefined) }, session: { deriveMessages: () => [] } }, async dispose() {} } } } }
+    const interrupted = runDeepClosure(stalled as never, config, job.id, controller.signal); await allCreated; controller.abort(); const cancelled = await interrupted
+    assert.equal(cancelled.lifecycle, 'cancelled')
+    const resumed = await runDeepClosure(deepClosureContext(config, 'validation').ctx as never, config, job.id)
+    assert.equal(resumed.lifecycle, 'completed')
+    assert.equal(resumed.workers.length, 12)
+    assert.equal(new Set(resumed.workers.map(worker => worker.id)).size, 12)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

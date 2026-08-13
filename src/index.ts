@@ -10,7 +10,7 @@ import { applyRemediationProposal, bulkScan, installPreCommitHook, planCandidate
 import { cancelInvestigation, claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation, resumeInvestigation } from './workbench.js'
 import { generateHardeningPortfolio, importFindings, importGitHubSecurityFindings, triageFindingBacklog, triageImportedFinding } from './analysis.js'
 import { createGitHubAdvisory, createTracking, previewGitHubAdvisory, previewTracking } from './tracking.js'
-import { createDeepDiscoveryJob, deepDiscoveryCapability, getDeepWorklist, readDeepSource, reportDeepCandidate, reportDeepWorker, runDeepDiscovery } from './deep-discovery.js'
+import { createDeepClosureJob, createDeepDiscoveryJob, deepDiscoveryCapability, getDeepWorklist, readDeepSource, readScanSource, reportDeepCandidate, reportDeepWorker, runDeepClosure, runDeepDiscovery } from './deep-discovery.js'
 
 export const name = 'dsh-security-suite'
 export const inject = ['tools', 'systemPrompt']
@@ -79,6 +79,24 @@ export function apply(ctx: Context, config: PluginConfig): void {
     name: 'security_deep_discovery_capability', description: 'Report whether this DSH profile exposes the native agent runtime required for six-worker delegated deep discovery. This performs no scan and creates no agent.', parameters: {},
     output: { schema: { type: 'object', properties: { available: { type: 'boolean' }, workersPerRound: { type: 'number' }, reason: { type: 'string' } }, required: ['available', 'workersPerRound'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute() { return deepDiscoveryCapability(ctx) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_read_scan_source', description: 'Read a bounded source range only when that exact path and digest belong to a saved scan receipt. This is for centralized DSH validation and attack-path workers; it refuses changed or unreceipted source.', parameters: { scan_id: { type: 'string', required: true }, path: { type: 'string', required: true }, start_line: { type: 'number' }, end_line: { type: 'number' } },
+    output: { schema: { type: 'object', properties: { path: { type: 'string' }, startLine: { type: 'number' }, endLine: { type: 'number' }, content: { type: 'string' }, sha256: { type: 'string' } }, required: ['path', 'startLine', 'endLine', 'content', 'sha256'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.content ?? '' }] },
+    async execute(args) { return readScanSource(config, args.scan_id, args.path, args.start_line, args.end_line) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_start_deep_closure', description: 'Create and run a genuine six-worker DSH centralized closure phase for a deep investigation. Choose validation to close all discovered candidates, then attack_path to close all reportable validations. Workers can claim only their phase tasks, read only scan-receipted source, and persist evidence through the normal claim-token ledger.', parameters: { scan_id: { type: 'string', required: true, description: 'Open deep investigation scan identifier.' }, phase: { type: 'string', required: true, enum: ['validation', 'attack_path'], description: 'Centralized closure phase.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, scanId: { type: 'string' }, phase: { type: 'string' }, lifecycle: { type: 'string' }, completedTaskIds: { type: 'array', items: { type: 'string' } } }, required: ['id', 'scanId', 'phase', 'lifecycle', 'completedTaskIds'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args, exec) { const job = await createDeepClosureJob(config, args.scan_id, args.phase as 'validation' | 'attack_path'); return runDeepClosure(ctx, config, job.id, exec.signal) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_resume_deep_closure', description: 'Resume a cancelled or incomplete six-worker DSH centralized deep closure job. Completed receipts remain intact; only unfinished phase tasks may be claimed in the new worker round.', parameters: { job_id: { type: 'string', required: true, description: 'Cancelled or incomplete closure job identifier.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, scanId: { type: 'string' }, phase: { type: 'string' }, lifecycle: { type: 'string' }, completedTaskIds: { type: 'array', items: { type: 'string' } } }, required: ['id', 'scanId', 'phase', 'lifecycle', 'completedTaskIds'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args, exec) { return runDeepClosure(ctx, config, args.job_id, exec.signal) },
   }))
 
   ctx.tools.register(defineTool({
