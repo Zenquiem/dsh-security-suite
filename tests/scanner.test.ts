@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict'
 import { mkdtemp, mkdir, rm, writeFile } from 'node:fs/promises'
+import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { promisify } from 'node:util'
 import test from 'node:test'
-import { assessDirectory, resolveSafeTarget, runScan } from '../src/scanner.ts'
+import { assessDirectory, resolveSafeTarget, runDiffScan, runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan, loadScan, renderCsv, saveScan, saveTriageAnnotation, toSarif, verifyScanBundle, verifySeal } from '../src/state.ts'
+
+const execFileAsync = promisify(execFile)
 
 test('assessDirectory reports source candidates and skips dependencies', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
@@ -82,6 +86,48 @@ test('directory assessment keeps structured local-call resolution within one dir
 
 test('resolveSafeTarget rejects paths outside the workspace', () => {
   assert.throws(() => resolveSafeTarget('/workspace', '../outside'), /inside the current workspace/)
+})
+
+test('diff scan distinguishes added risks from deleted authorization and input controls', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'route.ts'), 'app.post("/admin", requireAuthorization, handler)\nvalidateRequest(req.body)\nconst response = "ok"\n')
+    await execFileAsync('git', ['add', 'route.ts'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'route.ts'), 'app.post("/admin", handler)\nconst script = req.query.code\neval(script)\n')
+    const scan = await runDiffScan(root, undefined, '', state)
+    const rules = scan.findings.map(finding => finding.ruleId).sort()
+    assert.deepEqual(rules, ['dangerous.dynamic.code', 'removed.authorization.control', 'removed.input.validation.control'])
+    assert.equal(scan.findings.filter(finding => finding.disposition === 'reportable').length, 3)
+    const authorization = scan.findings.find(finding => finding.ruleId === 'removed.authorization.control')
+    assert.ok(authorization)
+    assert.equal(authorization.locations[0]?.line, 1)
+    assert.equal(authorization.evidence.some(item => item.kind === 'counterevidence' && item.location?.role === 'expected_control'), true)
+    assert.equal(scan.coverage.receipts.length, 1)
+    assert.equal(scan.coverage.receipts[0]?.path, 'route.ts')
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'removed-authorization-control')?.matches, 1)
+    assert.deepEqual(scan.recipe.passes, ['diff-added-lines', 'diff-removed-controls'])
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('diff scan does not classify ordinary deleted code as a removed security control', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'app.ts'), 'const message = "hello"\n')
+    await execFileAsync('git', ['add', 'app.ts'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'app.ts'), '')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.equal(scan.findings.length, 0)
+    assert.equal(scan.coverage.receipts.length, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
 })
 
 test('scan records persist canonical findings and export SARIF', async () => {

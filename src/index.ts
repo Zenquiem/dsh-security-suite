@@ -263,7 +263,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: 'security_review_diff',
-    description: 'Read a Git diff in the current workspace and return it with security-review instructions. This is read-only.',
+    description: 'Perform a read-only native Git diff security review. It analyzes added code for dangerous behavior and deleted lines for removed authorization or input-validation controls, preserving changed-file receipts and static evidence.',
     parameters: {
       base: { type: 'string', description: 'Optional Git base ref. Defaults to the working tree diff.' },
     },

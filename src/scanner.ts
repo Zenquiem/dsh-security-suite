@@ -18,6 +18,13 @@ const TEXT_EXTENSIONS = new Set(['.c', '.cc', '.cpp', '.cs', '.go', '.java', '.j
 const MAX_DIFF_BYTES = 1_000_000
 const execFileAsync = promisify(execFile)
 
+interface RemovedControlRule { id: string; severity: Severity; cwe: string; rationale: string; pattern: RegExp }
+
+const REMOVED_CONTROL_RULES: RemovedControlRule[] = [
+  { id: 'removed-authorization-control', severity: 'high', cwe: 'CWE-862', rationale: 'The patch removes an explicit authentication, authorization, permission, token, or CSRF control. An equivalent replacement was not established in the changed hunk.', pattern: /(?:\b(?:require|ensure|check|enforce)(?:Auth(?:entication|orization)?|Permission|Access)|\b(?:authorize|isAuthorized|hasPermission|verify(?:Token|Jwt|JWT)|authenticate|authMiddleware|csrf(?:Protect|Middleware)|validateCsrf)\b|\.use\s*\(\s*(?:auth|authenticate|authorize))/i },
+  { id: 'removed-input-validation-control', severity: 'medium', cwe: 'CWE-20', rationale: 'The patch removes an explicit input validation, parsing, allowlist, or sanitization control. An equivalent replacement was not established in the changed hunk.', pattern: /(?:\b(?:validate(?:Input|Request|Schema)?|sanitize(?:Input)?|parse(?:Async)?|safeParse|allowlist|whitelist|escape(?:Html)?|check(?:Input|Schema)|isValid)\b|schema\.(?:parse|validate)|z\.[A-Za-z_]\w*\s*\()/i },
+]
+
 interface Rule { id: string; title: string; cwe: string; severity: Severity; rationale: string; pattern: RegExp; languages?: string[]; context?: RegExp }
 
 const RULES: Rule[] = [
@@ -225,17 +232,18 @@ async function targetSnapshot(root: string, receipts: FileReceipt[]): Promise<Ta
 
 function validateCandidate(finding: Finding): CandidateDisposition {
   const hasInputContext = finding.evidence.some(item => item.kind === 'context')
-  const direct = finding.ruleId === 'tls.verification.disabled' || (hasInputContext && ['dangerous.dynamic.code', 'shell.command.construction', 'path.traversal.sink', 'unsafe.deserialization', 'ssrf.request.sink'].includes(finding.ruleId))
+  const removedControl = ['removed.authorization.control', 'removed.input.validation.control'].includes(finding.ruleId)
+  const direct = removedControl || finding.ruleId === 'tls.verification.disabled' || (hasInputContext && ['dangerous.dynamic.code', 'shell.command.construction', 'path.traversal.sink', 'unsafe.deserialization', 'ssrf.request.sink'].includes(finding.ruleId))
   const disposition: CandidateDisposition = direct ? 'reportable' : 'suppressed'
   const conclusion = direct ? 'reportable' : 'suppressed'
-  const entry = hasInputContext ? 'Nearby source contains an input/request marker.' : 'No attacker-controlled entry point was established by the local static pass.'
+  const entry = removedControl ? 'The changed hunk deletes an explicit security control; equivalent replacement remains unproven.' : hasInputContext ? 'Nearby source contains an input/request marker.' : 'No attacker-controlled entry point was established by the local static pass.'
   const root = `${finding.locations[0].file}:${finding.locations[0].line} (${finding.ruleId})`
   finding.disposition = disposition
   finding.validation = direct ? `Static validation established a plausible path from request-derived input or an explicitly unsafe control to ${root}. Runtime reachability remains unexecuted.` : `Suppressed after static validation: ${entry}`
   finding.impact = direct ? 'The vulnerable control could expose the security boundary described by the rule family if the observed input path is reachable.' : 'No concrete attacker-controlled path was established.'
   finding.counterevidence = direct ? 'No equivalent local control was detected in the reviewed context. Runtime behavior was not executed.' : entry
   finding.confidence = direct && finding.ruleId === 'tls.verification.disabled' ? 'high' : direct ? 'medium' : 'low'
-  finding.validationRecord = { method: 'static', conclusion, attacker: direct ? 'An unauthenticated or low-privilege caller able to influence the request-derived value.' : 'Not established.', entryPoint: entry, trustBoundary: 'Application request/input boundary to a sensitive operation.', rootControl: root, sink: finding.locations[0].excerpt, impact: finding.impact, directEvidence: finding.evidence.map(item => item.detail).join(' '), counterevidence: finding.counterevidence, limitations: 'No runtime execution or package build was performed by the native scanner.', confidence: finding.confidence, recordedAt: new Date().toISOString() }
+  finding.validationRecord = { method: 'static', conclusion, attacker: direct ? removedControl ? 'A caller who can reach the affected route or operation after the removed control.' : 'An unauthenticated or low-privilege caller able to influence the request-derived value.' : 'Not established.', entryPoint: entry, trustBoundary: 'Application request/input boundary to a sensitive operation.', rootControl: root, sink: finding.locations[0].excerpt, impact: finding.impact, directEvidence: finding.evidence.map(item => item.detail).join(' '), counterevidence: finding.counterevidence, limitations: 'No runtime execution or package build was performed by the native scanner.', confidence: finding.confidence, recordedAt: new Date().toISOString() }
   finding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition, summary: finding.validation })
   return disposition
 }
@@ -247,6 +255,23 @@ function analyzeAttackPath(finding: Finding): void {
   finding.attackPathRecord = { attacker: 'Caller able to control the identified input or invoke the affected feature.', entryPoint: finding.validationRecord?.entryPoint ?? 'Static source context.', preconditions: 'The affected code path must be reachable in deployment.', dataflow: `${finding.validationRecord?.entryPoint ?? 'Input'} -> ${finding.validationRecord?.rootControl ?? location.file} -> ${finding.validationRecord?.sink ?? location.excerpt}`, outcome: finding.impact, severityRationale: `${finding.severity} severity is provisional and reflects the sensitive operation with static reachability evidence.`, changeConditions: 'Increase confidence after a targeted test or runtime proof; lower severity if a complete upstream control prevents attacker influence.', recordedAt: new Date().toISOString() }
   finding.evidence.push({ kind: 'attack_path', detail: finding.attackPath, location })
   finding.ledger.push({ at: new Date().toISOString(), phase: 'attack_path', disposition: 'reportable', summary: finding.attackPath })
+}
+
+function diffPath(value: string): string {
+  if (!value || value === '/dev/null' || value.startsWith('/') || value.split('/').includes('..')) return 'unknown'
+  return value
+}
+
+function removedControlCandidate(file: string, line: number, source: string): Candidate | undefined {
+  for (const rule of REMOVED_CONTROL_RULES) {
+    rule.pattern.lastIndex = 0
+    if (!rule.pattern.test(source)) continue
+    const excerpt = source.trim().slice(0, 240)
+    return { rule: rule.id, severity: rule.severity, file, line, excerpt, rationale: rule.rationale, cwe: rule.cwe, evidence: [
+      { kind: 'pattern', detail: `Diff removal matched ${rule.id}.`, location: { file, line, excerpt, role: 'expected_control' } },
+      { kind: 'counterevidence', detail: 'The changed hunk removes an explicit security control; no equivalent replacement is established by this diff-only analysis.', location: { file, line, excerpt, role: 'expected_control' } },
+    ] }
+  }
 }
 
 export async function runScan(directory: string, limits: ScanLimits, mode: 'standard' | 'deep', threatModel: string, scopeRequested = false, stateDirectory = '', automaticValidation = true): Promise<ScanRecord> {
@@ -266,12 +291,34 @@ export async function reviewGitDiff(workspace: string, base: string | undefined)
 }
 
 export async function runDiffScan(workspace: string, base: string | undefined, threatModel: string, stateDirectory = ''): Promise<ScanRecord> {
-  const review = await reviewGitDiff(workspace, base); const candidates: Candidate[] = []; let currentFile = ''; let newLine = 0
-  for (const diffLine of review.diff.split(/\r?\n/)) {
-    if (diffLine.startsWith('+++ b/')) { currentFile = diffLine.slice(6); newLine = 0; continue }
-    const hunk = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(diffLine); if (hunk) { newLine = Number(hunk[1]); continue }
-    if (diffLine.startsWith('+') && !diffLine.startsWith('+++')) { const analyzed = analyzeText(resolve(workspace), join(resolve(workspace), currentFile || 'unknown'), diffLine.slice(1), 'diff'); for (const candidate of analyzed.candidates) { candidate.file = currentFile || 'unknown'; candidate.line = newLine; candidate.evidence[0].location = location(candidate.file, newLine, candidate.excerpt); candidates.push(candidate) }; newLine++; continue }
-    if (!diffLine.startsWith('-')) newLine++
+  const review = await reviewGitDiff(workspace, base); const candidates: Candidate[] = []; const receipts: FileReceipt[] = []; const ruleReceipts: RuleReceipt[] = []; const changedPaths = new Set<string>(); let currentFile = ''; let oldLine = 0; let newLine = 0; let addedLines: Array<{ line: number; source: string }> = []
+  const flushAddedLines = (): void => {
+    if (!addedLines.length) return
+    const analyzed = analyzeText(resolve(workspace), join(resolve(workspace), currentFile || 'unknown'), addedLines.map(item => item.source).join('\n'), 'diff-added')
+    for (const candidate of analyzed.candidates) {
+      const source = addedLines[candidate.line - 1]
+      if (!source) continue
+      candidate.file = currentFile || 'unknown'; candidate.line = source.line; candidate.excerpt = source.source.trim().slice(0, 240); candidate.evidence[0].location = location(candidate.file, source.line, candidate.excerpt); candidates.push(candidate)
+    }
+    addedLines = []
   }
-  const root = resolve(workspace); const now = new Date().toISOString(); const findings = reduceCandidates(candidates); for (const finding of findings) validateCandidate(finding); for (const finding of findings) analyzeAttackPath(finding); const policy = await resolvePolicyGuidance(root); const id = createScanId(); const complete = !review.truncated && findings.every(finding => finding.ledger.some(row => row.phase === 'validation') && (finding.disposition !== 'reportable' || finding.ledger.some(row => row.phase === 'attack_path'))); const [head, baseRevision, remote] = await Promise.all([execFileAsync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' })), base ? execFileAsync('git', ['rev-parse', '--verify', base], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' })) : Promise.resolve({ stdout: '' }), execFileAsync('git', ['config', '--get', 'remote.origin.url'], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' }))]); const remoteValue = remote.stdout.trim().replace(/^[^@]+@/, '').replace(/[?#].*$/, ''); const record: ScanRecord = { schemaVersion: 3, id, mode: 'diff', lifecycle: complete ? 'completed' : 'incomplete', target: root, targetSnapshot: { kind: 'git_diff', targetId: `dsh-security-suite-target/v1:sha256:${sha256(remoteValue || root)}`, displayName: basename(root) || root, baseRevision: baseRevision.stdout.trim() || undefined, headRevision: head.stdout.trim() || undefined, snapshotDigest: `dsh-security-suite-snapshot/v1:sha256:${sha256(review.diff)}` }, createdAt: now, completedAt: new Date().toISOString(), threatModel: threatModel || 'Review changed behavior for attacker-controlled inputs, authorization boundaries, and sensitive sinks.', policyGuidance: policy.text, preflight: { status: review.truncated ? 'warn' : 'ready', checks: [{ id: 'git-diff', status: review.truncated ? 'warn' : 'pass', detail: `Reviewed ${review.mode}.` }, { id: 'worker-orchestration', status: 'warn', detail: 'Investigation tasks are durable and claimable by DSH reviewers. This plugin does not assume a private subagent API.' }], projectFiles: [], languages: [], suggestedCommands: [] }, findings, coverage: { mode: 'diff', reviewedFiles: review.diff.split('\ndiff --git ').length - 1, skippedFiles: review.truncated ? 1 : 0, exclusions: review.truncated ? ['diff truncated at 1 MB'] : [], complete, receipts: [], ruleReceipts: [], policyFiles: policy.files, surfaces: [{ id: 'git-diff', label: review.mode, disposition: findings.some(finding => finding.disposition === 'reportable') ? 'reported' : 'no_issue_found', receiptRefs: ['artifacts/02_discovery/finding_discovery_report.md'], riskArea: 'changed-code' }], deferred: review.truncated ? [{ id: 'diff-truncated', reason: 'Diff exceeded the 1 MB safe processing limit.' }] : [] }, activity: [activity('preflight', 'Git diff preflight completed.'), activity('policy', policy.files.length ? `Resolved policy files: ${policy.files.join(', ')}.` : 'No SECURITY.md policy file found in the scan scope.'), activity('discovery', `Analyzed changed lines in ${review.mode}.`), activity('reduction', `Reduced observations to ${findings.length} unique candidates.`), activity('validation', `Recorded static validation receipts for ${findings.length} candidates.`), activity('attack_path', `Recorded attack-path receipts for ${findings.filter(finding => finding.disposition === 'reportable').length} reportable candidates.`), activity('complete', complete ? 'Diff scan completed with closed candidate ledgers.' : 'Diff scan incomplete because the diff was truncated.')], tasks: [], recipe: { mode: 'diff', scopeRequested: true, passes: ['diff'] }, artifacts: { directory: scanArtifactDir(getStateDir(stateDirectory), root, id) }, seal: '' }; record.seal = sealScan(record); return record
+  for (const diffLine of review.diff.split(/\r?\n/)) {
+    if (diffLine.startsWith('+++ b/')) { flushAddedLines(); currentFile = diffPath(diffLine.slice(6)); continue }
+    const hunk = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(diffLine); if (hunk) { flushAddedLines(); oldLine = Number(hunk[1]); newLine = Number(hunk[2]); continue }
+    if (diffLine.startsWith('+') && !diffLine.startsWith('+++')) {
+      if (currentFile !== 'unknown') changedPaths.add(currentFile)
+      addedLines.push({ line: newLine, source: diffLine.slice(1) })
+      newLine++; continue
+    }
+    if (diffLine.startsWith('-') && !diffLine.startsWith('---')) {
+      if (currentFile !== 'unknown') changedPaths.add(currentFile)
+      const candidate = removedControlCandidate(currentFile || 'unknown', oldLine, diffLine.slice(1)); if (candidate) candidates.push(candidate)
+      oldLine++; continue
+    }
+    oldLine++; newLine++
+  }
+  flushAddedLines()
+  for (const path of [...changedPaths].sort()) { const patch = review.diff.split(`diff --git a/${path} b/${path}`)[1] ?? ''; receipts.push({ path, bytes: Buffer.byteLength(patch, 'utf8'), sha256: sha256(patch), language: languageFor(path) }) }
+  for (const rule of [...RULES.map(rule => rule.id), ...REMOVED_CONTROL_RULES.map(rule => rule.id)]) ruleReceipts.push({ ruleId: rule, pass: 'diff', matches: candidates.filter(candidate => candidate.rule === rule).length })
+  const root = resolve(workspace); const now = new Date().toISOString(); const findings = reduceCandidates(candidates); for (const finding of findings) validateCandidate(finding); for (const finding of findings) analyzeAttackPath(finding); const policy = await resolvePolicyGuidance(root); const id = createScanId(); const complete = !review.truncated && findings.every(finding => finding.ledger.some(row => row.phase === 'validation') && (finding.disposition !== 'reportable' || finding.ledger.some(row => row.phase === 'attack_path'))); const [head, baseRevision, remote] = await Promise.all([execFileAsync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' })), base ? execFileAsync('git', ['rev-parse', '--verify', base], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' })) : Promise.resolve({ stdout: '' }), execFileAsync('git', ['config', '--get', 'remote.origin.url'], { cwd: root, encoding: 'utf8' }).catch(() => ({ stdout: '' }))]); const remoteValue = remote.stdout.trim().replace(/^[^@]+@/, '').replace(/[?#].*$/, ''); const record: ScanRecord = { schemaVersion: 3, id, mode: 'diff', lifecycle: complete ? 'completed' : 'incomplete', target: root, targetSnapshot: { kind: 'git_diff', targetId: `dsh-security-suite-target/v1:sha256:${sha256(remoteValue || root)}`, displayName: basename(root) || root, baseRevision: baseRevision.stdout.trim() || undefined, headRevision: head.stdout.trim() || undefined, snapshotDigest: `dsh-security-suite-snapshot/v1:sha256:${sha256(review.diff)}` }, createdAt: now, completedAt: new Date().toISOString(), threatModel: threatModel || 'Review changed behavior for attacker-controlled inputs, authorization boundaries, and sensitive sinks.', policyGuidance: policy.text, preflight: { status: review.truncated ? 'warn' : 'ready', checks: [{ id: 'git-diff', status: review.truncated ? 'warn' : 'pass', detail: `Reviewed ${review.mode}; ${changedPaths.size} changed source path(s) received.` }, { id: 'worker-orchestration', status: 'warn', detail: 'Investigation tasks are durable and claimable by DSH reviewers. This plugin does not assume a private subagent API.' }], projectFiles: [], languages: [...new Set(receipts.map(item => item.language))], suggestedCommands: [] }, findings, coverage: { mode: 'diff', reviewedFiles: receipts.length, skippedFiles: review.truncated ? 1 : 0, exclusions: review.truncated ? ['diff truncated at 1 MB'] : [], complete, receipts, ruleReceipts, policyFiles: policy.files, surfaces: [{ id: 'git-diff', label: review.mode, disposition: findings.some(finding => finding.disposition === 'reportable') ? 'reported' : 'no_issue_found', receiptRefs: ['artifacts/02_discovery/finding_discovery_report.md'], riskArea: 'changed-code' }], deferred: review.truncated ? [{ id: 'diff-truncated', reason: 'Diff exceeded the 1 MB safe processing limit.' }] : [] }, activity: [activity('preflight', 'Git diff preflight completed.'), activity('policy', policy.files.length ? `Resolved policy files: ${policy.files.join(', ')}.` : 'No SECURITY.md policy file found in the scan scope.'), activity('discovery', `Analyzed added lines and removed security controls in ${review.mode}.`), activity('reduction', `Reduced observations to ${findings.length} unique candidates.`), activity('validation', `Recorded static validation receipts for ${findings.length} candidates.`), activity('attack_path', `Recorded attack-path receipts for ${findings.filter(finding => finding.disposition === 'reportable').length} reportable candidates.`), activity('complete', complete ? 'Diff scan completed with closed candidate ledgers.' : 'Diff scan incomplete because the diff was truncated.')], tasks: [], recipe: { mode: 'diff', scopeRequested: true, passes: ['diff-added-lines', 'diff-removed-controls'] }, artifacts: { directory: scanArtifactDir(getStateDir(stateDirectory), root, id) }, seal: '' }; record.seal = sealScan(record); return record
 }
