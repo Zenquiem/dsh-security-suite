@@ -267,17 +267,42 @@ function analyzeFrameworkRouteAuthorization(file: string, content: string, onlyR
   return []
 }
 
+function pythonJwtConfigurationCandidates(file: string, content: string, lines: string[]): Candidate[] {
+  const candidates: Candidate[] = []; const options = new Map<string, { line: number; excerpt: string }>()
+  for (const match of content.matchAll(/\b([A-Za-z_]\w*)\s*=\s*\{([\s\S]{0,1200}?)\}/g)) {
+    const control = /["']verify_signature["']\s*:\s*False\b/i.exec(match[2])
+    if (!control) continue
+    const number = lineAt(content, (match.index ?? 0) + match[0].indexOf(match[2]) + (control.index ?? 0))
+    options.set(match[1], { line: number, excerpt: sourceLine(lines, number) })
+  }
+  for (const match of content.matchAll(/\bjwt\.(?:decode|verify)\s*\(/gi)) {
+    const open = (match.index ?? 0) + match[0].lastIndexOf('('); const close = closingParenthesis(content, open)
+    if (close === undefined || close - open > 4_000) continue
+    const call = content.slice(open, close + 1); const callLine = lineAt(content, match.index ?? 0); const callExcerpt = sourceLine(lines, callLine)
+    const controls: Array<{ line: number; excerpt: string; detail: string }> = []
+    const direct = /\bverify\s*=\s*False\b/i.exec(call)
+    if (direct) { const line = lineAt(content, open + (direct.index ?? 0)); controls.push({ line, excerpt: sourceLine(lines, line), detail: 'JWT call explicitly sets verify=False.' }) }
+    const inlineOptions = /\boptions\s*=\s*\{([\s\S]{0,1200}?)\}/i.exec(call)
+    const inlineControl = inlineOptions && /["']verify_signature["']\s*:\s*False\b/i.exec(inlineOptions[1])
+    if (inlineOptions && inlineControl) { const line = lineAt(content, open + (inlineOptions.index ?? 0) + inlineOptions[0].indexOf(inlineOptions[1]) + (inlineControl.index ?? 0)); controls.push({ line, excerpt: sourceLine(lines, line), detail: 'JWT call passes options with verify_signature disabled.' }) }
+    const namedOptions = /\boptions\s*=\s*([A-Za-z_]\w*)\b/i.exec(call)?.[1]; const bound = namedOptions ? options.get(namedOptions) : undefined
+    if (bound) controls.push({ ...bound, detail: `JWT call passes local options object ${namedOptions} with verify_signature disabled.` })
+    const noneAlgorithm = /\balgorithms\s*=\s*\[[^\]]*["']none["'][^\]]*\]/i.exec(call)
+    if (noneAlgorithm) { const line = lineAt(content, open + (noneAlgorithm.index ?? 0)); controls.push({ line, excerpt: sourceLine(lines, line), detail: 'JWT call allows the unsigned none algorithm.' }) }
+    for (const control of controls) {
+      const candidate = configurationCandidate(CONFIGURATION_RULES.jwt, file, lines, control.line, `Configuration analysis found ${control.detail}`)
+      candidate.evidence.push({ kind: 'context', detail: 'The disabled JWT verification control is used by this PyJWT decode or verify call.', location: { file, line: callLine, excerpt: callExcerpt, role: 'sink' } })
+      candidates.push(candidate)
+    }
+  }
+  return candidates
+}
+
 /** Analyze security-sensitive configuration blocks that require paired controls. */
 function analyzeSecurityConfiguration(file: string, content: string, onlyRules?: Set<string>): Candidate[] {
   const lines = content.split(/\r?\n/); const candidates: Candidate[] = []
   const enabled = (rule: ConfigurationRule): boolean => !onlyRules || onlyRules.has(rule.id)
-  if (enabled(CONFIGURATION_RULES.jwt)) {
-    for (const match of content.matchAll(/(?:["']?verify_signature["']?\s*[:=]\s*false|jwt\.(?:decode|verify)\s*\([\s\S]{0,500}?\bverify\s*[:=]\s*false|algorithms\s*[:=]\s*\[[^\]]*['"]none['"])/gi)) {
-      const control = /(?:["']?verify_signature["']?\s*[:=]\s*false|\bverify\s*[:=]\s*false|algorithms\s*[:=]\s*\[[^\]]*['"]none['"])/i.exec(match[0])
-      const line = lineAt(content, (match.index ?? 0) + (control?.index ?? 0))
-      candidates.push(configurationCandidate(CONFIGURATION_RULES.jwt, file, lines, line, 'Configuration analysis found disabled JWT verification or an unsigned none algorithm allowlist.'))
-    }
-  }
+  if (enabled(CONFIGURATION_RULES.jwt) && languageFor(file) === 'python') candidates.push(...pythonJwtConfigurationCandidates(file, content, lines))
   if (enabled(CONFIGURATION_RULES.cors)) {
     for (const match of content.matchAll(/\bcors\s*\(\s*\{([\s\S]{0,1200}?)\}\s*\)/gi)) {
       const block = match[1]

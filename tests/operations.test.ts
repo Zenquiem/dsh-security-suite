@@ -183,7 +183,7 @@ test('safe JWT remediation is reversible and rollback refuses an altered applied
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
   const local = { ...config, stateDir: state }
   try {
-    await writeFile(join(root, 'jwt.py'), 'options = {"verify_signature": False}\n')
+    await writeFile(join(root, 'jwt.py'), 'options = {"verify_signature": False}\nclaims = jwt.decode(token, key, options=options)\n')
     const scan = await runScan(root, local, 'standard', '', false, state); await saveScan(state, scan)
     const finding = scan.findings.find(item => item.ruleId === 'jwt.verification.disabled'); assert.ok(finding)
     const proposal = await remediationPlan(root, local, scan.id, finding.id); assert.equal(proposal.safeToApply, true)

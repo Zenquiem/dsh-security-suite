@@ -30,7 +30,7 @@ test('assessDirectory reports AST-proven JavaScript candidates and skips depende
 test('directory assessment structurally detects unsafe multi-line JWT, CORS, and XML configurations', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
-    await writeFile(join(root, 'auth.py'), 'claims = jwt.decode(\n  token,\n  key,\n  verify=False,\n)\n')
+    await writeFile(join(root, 'auth.py'), 'options = {"verify_signature": False}\nclaims = jwt.decode(\n  token,\n  key,\n  options=options,\n)\n')
     await writeFile(join(root, 'server.ts'), 'app.use(cors({\n  origin: true,\n  credentials: true,\n}))\n')
     await writeFile(join(root, 'Xml.java'), 'class Xml {\n void parse() throws Exception {\n  DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();\n  factory.newDocumentBuilder();\n }\n}\n')
     const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
@@ -51,6 +51,18 @@ test('directory assessment does not flag paired configuration controls that rema
     await writeFile(join(root, 'Xml.java'), 'class Xml {\n void parse() throws Exception {\n  DocumentBuilderFactory factory = DocumentBuilderFactory.newInstance();\n  factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl", true);\n  factory.newDocumentBuilder();\n }\n}\n')
     const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
     assert.equal(result.candidates.some(item => ['jwt-verification-disabled', 'cors-wildcard-credentials', 'xml-external-entity-risk'].includes(item.rule)), false)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('directory assessment ties Python JWT verification disablement to a PyJWT call and excludes unused settings', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'auth.py'), 'unused = {"verify_signature": False}\nclaims = jwt.decode(token, key, verify=False)\ntrusted = jwt.decode(token, key, algorithms=["RS256"])\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'jwt-verification-disabled')
+    assert.equal(candidates.length, 1)
+    assert.equal(candidates[0]?.line, 2)
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.line === 2 && item.location.role === 'sink'), true)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

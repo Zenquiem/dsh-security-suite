@@ -45,6 +45,8 @@ JavaScript/TypeScript TLS verification discovery is AST-based: `rejectUnauthoriz
 
 JavaScript/TypeScript dynamic execution, command, filesystem, outbound-request, and SQL candidates are emitted only by the native AST request-source-to-sink analysis. Textual appearances of those APIs without a resolved supported request source are not JavaScript/TypeScript candidates.
 
+Python JWT verification discovery is call-scoped: an explicit `verify=False`, unsigned `none` algorithm, or `verify_signature=False` local options dictionary must be used by a supported `jwt.decode()` or `jwt.verify()` call. Unused dictionaries and unrelated verification settings are not candidates.
+
 Ruby deserialization analysis follows request-derived values through same-directory local wrappers into `YAML.load`, `Psych.load`, and `Marshal.load`. `safe_load`, static data, and unrelated parser methods remain unproven.
 
 PHP deserialization analysis follows request-derived values through same-directory local wrappers into `unserialize()`. It recognizes the explicit `allowed_classes => false` control; other allowlists, wrappers, and parser APIs remain validation-required.
