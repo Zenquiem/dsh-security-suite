@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
@@ -185,6 +185,28 @@ test('backlog triage requires local component and version evidence for dependenc
         const [triaged] = (await triageFindingBacklog(root, { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: state }, [{ id: item.name, title: 'Example runtime vulnerability', description: 'Affected package advisory', sourceType: 'advisory', component: 'example-runtime', affectedVersion: '>=1.0.0 <2.0.0', packageEcosystem: 'npm', locations: [], sourcePath: 'github://owner/repo/dependabot/1', sourceSha256: item.name }])).items
         assert.equal(triaged?.verdict, item.verdict, item.name)
         assert.equal(triaged?.dependencyAssessment?.status, item.assessment, item.name)
+      } finally { await rm(root, { recursive: true, force: true }) }
+    }
+  } finally { await rm(state, { recursive: true, force: true }) }
+})
+
+test('dependency triage finds nested service manifests but treats example packages as non-runtime evidence', async () => {
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const cases = [
+    { path: 'packages/api', verdict: 'confirmed', assessment: 'affected' },
+    { path: 'examples/demo', verdict: 'needs_review', assessment: 'non_runtime_only' },
+  ] as const
+  try {
+    for (const item of cases) {
+      const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+      try {
+        await writeFile(join(root, 'SECURITY.md'), 'The production API runtime is in scope for supported security boundaries.\n')
+        await mkdir(join(root, item.path), { recursive: true })
+        await writeFile(join(root, item.path, 'package.json'), '{"name":"nested","dependencies":{"example-runtime":"1.4.0"}}\n')
+        const [triaged] = (await triageFindingBacklog(root, { enabled: true, maxFiles: 40, maxFileBytes: 4096, stateDir: state }, [{ id: item.path, title: 'Nested package advisory', description: 'Affected package advisory', sourceType: 'advisory', component: 'example-runtime', affectedVersion: '>=1.0.0 <2.0.0', packageEcosystem: 'npm', locations: [], sourcePath: 'github://owner/repo/dependabot/1', sourceSha256: item.path }])).items
+        assert.equal(triaged?.verdict, item.verdict, item.path)
+        assert.equal(triaged?.dependencyAssessment?.status, item.assessment, item.path)
+        assert.equal(triaged?.dependencyAssessment?.evidence.some(evidence => evidence.file === `${item.path}/package.json`), true)
       } finally { await rm(root, { recursive: true, force: true }) }
     }
   } finally { await rm(state, { recursive: true, force: true }) }

@@ -1,5 +1,5 @@
-import { mkdir, readFile, writeFile } from 'node:fs/promises'
-import { basename, isAbsolute, join, relative, resolve } from 'node:path'
+import { mkdir, readdir, readFile, writeFile } from 'node:fs/promises'
+import { basename, dirname, isAbsolute, join, relative, resolve } from 'node:path'
 import { randomUUID } from 'node:crypto'
 import type { Config } from './config.js'
 import type { Finding, ScanRecord } from './contracts.js'
@@ -297,23 +297,45 @@ function manifestVersion(manifest: Record<string, unknown>, component: string): 
   return undefined
 }
 
+function nonProductManifest(path: string): boolean { return /(?:^|\/)(?:test|tests|fixtures?|examples?|docs?)(?:\/|$)/i.test(path) }
+
+/** Discover a bounded set of workspace manifests without traversing dependencies or VCS state. */
+async function workspaceManifests(root: string): Promise<string[]> {
+  const manifests: string[] = []; const ignored = new Set(['.git', '.hg', '.svn', 'node_modules', 'dist', 'build', 'coverage', '.next', '.cache', 'vendor'])
+  const visit = async (directory: string, depth: number): Promise<void> => {
+    if (depth > 8 || manifests.length >= 500) return
+    const entries = await readdir(directory, { withFileTypes: true }).catch(() => undefined); if (!entries) return
+    for (const entry of entries) {
+      if (manifests.length >= 500) return
+      const absolute = join(directory, entry.name)
+      if (entry.isDirectory()) { if (!ignored.has(entry.name)) await visit(absolute, depth + 1); continue }
+      if (entry.isFile() && entry.name === 'package.json') manifests.push(relative(root, absolute).replaceAll('\\', '/'))
+    }
+  }
+  await visit(root, 0); return manifests.sort()
+}
+
 async function packageEvidence(root: string, finding: ImportedFinding): Promise<BacklogTriageItem['dependencyAssessment'] | undefined> {
   if (!finding.component || !(finding.sourceType === 'cve' || finding.sourceType === 'advisory' || finding.affectedVersion)) return undefined
-  const component = finding.component; const evidence: DependencyEvidence[] = []; const manifests = new Set(['package.json'])
-  if (finding.manifestPath && finding.manifestPath.endsWith('package.json')) manifests.add(finding.manifestPath)
+  const component = finding.component; const evidence: DependencyEvidence[] = []; const manifests = new Set(await workspaceManifests(root)); manifests.add('package.json')
+  if (finding.manifestPath) {
+    const candidate = finding.manifestPath.endsWith('package.json') ? finding.manifestPath : join(dirname(finding.manifestPath), 'package.json')
+    const absolute = resolve(root, candidate); if (inside(root, absolute)) manifests.add(relative(root, absolute).replaceAll('\\', '/'))
+  }
   for (const path of manifests) {
     const file = resolve(root, path); if (!inside(root, file)) continue
     try {
       const manifest = object(JSON.parse(await readFile(file, 'utf8'))); const scope = dependencyScope(manifest, component)
-      if (scope) evidence.push({ file: path, version: manifestVersion(manifest, component), scope })
+      if (scope) evidence.push({ file: path, version: manifestVersion(manifest, component), scope: nonProductManifest(path) ? 'development' : scope })
     } catch { /* Missing or malformed manifests are evidence gaps, not implicit absence. */ }
   }
-  for (const lockName of ['package-lock.json', 'npm-shrinkwrap.json']) {
+  const lockPaths = [...manifests].flatMap(path => ['package-lock.json', 'npm-shrinkwrap.json'].map(lock => join(dirname(path), lock).replaceAll('\\', '/')))
+  for (const lockPath of new Set(lockPaths)) {
     try {
-      const lock = object(JSON.parse(await readFile(join(root, lockName), 'utf8'))); const packages = object(lock.packages); const lockEntry = object(packages[`node_modules/${component}`])
+      const lock = object(JSON.parse(await readFile(join(root, lockPath), 'utf8'))); const packages = object(lock.packages); const lockEntry = object(packages[`node_modules/${component}`])
       const version = stringValue(lockEntry.version); if (version) {
-        const declared = evidence.find(item => item.scope !== 'unknown')
-        evidence.push({ file: lockName, version, scope: lockEntry.dev === true ? 'development' : declared?.scope ?? 'unknown' })
+        const manifestPath = join(dirname(lockPath), 'package.json').replaceAll('\\', '/'); const declared = evidence.find(item => item.file === manifestPath)
+        evidence.push({ file: lockPath, version, scope: lockEntry.dev === true || nonProductManifest(lockPath) ? 'development' : declared?.scope ?? 'unknown' })
       }
     } catch { /* Lockfiles are optional. */ }
   }

@@ -24,7 +24,7 @@
   ],
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "check:runtime-independence": "node scripts/check-runtime-independence.mjs",
+    "check:dsh-runtime": "node scripts/check-dsh-runtime.mjs",
     "typecheck": "tsc --noEmit -p tsconfig.json",
     "test": "node --import tsx --test tests/**/*.test.ts"
   },

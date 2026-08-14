@@ -4,7 +4,7 @@
 
 > DeepSeek Harness is in developer preview; its plugin API may introduce breaking changes.
 
-The plugin owns its scan orchestration, evidence model, persistent workbench, export formats, remediation workflow, and DSH tool surface. It has no external security-engine SDK, CLI, credential, or hosted runtime dependency. In particular, it does not import, invoke, authenticate to, or delegate work to OpenAI or Codex software; every assistant worker is created by DeepSeek Harness. Formal validation and attack-path receipts are claim-token-bound, and post-review annotations cannot replace those receipts.
+The plugin owns its scan orchestration, evidence model, persistent workbench, export formats, remediation workflow, and DSH tool surface. It is implemented and executed entirely through DeepSeek Harness: every assistant worker is created by DSH, and the package has no external security-engine SDK, CLI, credential, or hosted runtime dependency. Formal validation and attack-path receipts are claim-token-bound, and post-review annotations cannot replace those receipts.
 
 Every scan entry point, including the exported library functions, creates an open investigation. Static analysis can only create discovery candidates and durable validation tasks; a reportable finding requires a claim-token-bound validation receipt and then a separately claimed attack-path receipt before finalization. There is no automatic-static-validation option. Post-remediation detection scans are likewise open investigations, not automatic resolution proof.
 
