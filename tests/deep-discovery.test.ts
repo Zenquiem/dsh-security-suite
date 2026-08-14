@@ -26,6 +26,21 @@ test('deep candidate reports require the exact active worker token and readable 
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
+test('deep candidate reports fail closed when the frozen source receipt drifts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    const job = await createDeepDiscoveryJob(config, scan.id)
+    job.lifecycle = 'running'; job.workers.push({ id: 'worker_1_1', round: 1, status: 'running', token: 'claim', candidateIds: [] })
+    await writeFile(join(state, 'deep-discovery', `${job.id}.json`), `${JSON.stringify(job)}\n`)
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.changed) }\n')
+    await assert.rejects(() => reportDeepCandidate(config, job.id, 'worker_1_1', 'claim', { ruleId: 'dynamic-code.eval', title: 'eval', severity: 'high', cwe: 'CWE-95', file: 'app.ts', line: 1, rootCause: 'request input reaches eval' }), /changed after/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
 function deepWorkerContext(config: { stateDir: string }, reports: boolean, failAt?: number, closesCoverage = true) {
   let created = 0; const restrictions: string[][] = []
   const ctx = {
@@ -84,6 +99,25 @@ test('deep discovery creates six native DSH workers per round and only saturates
     assert.match(await readFile(join(persisted.artifacts.directory, 'artifacts', '03_coverage', 'repository_coverage_ledger.md'), 'utf8'), /app\.ts/)
     assert.match(await readFile(join(persisted.artifacts.directory, 'artifacts', '04_reconciliation', 'dedupe_report.md'), 'utf8'), /absorbed workers/)
     assert.match(await readFile(join(persisted.artifacts.directory, 'artifacts', '01_context', 'deep_canonical_threat_model.md'), 'utf8'), /Canonical Deep Validation Threat Model/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('an incomplete deep round retains process evidence but cannot merge or saturate provisional candidates', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'runUntrustedCommand(input)\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    const job = await createDeepDiscoveryJob(config, scan.id, 2)
+    const result = await runDeepDiscovery(deepWorkerContext(config, true, 6).ctx as never, config, job.id)
+    assert.equal(result.lifecycle, 'incomplete')
+    assert.deepEqual(result.rounds.map(round => [round.status, round.novelty]), [['incomplete', 0]])
+    const persisted = await loadScan(state, scan.id)
+    assert.equal(persisted.findings.some(finding => finding.ruleId === 'custom.delegated-sink'), false)
+    const reconciliation = join(persisted.artifacts.directory, 'artifacts', '04_reconciliation')
+    assert.match(await readFile(join(reconciliation, 'deep-round-01-incomplete.json'), 'utf8'), /excluded from canonical reconciliation/)
+    await assert.rejects(() => readFile(join(reconciliation, 'deep-round-01-merge.json'), 'utf8'))
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

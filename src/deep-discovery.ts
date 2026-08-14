@@ -124,7 +124,8 @@ export async function reportDeepCandidate(config: Config, jobId: string, workerI
     if (!/^[a-z][a-z0-9.-]{2,100}$/.test(input.ruleId) || !input.title.trim() || !input.cwe.trim() || !Number.isInteger(input.line) || input.line < 1) throw new Error('Candidate fields are invalid.')
     const workItem = job.worklist.find(item => item.path === input.file && input.line >= item.startLine && input.line <= item.endLine); if (!workItem) throw new Error('Candidate location is outside the authoritative deep-discovery worklist region.')
     const source = resolve(job.target, input.file); if (!inside(job.target, source)) throw new Error('Candidate location is outside the deep-scan target.')
-    const lines = (await readFile(source, 'utf8')).split(/\r?\n/); const excerpt = lines[input.line - 1]?.trim().slice(0, 240); if (!excerpt) throw new Error('Candidate location does not identify a readable source line.')
+    const content = await readFile(source, 'utf8'); if (sha256(content) !== workItem.sha256) throw new Error('Source file changed after the authoritative deep-discovery worklist was created.')
+    const lines = content.split(/\r?\n/); const excerpt = lines[input.line - 1]?.trim().slice(0, 240); if (!excerpt) throw new Error('Candidate location does not identify a readable source line.')
     const fingerprint = sha256(`${input.ruleId}:${input.file}:${excerpt.replace(/\s+/g, ' ')}`); const reportId = `deepreport_${sha256(`${job.id}:${workerId}:${fingerprint}`).slice(0, 24)}`; const existing = job.candidates.find(item => item.fingerprint === fingerprint)
     if (existing) { if (!existing.workerIds.includes(workerId)) existing.workerIds.push(workerId); if (!existing.reportIds.includes(reportId)) existing.reportIds.push(reportId); if (!worker.candidateIds.includes(existing.id)) worker.candidateIds.push(existing.id); return existing }
     const candidate: DeepCandidate = { ...input, id: `deepcand_${sha256(`${job.id}:${workerId}:${fingerprint}`).slice(0, 24)}`, workerId, workerIds: [workerId], reportIds: [reportId], excerpt, fingerprint, reportedAt: new Date().toISOString() }; job.candidates.push(candidate); worker.candidateIds.push(candidate.id); return candidate
@@ -229,6 +230,11 @@ function completeWorkerIds(job: DeepDiscoveryJob): Set<string> {
   return new Set(job.rounds.filter(round => round.status === 'complete').flatMap(round => round.workerIds))
 }
 
+function canonicalCandidates(job: DeepDiscoveryJob): DeepCandidate[] {
+  const complete = completeWorkerIds(job)
+  return job.candidates.filter(candidate => candidate.workerIds.some(workerId => complete.has(workerId)))
+}
+
 async function persistRoundArtifacts(scan: ScanRecord, job: DeepDiscoveryJob, round: DeepRound): Promise<string[]> {
   const workers = round.workerIds.map(id => job.workers.find(worker => worker.id === id)).filter((worker): worker is DeepWorker => Boolean(worker))
   const refs: string[] = []
@@ -244,8 +250,13 @@ async function persistRoundArtifacts(scan: ScanRecord, job: DeepDiscoveryJob, ro
   }
   const ledger = job.workers.filter(worker => worker.round <= round.number).map(worker => JSON.stringify({ round: worker.round, workerId: worker.id, status: worker.status, hasReport: Boolean(worker.report), reviewedRegions: worker.report?.reviewedWorkItemIds.length ?? 0, deferredRegions: worker.report?.deferred.length ?? 0, candidateIds: worker.candidateIds })).join('\n')
   refs.push(await writeArtifact(scan, 'artifacts/02_discovery/work_ledger.jsonl', `${ledger}\n`))
-  const canonical = job.candidates.map(candidate => ({ id: candidate.id, fingerprint: candidate.fingerprint, ruleId: candidate.ruleId, title: candidate.title, file: candidate.file, line: candidate.line, workerIds: candidate.workerIds, reportIds: candidate.reportIds }))
-  const merge = { jobId: job.id, round: round.number, workers: workers.map(worker => ({ id: worker.id, status: worker.status, report: Boolean(worker.report), candidateIds: worker.candidateIds })), canonicalCandidates: canonical, novelty: round.novelty }
+  const roundCandidates = job.candidates.filter(candidate => workers.some(worker => candidate.workerIds.includes(worker.id)))
+  if (round.status !== 'complete') {
+    refs.push(await writeArtifact(scan, `artifacts/04_reconciliation/deep-round-${String(round.number).padStart(2, '0')}-incomplete.json`, `${JSON.stringify({ jobId: job.id, round: round.number, status: round.status, workers: workers.map(worker => ({ id: worker.id, status: worker.status, report: Boolean(worker.report), candidateIds: worker.candidateIds })), provisionalCandidateIds: roundCandidates.map(candidate => candidate.id), note: 'This incomplete round is retained only as process evidence. Its candidates are excluded from canonical reconciliation, scan findings, and saturation.' }, null, 2)}\n`))
+    return refs
+  }
+  const canonical = canonicalCandidates(job).map(candidate => ({ id: candidate.id, fingerprint: candidate.fingerprint, ruleId: candidate.ruleId, title: candidate.title, file: candidate.file, line: candidate.line, workerIds: candidate.workerIds, reportIds: candidate.reportIds }))
+  const merge = { jobId: job.id, round: round.number, status: round.status, workers: workers.map(worker => ({ id: worker.id, status: worker.status, report: Boolean(worker.report), candidateIds: worker.candidateIds })), canonicalCandidates: canonical, novelty: round.novelty }
   refs.push(await writeArtifact(scan, `artifacts/04_reconciliation/deep-round-${String(round.number).padStart(2, '0')}-merge.json`, `${JSON.stringify(merge, null, 2)}\n`))
   refs.push(await writeArtifact(scan, 'artifacts/04_reconciliation/deduped_candidates.jsonl', `${canonical.map(candidate => JSON.stringify(candidate)).join('\n')}\n`))
   refs.push(await writeArtifact(scan, 'artifacts/04_reconciliation/dedupe_report.md', `# Deep Discovery Reconciliation\n\n- Job: \`${job.id}\`\n- Completed rounds: ${job.rounds.filter(item => item.status === 'complete').length}\n- Canonical candidates: ${canonical.length}\n\n${canonical.map(candidate => `- \`${candidate.id}\`: ${candidate.ruleId} at ${candidate.file}:${candidate.line}; absorbed workers ${candidate.workerIds.join(', ')}.`).join('\n')}\n`))
@@ -276,7 +287,7 @@ export async function runDeepDiscovery(ctx: Context, config: Config, jobId: stri
     await Promise.all(workers.map(worker => runWorker(ctx, config, job, worker, signal)))
     job = await loadDeepDiscoveryJob(config, jobId)
     const completedRound = job.rounds.find(item => item.number === number); if (!completedRound) throw new Error('Deep discovery round state is missing.')
-    const incomplete = workers.some(worker => { const record = job.workers.find(item => item.id === worker.id); return record?.status !== 'completed' || !record.report }); const candidates = job.candidates.filter(candidate => workers.some(worker => candidate.workerIds.includes(worker.id))); completedRound.candidateCount = candidates.length; completedRound.novelty = candidates.filter(candidate => !known.has(candidate.fingerprint)).length; for (const candidate of candidates) known.add(candidate.fingerprint); completedRound.status = incomplete ? 'incomplete' : 'complete'
+    const incomplete = workers.some(worker => { const record = job.workers.find(item => item.id === worker.id); return record?.status !== 'completed' || !record.report }); const candidates = job.candidates.filter(candidate => workers.some(worker => candidate.workerIds.includes(worker.id))); completedRound.candidateCount = candidates.length; completedRound.novelty = incomplete ? 0 : candidates.filter(candidate => !known.has(candidate.fingerprint)).length; if (!incomplete) for (const candidate of candidates) known.add(candidate.fingerprint); completedRound.status = incomplete ? 'incomplete' : 'complete'
     const source = await loadScan(state, job.scanId); completedRound.artifactRefs = await persistRoundArtifacts(source, job, completedRound); await save(state, job)
     if (cancelled(signal)) { job.lifecycle = 'cancelled'; await save(state, job); return job }
     if (incomplete) { job.lifecycle = 'incomplete'; await save(state, job); return job }
@@ -284,7 +295,7 @@ export async function runDeepDiscovery(ctx: Context, config: Config, jobId: stri
     completedRounds++
     if (completedRounds === job.maxRounds) job.lifecycle = 'capped'
   }
-  const eligibleWorkers = completeWorkerIds(job); const eligibleCandidates = job.candidates.filter(candidate => candidate.workerIds.some(workerId => eligibleWorkers.has(workerId))); const scan = await loadScan(state, job.scanId); for (const candidate of eligibleCandidates) addCandidate(scan, candidate)
+  const eligibleWorkers = completeWorkerIds(job); const eligibleCandidates = canonicalCandidates(job); const scan = await loadScan(state, job.scanId); for (const candidate of eligibleCandidates) addCandidate(scan, candidate)
   const reports = job.workers.filter(worker => eligibleWorkers.has(worker.id) && worker.report).map(worker => ({ worker, report: worker.report! }))
   if (reports.length !== WORKERS_PER_ROUND * job.rounds.filter(round => round.status === 'complete').length) throw new Error('A terminal deep discovery job is missing a completed worker threat model.')
   const model = ['# Canonical Deep Validation Threat Model', '', `- Discovery job: \`${job.id}\``, `- Immutable worklist digest: \`${job.worklistDigest}\``, `- Completed workers: ${reports.map(({ worker }) => `\`${worker.id}\``).join(', ')}`, '', 'This model is synthesized from independent DSH worker reports. Worker statements are evidence leads, not proof; validation must reopen scan-receipted source and record counterevidence.', '', ...reports.flatMap(({ worker, report }) => [`## ${worker.id} (${worker.lens ?? 'legacy neutral review'})`, '', report.threatModel.trim(), ''])].join('\n').trim() + '\n'
