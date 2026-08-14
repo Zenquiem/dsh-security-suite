@@ -6,7 +6,7 @@ import type { Finding, ScanRecord } from './contracts.js'
 import { assessDirectory } from './scanner.js'
 import { generateDerivedHardening, getStateDir, loadScan, sha256 } from './state.js'
 
-export interface ImportedFinding { id: string; title: string; description: string; severity?: string; cwe?: string; ruleId?: string; sourceType: 'sarif' | 'cve' | 'advisory' | 'scanner_ticket' | 'bug_bounty' | 'freeform' | 'generic' | 'text'; locations: Array<{ file: string; line?: number }>; sourcePath: string; sourceSha256: string; inputId?: string; references?: string[]; component?: string; provenance?: Record<string, string> }
+export interface ImportedFinding { id: string; title: string; description: string; severity?: string; cwe?: string; ruleId?: string; sourceType: 'sarif' | 'cve' | 'advisory' | 'scanner_ticket' | 'bug_bounty' | 'freeform' | 'generic' | 'text'; locations: Array<{ file: string; line?: number }>; sourcePath: string; sourceSha256: string; inputId?: string; references?: string[]; component?: string; affectedVersion?: string; packageEcosystem?: string; manifestPath?: string; claimedSource?: string; claimedControl?: string; claimedSink?: string; preconditions?: string; impact?: string; provenance?: Record<string, string> }
 export interface TriageResult { id: string; importedFindingId: string; target: string; status: 'affected' | 'not_affected' | 'needs_information'; confidence: 'high' | 'medium' | 'low'; rationale: string; evidence: string[]; limitations: string[]; staticAssessment: { exactCandidateMatches: number; requestContextMatches: number }; createdAt: string }
 export interface HardeningResult { id: string; scanId: string; outcome: 'structural_hardening_recommended' | 'local_remediation_preferred'; directory: string; portfolio: string; structured: string; opportunities: number[] }
 export type GitHubFindingSource = 'code_scanning' | 'dependabot' | 'advisories' | 'all'
@@ -16,11 +16,12 @@ export interface BacklogTriageItem {
   inputId: string
   sourceType: 'sarif' | 'cve' | 'advisory' | 'scanner_ticket' | 'bug_bounty' | 'freeform' | 'unknown'
   title: string
-  normalizedInput: { component?: string; claimedSource?: string; claimedSink?: string; affectedVersion?: string; preconditions?: string; impact?: string; references: string[] }
+  normalizedInput: { component?: string; packageEcosystem?: string; manifestPath?: string; claimedSource?: string; claimedControl?: string; claimedSink?: string; affectedVersion?: string; preconditions?: string; impact?: string; references: string[] }
   verdict: 'confirmed' | 'not_actionable' | 'needs_review'
   confidence: 'high' | 'medium' | 'low'
   affectedLocations: Array<{ file: string; line?: number }>
   boundaryAssessment: { productSurface: string; actor: string; source: string; boundaryCrossed: boolean | null; policyBasis: string }
+  dependencyAssessment?: { component: string; affectedRange?: string; packageEcosystem?: string; evidence: Array<{ file: string; version?: string; scope: 'runtime' | 'development' | 'unknown' }>; status: 'affected' | 'not_present' | 'outside_affected_range' | 'non_runtime_only' | 'unknown' }
   exploitabilityStackRank: { rankQueue: 'confirmed' | 'needs_review' | null; rank: number | null; rationale: string; drivers: string[] }
   evidence: string[]
   counterevidence: string[]
@@ -74,7 +75,7 @@ export async function importFindings(workspace: string, sourcePath: string): Pro
     const item = object(entry); const locations = importedLocations(item.locations)
     const title = text(item.title) || text(item.name) || `Imported finding ${index + 1}`
     const source = sourceType(item.sourceType)
-    return { id: `imp_${sha256(`${sourceSha256}:${index}:${title}`).slice(0, 24)}`, inputId: stringValue(item.id) ?? stringValue(item.inputId), title, description: text(item.description) || text(item.summary) || JSON.stringify(item), severity: text(item.severity), cwe: text(item.cwe), ruleId: text(item.ruleId) || undefined, sourceType: source, locations, sourcePath, sourceSha256, references: stringList(item.references), component: stringValue(item.component) }
+    return { id: `imp_${sha256(`${sourceSha256}:${index}:${title}`).slice(0, 24)}`, inputId: stringValue(item.id) ?? stringValue(item.inputId), title, description: text(item.description) || text(item.summary) || JSON.stringify(item), severity: text(item.severity), cwe: text(item.cwe), ruleId: text(item.ruleId) || undefined, sourceType: source, locations, sourcePath, sourceSha256, references: stringList(item.references), component: stringValue(item.component) ?? stringValue(item.package), affectedVersion: stringValue(item.affectedVersion) ?? stringValue(item.affected_version) ?? stringValue(item.vulnerableVersionRange) ?? stringValue(item.vulnerable_version_range), packageEcosystem: stringValue(item.packageEcosystem) ?? stringValue(item.package_ecosystem) ?? stringValue(item.ecosystem), manifestPath: stringValue(item.manifestPath) ?? stringValue(item.manifest_path), claimedSource: stringValue(item.claimedSource) ?? stringValue(item.source), claimedControl: stringValue(item.claimedControl) ?? stringValue(item.control), claimedSink: stringValue(item.claimedSink) ?? stringValue(item.sink), preconditions: stringValue(item.preconditions), impact: stringValue(item.impact), provenance: Object.fromEntries(Object.entries(object(item.provenance)).map(([key, value]) => [key, stringValue(value) ?? '']).filter(([, value]) => Boolean(value))) }
   })
 }
 
@@ -102,14 +103,14 @@ function githubLocation(value: unknown): ImportedFinding['locations'] {
 }
 
 function githubImported(value: Record<string, unknown>, index: number, repository: string, source: GitHubFindingSource, instances: unknown[] = []): ImportedFinding {
-  const number = stringValue(value.number) ?? stringValue(value.ghsa_id) ?? `${source}-${index + 1}`; const rule = object(value.rule); const advisory = object(value.security_advisory); const dependency = object(value.dependency); const packageValue = object(dependency.package)
+  const number = stringValue(value.number) ?? stringValue(value.ghsa_id) ?? `${source}-${index + 1}`; const rule = object(value.rule); const advisory = object(value.security_advisory); const vulnerability = object(value.security_vulnerability); const dependency = object(value.dependency); const packageValue = object(dependency.package)
   const cve = stringList(advisory.cve_id ? [advisory.cve_id] : advisory.cve_ids).find(item => /^CVE-/i.test(item))
   const locations = source === 'code_scanning' ? instances.flatMap(githubLocation) : githubLocation(value)
   const title = stringValue(rule.description) ?? stringValue(advisory.summary) ?? stringValue(value.summary) ?? `GitHub ${source} finding ${number}`
   const description = [stringValue(value.html_url) ? `GitHub finding: ${value.html_url}` : '', stringValue(rule.full_description) ?? stringValue(advisory.description) ?? stringValue(value.description) ?? '', stringValue(value.dismissed_reason) ? `Dismissal context: ${value.dismissed_reason}` : ''].filter(Boolean).join('\n\n')
   const references = [stringValue(value.html_url), stringValue(value.url)].filter((item): item is string => Boolean(item))
   const provenance: Record<string, string> = { repository, source, number, ...(stringValue(value.state) ? { state: stringValue(value.state)! } : {}), ...(stringValue(advisory.ghsa_id) ? { ghsaId: stringValue(advisory.ghsa_id)! } : {}), ...(cve ? { cve } : {}) }
-  return { id: `gh_${sha256(`${repository}:${source}:${number}`).slice(0, 24)}`, inputId: `${repository}:${source}:${number}`, title, description: description || title, severity: stringValue(rule.severity) ?? stringValue(advisory.severity) ?? stringValue(value.security_advisory ? object(value.security_advisory).severity : undefined), cwe: stringValue(rule.cwe_id) ?? cve, ruleId: stringValue(rule.id), sourceType: source === 'code_scanning' ? 'sarif' : cve ? 'cve' : 'advisory', locations, sourcePath: `github://${repository}/${source}/${number}`, sourceSha256: digestImported(value), references, component: stringValue(packageValue.name) ?? stringValue(value.manifest_path), provenance }
+  return { id: `gh_${sha256(`${repository}:${source}:${number}`).slice(0, 24)}`, inputId: `${repository}:${source}:${number}`, title, description: description || title, severity: stringValue(rule.severity) ?? stringValue(advisory.severity) ?? stringValue(value.security_advisory ? object(value.security_advisory).severity : undefined), cwe: stringValue(rule.cwe_id) ?? cve, ruleId: stringValue(rule.id), sourceType: source === 'code_scanning' ? 'sarif' : cve ? 'cve' : 'advisory', locations, sourcePath: `github://${repository}/${source}/${number}`, sourceSha256: digestImported(value), references, component: stringValue(packageValue.name) ?? stringValue(object(vulnerability.package).name), affectedVersion: stringValue(vulnerability.vulnerable_version_range) ?? stringValue(value.vulnerable_version_range), packageEcosystem: stringValue(packageValue.ecosystem) ?? stringValue(object(vulnerability.package).ecosystem), manifestPath: stringValue(value.manifest_path) ?? stringValue(dependency.manifest_path), provenance }
 }
 
 /** Read selected GitHub security sources through REST and normalize them as untrusted local triage inputs. */
@@ -234,19 +235,113 @@ function surfaceFor(finding: ImportedFinding): { productSurface: string; actor: 
 function triageSourceType(finding: ImportedFinding): BacklogTriageItem['sourceType'] { return ['sarif', 'cve', 'advisory', 'scanner_ticket', 'bug_bounty', 'freeform'].includes(finding.sourceType) ? finding.sourceType as BacklogTriageItem['sourceType'] : 'unknown' }
 function triageScore(item: BacklogTriageItem): number { const severity = /critical/i.test(item.title + item.normalizedInput.impact) ? 4 : /high/i.test(item.title + item.normalizedInput.impact) ? 3 : /medium/i.test(item.title + item.normalizedInput.impact) ? 2 : 1; return severity * 10 + (item.affectedLocations.length ? 3 : 0) + (item.boundaryAssessment.boundaryCrossed ? 4 : 0) + (item.confidence === 'high' ? 3 : item.confidence === 'medium' ? 2 : 1) }
 
+type DependencyScope = 'runtime' | 'development' | 'unknown'
+type DependencyEvidence = { file: string; version?: string; scope: DependencyScope }
+
+function semver(value: string): number[] | undefined {
+  const match = /^v?(\d+)(?:\.(\d+))?(?:\.(\d+))?(?:[-+].*)?$/.exec(value.trim())
+  return match ? [Number(match[1]), Number(match[2] ?? 0), Number(match[3] ?? 0)] : undefined
+}
+
+function compareVersion(left: number[], right: number[]): number { return left[0] - right[0] || left[1] - right[1] || left[2] - right[2] }
+
+function matchesComparator(version: number[], comparator: string): boolean | undefined {
+  const value = comparator.trim()
+  if (!value || value === '*' || /^x$/i.test(value)) return true
+  const match = /^(<=|>=|<|>|=|~\s*|\^\s*)?\s*v?(\d+)(?:\.(\d+|x|\*))?(?:\.(\d+|x|\*))?(?:[-+].*)?$/.exec(value)
+  if (!match) return undefined
+  const operator = (match[1] ?? '').replace(/\s/g, ''); const target = [Number(match[2]), Number(match[3] === undefined || /x|\*/i.test(match[3]) ? 0 : match[3]), Number(match[4] === undefined || /x|\*/i.test(match[4]) ? 0 : match[4])]
+  const comparison = compareVersion(version, target)
+  if (operator === '>') return comparison > 0
+  if (operator === '>=') return comparison >= 0
+  if (operator === '<') return comparison < 0
+  if (operator === '<=') return comparison <= 0
+  if (operator === '^') {
+    const upper = target[0] > 0 ? [target[0] + 1, 0, 0] : target[1] > 0 ? [0, target[1] + 1, 0] : [0, 0, target[2] + 1]
+    return comparison >= 0 && compareVersion(version, upper) < 0
+  }
+  if (operator === '~') return comparison >= 0 && compareVersion(version, [target[0], target[1] + 1, 0]) < 0
+  if (match[3] === undefined || /x|\*/i.test(match[3])) return version[0] === target[0]
+  if (match[4] === undefined || /x|\*/i.test(match[4])) return version[0] === target[0] && version[1] === target[1]
+  return comparison === 0
+}
+
+function matchesAffectedRange(versionValue: string, range?: string): boolean | undefined {
+  if (!range?.trim()) return undefined
+  const version = semver(versionValue); if (!version) return undefined
+  const branches = range.split('||').map(branch => branch.trim()).filter(Boolean)
+  if (!branches.length) return undefined
+  let understood = false
+  for (const branch of branches) {
+    const hyphen = /^\s*(\S+)\s+-\s+(\S+)\s*$/.exec(branch)
+    const terms = hyphen ? [`>=${hyphen[1]}`, `<=${hyphen[2]}`] : branch.replace(/,/g, ' ').split(/\s+/).filter(Boolean)
+    const outcomes = terms.map(term => matchesComparator(version, term))
+    if (outcomes.some(outcome => outcome === undefined)) continue
+    understood = true
+    if (outcomes.every(Boolean)) return true
+  }
+  return understood ? false : undefined
+}
+
+function dependencyScope(manifest: Record<string, unknown>, component: string): DependencyScope | undefined {
+  for (const field of ['dependencies', 'optionalDependencies', 'bundledDependencies']) if (Object.hasOwn(object(manifest[field]), component)) return 'runtime'
+  if (Object.hasOwn(object(manifest.devDependencies), component)) return 'development'
+  if (Object.hasOwn(object(manifest.peerDependencies), component)) return 'unknown'
+  return undefined
+}
+
+function manifestVersion(manifest: Record<string, unknown>, component: string): string | undefined {
+  for (const field of ['dependencies', 'optionalDependencies', 'bundledDependencies', 'devDependencies', 'peerDependencies']) {
+    const value = stringValue(object(manifest[field])[component]); if (value && semver(value)) return value
+  }
+  return undefined
+}
+
+async function packageEvidence(root: string, finding: ImportedFinding): Promise<BacklogTriageItem['dependencyAssessment'] | undefined> {
+  if (!finding.component || !(finding.sourceType === 'cve' || finding.sourceType === 'advisory' || finding.affectedVersion)) return undefined
+  const component = finding.component; const evidence: DependencyEvidence[] = []; const manifests = new Set(['package.json'])
+  if (finding.manifestPath && finding.manifestPath.endsWith('package.json')) manifests.add(finding.manifestPath)
+  for (const path of manifests) {
+    const file = resolve(root, path); if (!inside(root, file)) continue
+    try {
+      const manifest = object(JSON.parse(await readFile(file, 'utf8'))); const scope = dependencyScope(manifest, component)
+      if (scope) evidence.push({ file: path, version: manifestVersion(manifest, component), scope })
+    } catch { /* Missing or malformed manifests are evidence gaps, not implicit absence. */ }
+  }
+  for (const lockName of ['package-lock.json', 'npm-shrinkwrap.json']) {
+    try {
+      const lock = object(JSON.parse(await readFile(join(root, lockName), 'utf8'))); const packages = object(lock.packages); const lockEntry = object(packages[`node_modules/${component}`])
+      const version = stringValue(lockEntry.version); if (version) {
+        const declared = evidence.find(item => item.scope !== 'unknown')
+        evidence.push({ file: lockName, version, scope: lockEntry.dev === true ? 'development' : declared?.scope ?? 'unknown' })
+      }
+    } catch { /* Lockfiles are optional. */ }
+  }
+  if (!evidence.length) return { component, affectedRange: finding.affectedVersion, packageEcosystem: finding.packageEcosystem, evidence, status: 'not_present' }
+  const versions = evidence.filter(item => item.version)
+  const matches = versions.map(item => ({ item, outcome: matchesAffectedRange(item.version!, finding.affectedVersion) }))
+  if (finding.affectedVersion && matches.length && matches.every(item => item.outcome === false)) return { component, affectedRange: finding.affectedVersion, packageEcosystem: finding.packageEcosystem, evidence, status: 'outside_affected_range' }
+  if (matches.some(item => item.outcome === true && item.item.scope === 'runtime')) return { component, affectedRange: finding.affectedVersion, packageEcosystem: finding.packageEcosystem, evidence, status: 'affected' }
+  if (matches.some(item => item.outcome === true && item.item.scope === 'development')) return { component, affectedRange: finding.affectedVersion, packageEcosystem: finding.packageEcosystem, evidence, status: 'non_runtime_only' }
+  return { component, affectedRange: finding.affectedVersion, packageEcosystem: finding.packageEcosystem, evidence, status: 'unknown' }
+}
+
 /** Triage a complete supplied backlog without dropping duplicate-looking inputs; each source item remains auditable. */
 export async function triageFindingBacklog(workspace: string, config: Config, imported: ImportedFinding[]): Promise<BacklogTriageResult> {
   if (!imported.length) throw new Error('At least one imported finding is required for backlog triage.')
   const root = resolve(workspace); const policyFiles = await policyFilesFor(root); const [runtimePolicy, local] = await Promise.all([policySupportsRuntimeBoundary(root, policyFiles), imported.some(finding => compatibleRules(finding).size) ? assessDirectory(root, { maxFiles: config.maxFiles, maxFileBytes: config.maxFileBytes }, true) : Promise.resolve(undefined)]); const results: BacklogTriageItem[] = []
   for (const [index, finding] of imported.entries()) {
-    const raw = await persistTriageResult(config, root, finding, await evaluateImportedFinding(root, finding, local)); const surface = surfaceFor(finding)
+    const raw = await persistTriageResult(config, root, finding, await evaluateImportedFinding(root, finding, local)); const surface = surfaceFor(finding); const dependency = await packageEvidence(root, finding)
     if (raw.staticAssessment.requestContextMatches > 0 && runtimePolicy && surface.boundaryCrossed === null) surface.boundaryCrossed = true
-    const status = raw.status === 'affected' && surface.boundaryCrossed !== false ? 'needs_review' : raw.status === 'not_affected' || surface.boundaryCrossed === false ? 'not_actionable' : 'needs_review'
-    const confirmed = status === 'needs_review' && raw.status === 'affected' && surface.boundaryCrossed === true
+    if (dependency?.status === 'affected' && runtimePolicy && surface.boundaryCrossed === null) surface.boundaryCrossed = true
+    const status = dependency?.status === 'not_present' || dependency?.status === 'outside_affected_range' ? 'not_actionable' : dependency?.status === 'affected' || dependency?.status === 'non_runtime_only' || dependency?.status === 'unknown' ? 'needs_review' : raw.status === 'affected' && surface.boundaryCrossed !== false ? 'needs_review' : raw.status === 'not_affected' || surface.boundaryCrossed === false ? 'not_actionable' : 'needs_review'
+    const confirmed = status === 'needs_review' && surface.boundaryCrossed === true && (dependency?.status === 'affected' || (!dependency && raw.status === 'affected'))
     const verdict: BacklogTriageItem['verdict'] = confirmed ? 'confirmed' : status
-    const proofGaps = [...raw.limitations, ...(surface.boundaryCrossed === null ? ['The supported product surface, attacker privilege, and boundary crossing remain unproven by the imported claim and local static match.'] : [])]
-    const counterevidence = raw.status === 'not_affected' ? ['The cited local locations were readable but no compatible native-analysis candidate matched the imported claim.'] : surface.boundaryCrossed === false ? ['The supplied locations are limited to test, example, fixture, or documentation paths.'] : []
-    results.push({ triageItemId: `triage-${String(index + 1).padStart(3, '0')}`, inputId: finding.inputId ?? finding.id, sourceType: triageSourceType(finding), title: finding.title, normalizedInput: { component: finding.component, claimedSource: finding.description.slice(0, 500), claimedSink: finding.ruleId, affectedVersion: finding.provenance?.state, impact: finding.severity, references: finding.references ?? [] }, verdict, confidence: verdict === 'not_actionable' ? raw.confidence : raw.status === 'affected' ? 'medium' : 'low', affectedLocations: finding.locations, boundaryAssessment: { ...surface, policyBasis: policyFiles.length ? `Applicable repository policy files were retained for review: ${policyFiles.join(', ')}.` : 'No repository SECURITY.md policy was found; supported-boundary status remains a proof gap.' }, exploitabilityStackRank: { rankQueue: verdict === 'confirmed' || verdict === 'needs_review' ? verdict : null, rank: null, rationale: verdict === 'not_actionable' ? 'not actionable' : 'Ranking is based on local evidence strength, affected location, and unresolved boundary exposure.', drivers: verdict === 'not_actionable' ? [] : ['local source evidence', 'affected location', 'boundary evidence gap', 'severity claim'] }, evidence: raw.evidence, counterevidence, proofGaps, recommendedNextStep: verdict === 'confirmed' ? 'fix_finding' : verdict === 'needs_review' ? 'validation' : 'close', fixFindingHandoff: verdict === 'confirmed' ? `Validate and remediate ${finding.title} at ${finding.locations.map(location => `${location.file}${location.line ? `:${location.line}` : ''}`).join(', ')}.` : null })
+    const dependencyEvidence = dependency ? dependency.evidence.map(item => `Local dependency evidence: ${item.file} declares ${dependency.component}${item.version ? ` at ${item.version}` : ' with an unresolved version'} in ${item.scope} scope.`) : []
+    const proofGaps = [...raw.limitations, ...(dependency?.status === 'unknown' ? ['The local component declaration does not establish an installed version compatible with the claimed affected range.'] : []), ...(dependency?.status === 'non_runtime_only' ? ['The compatible component evidence is limited to development-only dependency scope; a shipped runtime path remains unproven.'] : []), ...(surface.boundaryCrossed === null ? ['The supported product surface, attacker privilege, and boundary crossing remain unproven by the imported claim and local static match.'] : [])]
+    const counterevidence = dependency?.status === 'not_present' ? [`The affected component ${dependency.component} was not declared in the inspected local manifests or lockfiles.`] : dependency?.status === 'outside_affected_range' ? [`Local component versions are outside the imported affected range ${dependency.affectedRange ?? 'not supplied'}.`] : raw.status === 'not_affected' ? ['The cited local locations were readable but no compatible native-analysis candidate matched the imported claim.'] : surface.boundaryCrossed === false ? ['The supplied locations are limited to test, example, fixture, or documentation paths.'] : []
+    const handoffTarget = finding.locations.length ? finding.locations.map(location => `${location.file}${location.line ? `:${location.line}` : ''}`).join(', ') : `affected component ${finding.component ?? 'from the imported claim'}`
+    results.push({ triageItemId: `triage-${String(index + 1).padStart(3, '0')}`, inputId: finding.inputId ?? finding.id, sourceType: triageSourceType(finding), title: finding.title, normalizedInput: { component: finding.component, packageEcosystem: finding.packageEcosystem, manifestPath: finding.manifestPath, claimedSource: finding.claimedSource ?? finding.description.slice(0, 500), claimedControl: finding.claimedControl, claimedSink: finding.claimedSink ?? finding.ruleId, affectedVersion: finding.affectedVersion, preconditions: finding.preconditions, impact: finding.impact ?? finding.severity, references: finding.references ?? [] }, verdict, confidence: verdict === 'not_actionable' ? raw.confidence : dependency?.status === 'affected' || raw.status === 'affected' ? 'medium' : 'low', affectedLocations: finding.locations, boundaryAssessment: { ...surface, policyBasis: policyFiles.length ? `Applicable repository policy files were retained for review: ${policyFiles.join(', ')}.` : 'No repository SECURITY.md policy was found; supported-boundary status remains a proof gap.' }, dependencyAssessment: dependency, exploitabilityStackRank: { rankQueue: verdict === 'confirmed' || verdict === 'needs_review' ? verdict : null, rank: null, rationale: verdict === 'not_actionable' ? 'not actionable' : 'Ranking is based on local evidence strength, affected location, and unresolved boundary exposure.', drivers: verdict === 'not_actionable' ? [] : ['local source evidence', 'affected location', 'boundary evidence gap', 'severity claim'] }, evidence: [...raw.evidence, ...dependencyEvidence], counterevidence, proofGaps, recommendedNextStep: verdict === 'confirmed' ? 'fix_finding' : verdict === 'needs_review' ? 'validation' : 'close', fixFindingHandoff: verdict === 'confirmed' ? `Validate and remediate ${finding.title} at ${handoffTarget}.` : null })
   }
   for (const queue of ['confirmed', 'needs_review'] as const) results.filter(item => item.exploitabilityStackRank.rankQueue === queue).sort((a, b) => triageScore(b) - triageScore(a) || a.triageItemId.localeCompare(b.triageItemId)).forEach((item, index) => { item.exploitabilityStackRank.rank = index + 1 })
   const id = `backlog_${randomUUID()}`; const artifactPath = join(getStateDir(config.stateDir), 'triage', `${id}.json`); const result: BacklogTriageResult = { schemaVersion: 'dsh-security-suite.triage/v1', id, repository: { path: root, policyFiles }, items: results, createdAt: new Date().toISOString(), artifactPath }

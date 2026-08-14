@@ -167,6 +167,41 @@ test('backlog triage confirms only a policy-supported request-to-sink match', as
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
+test('backlog triage requires local component and version evidence for dependency advisories', async () => {
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const cases = [
+    { name: 'affected runtime dependency', manifest: { dependencies: { 'example-runtime': '1.4.0' } }, lock: '1.4.0', dev: false, verdict: 'confirmed', assessment: 'affected' },
+    { name: 'absent component', manifest: { dependencies: { unrelated: '1.4.0' } }, lock: undefined, dev: false, verdict: 'not_actionable', assessment: 'not_present' },
+    { name: 'outside affected range', manifest: { dependencies: { 'example-runtime': '2.4.0' } }, lock: '2.4.0', dev: false, verdict: 'not_actionable', assessment: 'outside_affected_range' },
+    { name: 'development-only component', manifest: { devDependencies: { 'example-runtime': '1.4.0' } }, lock: '1.4.0', dev: true, verdict: 'needs_review', assessment: 'non_runtime_only' },
+  ] as const
+  try {
+    for (const item of cases) {
+      const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+      try {
+        await writeFile(join(root, 'SECURITY.md'), 'The production API runtime is in scope for supported security boundaries.\n')
+        await writeFile(join(root, 'package.json'), `${JSON.stringify({ name: 'sample', ...item.manifest })}\n`)
+        if (item.lock) await writeFile(join(root, 'package-lock.json'), `${JSON.stringify({ lockfileVersion: 3, packages: { '': { name: 'sample' }, 'node_modules/example-runtime': { version: item.lock, ...(item.dev ? { dev: true } : {}) } } })}\n`)
+        const [triaged] = (await triageFindingBacklog(root, { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: state }, [{ id: item.name, title: 'Example runtime vulnerability', description: 'Affected package advisory', sourceType: 'advisory', component: 'example-runtime', affectedVersion: '>=1.0.0 <2.0.0', packageEcosystem: 'npm', locations: [], sourcePath: 'github://owner/repo/dependabot/1', sourceSha256: item.name }])).items
+        assert.equal(triaged?.verdict, item.verdict, item.name)
+        assert.equal(triaged?.dependencyAssessment?.status, item.assessment, item.name)
+      } finally { await rm(root, { recursive: true, force: true }) }
+    }
+  } finally { await rm(state, { recursive: true, force: true }) }
+})
+
+test('backlog triage does not confirm title or CWE similarity without a compatible local component', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await writeFile(join(root, 'SECURITY.md'), 'The production API runtime is in scope for supported security boundaries.\n')
+    await writeFile(join(root, 'package.json'), '{"name":"sample","dependencies":{"unrelated":"1.0.0"}}\n')
+    const [triaged] = (await triageFindingBacklog(root, { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: state }, [{ id: 'uncorroborated', title: 'CWE-95 dynamic code advisory', description: 'A similar scanner title is not component evidence.', sourceType: 'advisory', locations: [], sourcePath: 'github://owner/repo/advisories/1', sourceSha256: 'uncorroborated' }])).items
+    assert.equal(triaged?.verdict, 'needs_review')
+    assert.equal(triaged?.dependencyAssessment, undefined)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
 test('hardening portfolio records a structural recommendation from surviving scan evidence', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))

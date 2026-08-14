@@ -26,6 +26,28 @@ test('deep candidate reports require the exact active worker token and readable 
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
+test('deep reconciliation merges only reports with one shared remediation identity', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
+    const job = await createDeepDiscoveryJob(config, scan.id)
+    job.lifecycle = 'running'; job.workers.push({ id: 'worker_1_1', round: 1, status: 'running', token: 'first', candidateIds: [] }, { id: 'worker_1_2', round: 1, status: 'running', token: 'second', candidateIds: [] })
+    await writeFile(join(state, 'deep-discovery', `${job.id}.json`), `${JSON.stringify(job)}\n`)
+    const shared = { ruleId: 'dynamic-code.eval', title: 'eval', severity: 'high' as const, cwe: 'CWE-95', file: 'app.ts', line: 1, rootCause: 'Request input reaches dynamic code execution.', remediationIdentity: 'Reject untrusted request data before dynamic evaluation.' }
+    const first = await reportDeepCandidate(config, job.id, 'worker_1_1', 'first', shared)
+    const duplicate = await reportDeepCandidate(config, job.id, 'worker_1_2', 'second', shared)
+    const independent = await reportDeepCandidate(config, job.id, 'worker_1_2', 'second', { ...shared, remediationIdentity: 'Remove dynamic evaluation and dispatch only an allowlisted operation.' })
+    assert.equal(duplicate.id, first.id)
+    assert.equal(first.remediationSubsumption.decision, 'not_merged')
+    assert.equal((await loadDeepDiscoveryJob(config, job.id)).candidates.find(candidate => candidate.id === first.id)?.remediationSubsumption.decision, 'merged_equivalent_reports')
+    assert.notEqual(independent.id, first.id)
+    assert.equal((await loadDeepDiscoveryJob(config, job.id)).candidates.length, 2)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
 test('deep candidate reports fail closed when the frozen source receipt drifts', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
