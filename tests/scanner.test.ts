@@ -511,6 +511,16 @@ test('directory assessment records structured flow evidence for Java, C#, PHP, R
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment does not use text fallback for untainted supported-language sinks', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'runner.py'), 'def run():\n    input = "version"\n    subprocess.run(f"git {input}", shell=True)\n')
+    await writeFile(join(root, 'Runner.java'), 'class Runner {\n void run() throws Exception {\n  String input = "version";\n  Runtime.getRuntime().exec("git " + input);\n }\n}\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    assert.equal(result.candidates.some(item => item.rule === 'shell-command-construction'), false)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment keeps structured local-call resolution within one directory', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -1023,6 +1033,21 @@ test('diff scan traces an added Rust request path into an unchanged same-directo
     assert.equal(finding.locations[0]?.file, 'runner.rs')
     assert.equal(finding.evidence.some(item => item.location?.file === 'route.rs' && item.location.line === 2), true)
     assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'rust.diff-semantic-taint')?.matches, 1)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan does not use text fallback for an untainted supported-language sink', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'runner.py'), 'def run():\n    return "ok"\n')
+    await execFileAsync('git', ['add', 'runner.py'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'runner.py'), 'def run():\n    input = "version"\n    subprocess.run(f"git {input}", shell=True)\n')
+    const scan = await runDiffScan(root, undefined, '')
+    assert.equal(scan.findings.some(item => item.ruleId === 'shell.command.construction'), false)
+    assert.equal(scan.coverage.ruleReceipts.find(receipt => receipt.ruleId === 'python.diff-semantic-taint')?.matches, 0)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 

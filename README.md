@@ -53,7 +53,7 @@ JavaScript/TypeScript embedded-credential discovery is also AST-based: a non-pla
 
 JavaScript/TypeScript TLS verification discovery is AST-based: `rejectUnauthorized: false` must be in an inline or local named configuration object that reaches a supported TLS/HTTPS client call. Unused, logged, or unrelated objects with that property do not establish a client path. Other supported source languages retain explicit TLS-disablement rule coverage.
 
-JavaScript/TypeScript dynamic execution, command, filesystem, outbound-request, and SQL candidates are emitted only by the native AST request-source-to-sink analysis. Textual appearances of those APIs without a resolved supported request source are not JavaScript/TypeScript candidates.
+For JavaScript/TypeScript, Python, Go, Java, C#, PHP, Ruby, C, C++, and Rust, supported command, filesystem, outbound-request, and SQL candidates are emitted only by the native request-source-to-sink analyses. Python dynamic execution and the supported Python, Java, C#, PHP, and Ruby deserializers use the same evidence threshold. Textual appearances of those APIs without a resolved supported request source are not candidates; a language-rule pair without structured support remains explicitly unproven rather than being promoted by keyword matching.
 
 Python JWT verification discovery is call-scoped: an explicit `verify=False`, unsigned `none` algorithm, or `verify_signature=False` local options dictionary must be used by a supported `jwt.decode()` or `jwt.verify()` call. Unused dictionaries and unrelated verification settings are not candidates.
 

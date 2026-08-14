@@ -55,6 +55,20 @@ const CONFIGURATION_RULES: Record<'jwt' | 'cors' | 'tls' | 'xml', ConfigurationR
 
 const SECRET_FIELD_NAME = /(?:api[_-]?key|access[_-]?key|secret|password|token|private[_-]?key|credential)/i
 const PLACEHOLDER_SECRET_VALUE = /(?:^|[-_\s])(example|sample|test|dummy|placeholder|replace|changeme|your[-_\s]?)(?:[-_\s]|$)|\.example(?:\.com|\.org|\.net)?$/i
+const SOURCE_TO_SINK_RULES = new Set(['shell-command-construction', 'path-traversal-sink', 'ssrf-request-sink', 'sql-injection-query-construction'])
+const TEXT_RULES_REPLACED_BY_FLOW: Record<string, ReadonlySet<string>> = {
+  javascript: new Set(['dangerous-dynamic-code', ...SOURCE_TO_SINK_RULES]),
+  typescript: new Set(['dangerous-dynamic-code', ...SOURCE_TO_SINK_RULES]),
+  python: new Set(['dangerous-dynamic-code', ...SOURCE_TO_SINK_RULES, 'unsafe-deserialization']),
+  go: SOURCE_TO_SINK_RULES,
+  java: new Set([...SOURCE_TO_SINK_RULES, 'unsafe-deserialization']),
+  csharp: new Set([...SOURCE_TO_SINK_RULES, 'unsafe-deserialization']),
+  php: new Set([...SOURCE_TO_SINK_RULES, 'unsafe-deserialization']),
+  ruby: new Set([...SOURCE_TO_SINK_RULES, 'unsafe-deserialization']),
+  c: new Set(['shell-command-construction', 'path-traversal-sink', 'sql-injection-query-construction']),
+  cpp: new Set(['shell-command-construction', 'path-traversal-sink', 'sql-injection-query-construction']),
+  rust: SOURCE_TO_SINK_RULES,
+}
 
 function languageFor(file: string): string {
   return ({ '.js': 'javascript', '.jsx': 'javascript', '.mjs': 'javascript', '.cjs': 'javascript', '.ts': 'typescript', '.tsx': 'typescript', '.py': 'python', '.go': 'go', '.java': 'java', '.php': 'php', '.rb': 'ruby', '.rs': 'rust', '.sh': 'shell', '.bash': 'shell', '.c': 'c', '.cc': 'cpp', '.cpp': 'cpp', '.cs': 'csharp' } as Record<string, string>)[extname(file)] ?? 'text'
@@ -522,7 +536,7 @@ function analyzeText(root: string, file: string, content: string, pass: string, 
   const rel = relative(root, file); const language = languageFor(file); const lines = content.split(/\r?\n/); const candidates: Candidate[] = []; const receipts: RuleReceipt[] = []
   for (const rule of RULES) {
     if (onlyRules && !onlyRules.has(rule.id)) continue
-    if (['javascript', 'typescript'].includes(language) && new Set(['dangerous-dynamic-code', 'shell-command-construction', 'path-traversal-sink', 'ssrf-request-sink', 'sql-injection-query-construction']).has(rule.id)) { receipts.push({ ruleId: rule.id, pass, matches: 0 }); continue }
+    if (TEXT_RULES_REPLACED_BY_FLOW[language]?.has(rule.id)) { receipts.push({ ruleId: rule.id, pass, matches: 0 }); continue }
     if (rule.languages && !rule.languages.includes(language)) continue
     let matches = 0
     for (const [index, text] of lines.entries()) {
