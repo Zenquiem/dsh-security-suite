@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, mkdir, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { execFile } from 'node:child_process'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -26,6 +26,43 @@ test('assessDirectory reports AST-proven JavaScript candidates and skips depende
   } finally {
     await rm(root, { recursive: true, force: true })
   }
+})
+
+test('final finding identity survives nearby line movement and source-file rename', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'handler.ts'), 'export function route(req) { return eval(req.query.code) }\n')
+    const first = await runScan(root, config, 'standard', '', false, state, false)
+    const before = first.findings.find(finding => finding.ruleId === 'dangerous.dynamic.code')
+    assert.ok(before)
+    await rename(join(root, 'handler.ts'), join(root, 'renamed-handler.ts'))
+    await writeFile(join(root, 'renamed-handler.ts'), '\n\nexport function route(req) { return eval(req.query.code) }\n')
+    const second = await runScan(root, config, 'standard', '', false, state, false)
+    const after = second.findings.find(finding => finding.ruleId === 'dangerous.dynamic.code')
+    assert.ok(after)
+    assert.equal(after.id, before.id)
+    assert.equal(after.fingerprint, before.fingerprint)
+    assert.equal(after.identity.anchor.includes('handler'), false)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('final identity keeps semantically identical candidates in separate source files distinct', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: state }
+  try {
+    const source = 'export function route(req) { return eval(req.query.code) }\n'
+    await writeFile(join(root, 'first.ts'), source)
+    await writeFile(join(root, 'second.ts'), source)
+    const scan = await runScan(root, config, 'standard', '', false, state, false)
+    const findings = scan.findings.filter(finding => finding.ruleId === 'dangerous.dynamic.code')
+    assert.equal(findings.length, 2)
+    assert.equal(new Set(findings.map(finding => finding.id)).size, 2)
+    assert.equal(new Set(findings.map(finding => finding.fingerprint)).size, 2)
+    assert.equal(new Set(findings.map(finding => finding.identity.instance)).size, 2)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
 test('directory assessment structurally detects unsafe multi-line JWT, CORS, and XML configurations', async () => {

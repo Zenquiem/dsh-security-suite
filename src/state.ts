@@ -10,8 +10,39 @@ const SHA256 = /^[a-f0-9]{64}$/
 export function getStateDir(configured: string): string { return resolve(configured || process.env.DSH_SECURITY_SUITE_STATE_DIR || join(homedir(), '.dsh-security-suite')) }
 export function createScanId(): string { return `scan_${randomUUID()}` }
 export function sha256(value: string | Buffer): string { return createHash('sha256').update(value).digest('hex') }
-export function findingId(ruleId: string, anchor: string, instance = ''): string { return `dsf_${sha256(`${ruleId}:${anchor}:${instance}`).slice(0, 24)}` }
+export function findingFingerprint(targetId: string, ruleId: string, anchor: string, instance = ''): string { return sha256(`${targetId}:${ruleId}:${anchor}:${instance}`) }
+export function findingId(targetId: string, ruleId: string, anchor: string, instance = ''): string { return `dsf_${sha256(`${targetId}:${ruleId}:${anchor}:${instance}`).slice(0, 24)}` }
 export function candidateId(ruleId: string, file: string, line: number): string { return `cand_${sha256(`${ruleId}:${file}:${line}`).slice(0, 16)}` }
+
+function identitySlug(value: string): string { return value.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 180) || 'root-control' }
+
+/**
+ * Assign a durable finding identity only after the target identity is known.
+ * Paths and line numbers remain locations, never the primary semantic anchor.
+ */
+export function assignFindingIdentity(finding: Finding, targetId: string, used: Set<string> = new Set()): Finding {
+  const root = finding.locations.find(location => location.role === 'root_control' || location.role === 'sink') ?? finding.locations[0]
+  const anchor = identitySlug(`${finding.ruleId}:${root?.excerpt ?? finding.rootCause}`)
+  const evidence = finding.evidence.map(item => `${item.kind}:${item.location?.excerpt ?? ''}:${item.detail.replace(/(?:^|\s)[\w./-]+:\d+(?=\s|$)/g, '')}`).join('\n')
+  const base = `${finding.ruleId}\n${root?.excerpt ?? ''}\n${finding.rootCause}\n${evidence}`.replace(/\s+/g, ' ').trim()
+  let instance = `instance-${sha256(base).slice(0, 20)}`
+  // Exact semantic twins require a disambiguator. The path is used only in this
+  // collision fallback; ordinary nearby line movement and renames stay stable.
+  if (used.has(`${finding.ruleId}:${anchor}:${instance}`)) instance = `source-${sha256(`${base}:${root?.file ?? ''}`).slice(0, 20)}`
+  while (used.has(`${finding.ruleId}:${anchor}:${instance}`)) instance = `source-${sha256(`${base}:${root?.file ?? ''}:${root?.line ?? 0}:${instance}`).slice(0, 20)}`
+  used.add(`${finding.ruleId}:${anchor}:${instance}`)
+  finding.identity = { anchor, instance }
+  finding.fingerprint = findingFingerprint(targetId, finding.ruleId, anchor, instance)
+  finding.id = findingId(targetId, finding.ruleId, anchor, instance)
+  return finding
+}
+
+/** Assign stable, target-bound identities while preserving independently attackable siblings. */
+export function assignFindingIdentities(findings: Finding[], targetId: string): Finding[] {
+  const used = new Set<string>()
+  for (const finding of findings.sort((left, right) => (left.locations[0]?.file ?? '').localeCompare(right.locations[0]?.file ?? '') || (left.locations[0]?.line ?? 0) - (right.locations[0]?.line ?? 0))) assignFindingIdentity(finding, targetId, used)
+  return findings
+}
 
 function scanPath(stateDir: string, id: string): string { if (!SCAN_ID.test(id)) throw new Error('Invalid scan id.'); return join(stateDir, 'scans', `${id}.json`) }
 function canonical(record: ScanRecord): string { const { seal: _seal, ...unsealed } = record; return JSON.stringify(unsealed) }
