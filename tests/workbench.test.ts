@@ -99,3 +99,21 @@ test('cancelled investigations can resume unfinished task work', async () => {
     assert.equal(resumed.tasks[0].status, 'pending')
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
+
+test('concurrent DSH workers claim distinct audit tasks without overwriting scan state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function first(req) { return eval(req.query.first) }\nfunction second(req) { return eval(req.query.second) }\n')
+    const scan = await runScan(root, config, 'standard', '', false, state, false); await saveScan(state, scan)
+    assert.equal(scan.tasks.length, 2)
+    const claims = await Promise.all(Array.from({ length: 6 }, (_, index) => claimAuditTask(config, scan.id, `worker-${index}`, 'validation')))
+    const claimed = claims.filter((claim): claim is NonNullable<typeof claim> => claim !== null)
+    assert.equal(claimed.length, 2)
+    assert.equal(new Set(claimed.map(claim => claim.taskId)).size, 2)
+    const saved = await loadScan(state, scan.id)
+    assert.equal(saved.tasks.filter(task => task.status === 'claimed').length, 2)
+    assert.equal(new Set(saved.tasks.map(task => task.claim?.token).filter(Boolean)).size, 2)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})

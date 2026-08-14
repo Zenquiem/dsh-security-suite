@@ -25,6 +25,8 @@ test('the suite composes with DSH registries and cleans up its native tool surfa
   assert.equal(names.includes('security_disclosure_submit_report'), true)
   assert.equal(names.includes('security_review_diff'), true)
   assert.equal(names.includes('security_deep_discovery_capability'), true)
+  assert.equal(names.includes('security_run_deep_investigation'), true)
+  assert.equal(names.includes('security_resume_deep_investigation'), true)
   assert.equal(names.includes('security_resume_deep_discovery'), true)
   assert.equal(names.includes('security_deep_get_worklist'), true)
   assert.equal(names.includes('security_plan_candidate_validation'), true)
@@ -54,6 +56,7 @@ test('the suite composes with DSH registries and cleans up its native tool surfa
   assert.equal(ctx.tools.get('security_import_github_findings'), undefined)
   assert.equal(ctx.tools.get('security_import_ticket_findings'), undefined)
   assert.equal(ctx.tools.get('security_start_deep_closure'), undefined)
+  assert.equal(ctx.tools.get('security_run_deep_investigation'), undefined)
   const afterUnload = await ctx.systemPrompt.assemble()
   assert.equal(afterUnload.sections.some(section => section.name === 'dsh-security-suite:workflow'), false)
 })
@@ -131,7 +134,7 @@ test('the DSH tool pipeline records reviewed runtime evidence without auto-confi
 
 test('the built npm entrypoint registers and executes through the real DSH tool pipeline', async () => {
   const packageRoot = fileURLToPath(new URL('..', import.meta.url))
-  if (!existsSync(new URL('../dist/index.js', import.meta.url))) await execFileAsync('npm', ['run', 'build'], { cwd: packageRoot })
+  await execFileAsync('npm', ['run', 'build'], { cwd: packageRoot })
   const built = await import('../dist/index.js') as typeof import('../src/index.ts')
   assert.equal('default' in built, false)
   const ctx = new Context()
@@ -143,10 +146,12 @@ test('the built npm entrypoint registers and executes through the real DSH tool 
     assert.equal(result.isError, false, result.isError ? result.error.message : '')
     assert.equal(typeof result.value, 'object')
     assert.equal(ctx.tools.get('security_resume_deep_discovery') !== undefined, true)
+    assert.equal(ctx.tools.get('security_run_deep_investigation') !== undefined, true)
   } finally {
     await fiber.dispose()
   }
   assert.equal(ctx.tools.get('security_deep_discovery_capability'), undefined)
+  assert.equal(ctx.tools.get('security_run_deep_investigation'), undefined)
 })
 
 test('write tools require DSH user approval in addition to approved: true', async () => {

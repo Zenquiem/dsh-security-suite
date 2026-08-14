@@ -11,6 +11,7 @@ import { cancelInvestigation, claimAuditTask, completeScan, pendingCandidates, r
 import { generateHardeningPortfolio, importFindings, importGitHubSecurityFindings, importSecurityTickets, triageFindingBacklog, triageImportedFinding } from './analysis.js'
 import { createGitHubAdvisory, createTracking, previewGitHubAdvisory, previewTracking } from './tracking.js'
 import { createDeepClosureJob, createDeepDiscoveryJob, deepDiscoveryCapability, getDeepWorklist, readDeepSource, readScanSource, reportDeepCandidate, reportDeepWorker, runDeepClosure, runDeepDiscovery } from './deep-discovery.js'
+import { createDeepInvestigationJob, runDeepInvestigation } from './deep-workflow.js'
 import { createDisclosureCampaign, getDisclosureAssignment, readDisclosureExperimentArtifact, readDisclosureSource, runDisclosureCampaign, submitDisclosureReport } from './disclosure.js'
 
 export const name = 'dsh-security-suite'
@@ -83,6 +84,18 @@ export function apply(ctx: Context, config: PluginConfig): void {
     name: 'security_deep_discovery_capability', description: 'Report whether this DSH profile exposes the native agent runtime required for six-worker delegated deep discovery. This performs no scan and creates no agent.', parameters: {},
     output: { schema: { type: 'object', properties: { available: { type: 'boolean' }, workersPerRound: { type: 'number' }, reason: { type: 'string' } }, required: ['available', 'workersPerRound'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute() { return deepDiscoveryCapability(ctx) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_run_deep_investigation', description: 'Run a complete DSH-native deep security investigation: create a receipt-bound deep scan, execute independent six-worker discovery rounds, centrally validate every candidate, analyze every reportable attack path, and finalize only when all ledger receipts close. Interrupted work returns a durable job id for security_resume_deep_investigation; it never substitutes an external agent runtime or auto-confirms a static match.', parameters: { path: { type: 'string', description: 'Optional workspace-relative scan scope.' }, threat_model: { type: 'string', description: 'Optional in-scope assets, actors, and assumptions.' }, max_rounds: { type: 'number', description: 'Maximum complete discovery rounds from 1 to 10; default 10.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, scanId: { type: 'string' }, phase: { type: 'string' }, lifecycle: { type: 'string' }, discoveryJobId: { type: 'string' }, validationClosureJobId: { type: 'string' }, attackPathClosureJobId: { type: 'string' } }, required: ['id', 'scanId', 'phase', 'lifecycle', 'discoveryJobId'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args, exec) { const target = resolveSafeTarget(process.cwd(), args.path); const job = await createDeepInvestigationJob(target, config, args.threat_model ?? '', args.path !== undefined, args.max_rounds ?? 10); return runDeepInvestigation(ctx, config, job.id, exec.signal) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_resume_deep_investigation', description: 'Resume a durable interrupted DSH-native deep investigation from its unfinished discovery, validation, attack-path, or finalization phase. It reuses only its retained scan and subordinate DSH job records.', parameters: { job_id: { type: 'string', required: true, description: 'Job identifier returned by security_run_deep_investigation.' } },
+    output: { schema: { type: 'object', properties: { id: { type: 'string' }, scanId: { type: 'string' }, phase: { type: 'string' }, lifecycle: { type: 'string' }, discoveryJobId: { type: 'string' }, validationClosureJobId: { type: 'string' }, attackPathClosureJobId: { type: 'string' } }, required: ['id', 'scanId', 'phase', 'lifecycle', 'discoveryJobId'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args, exec) { return runDeepInvestigation(ctx, config, args.job_id, exec.signal) },
   }))
 
   ctx.tools.register(defineTool({
