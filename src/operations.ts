@@ -18,11 +18,13 @@ export interface CommandReceipt { id: string; command: string; cwd: string; exit
 export interface ValidationStrategy { method: 'isolated_project_checks' | 'realistic_interface_reproduction' | 'debugger_trace' | 'sanitizer_or_memory_checker' | 'source_trace'; status: 'runnable_with_approval' | 'requires_explicit_setup' | 'not_applicable' | 'available_without_execution'; rationale: string; requiredEvidence: string[] }
 export interface CandidateValidationPlan { id: string; scanId: string; candidateId: string; snapshotDigest: string; projectFiles: string[]; commands: Array<{ command: string; reason: string }>; strategies: ValidationStrategy[]; skipped: Array<{ reason: string }>; createdAt: string }
 export interface CandidateValidationPlanRun extends CandidateValidationPlan { approved: true; executedAt: string; receipts: CommandReceipt[]; artifactRef: string }
-export interface RemediationReplacement { startLine: number; endLine: number; expectedText: string; replacementText: string; testPlan: string }
+export interface RemediationReplacement { file: string; startLine: number; endLine: number; expectedText: string; replacementText: string }
+export interface RemediationFileSnapshot { file: string; sha256: string }
+export interface RemediationRollbackFile extends RemediationFileSnapshot { beforeContent: string; appliedSha256: string }
 export interface RemediationVerification { scanId: string; status: 'not_detected' | 'still_detected'; ruleId: string; file: string; matchingFindingIds: string[]; observedAt: string; limitation: string }
 export interface RemediationVerificationRun { id: string; remediationId: string; sourceScanId: string; snapshotDigest: string; commands: Array<{ command: string; reason: string }>; receipts: CommandReceipt[]; outcome: 'passed' | 'failed'; executedAt: string; artifactRef: string; limitation: string }
-export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; createdAt: string; status: 'proposed' | 'applied' | 'rolled_back' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; safeToApply: boolean; rationale: string; replacement?: RemediationReplacement; appliedAt?: string; verificationScanId?: string; verification?: RemediationVerification; postApplyVerification?: RemediationVerificationRun; rollbackId?: string }
-export interface RemediationRollback { id: string; remediationId: string; scanId: string; file: string; beforeContent: string; beforeSha256: string; appliedSha256: string; appliedSnapshotDigest: string; createdAt: string; status: 'available' | 'rolled_back' | 'stale'; rolledBackAt?: string; verificationScanId?: string }
+export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; baseFiles?: RemediationFileSnapshot[]; createdAt: string; status: 'proposed' | 'applied' | 'rolled_back' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; safeToApply: boolean; rationale: string; testPlan?: string; replacement?: RemediationReplacement; replacements?: RemediationReplacement[]; appliedAt?: string; verificationScanId?: string; verification?: RemediationVerification; postApplyVerification?: RemediationVerificationRun; rollbackId?: string }
+export interface RemediationRollback { id: string; remediationId: string; scanId: string; file: string; beforeContent: string; beforeSha256: string; appliedSha256: string; files?: RemediationRollbackFile[]; appliedSnapshotDigest: string; createdAt: string; status: 'available' | 'rolled_back' | 'stale'; rolledBackAt?: string; verificationScanId?: string }
 
 export interface BulkResult { path: string; scanId?: string; findings?: number; error?: string }
 export interface BulkJob { id: string; createdAt: string; updatedAt: string; mode: 'standard' | 'deep'; threatModel: string; entries: Array<BulkResult & { status: 'pending' | 'completed' | 'failed'; attempts: number }> }
@@ -245,6 +247,27 @@ function patchFor(file: string, replacement: RemediationReplacement): string {
   return `--- a/${file}\n+++ b/${file}\n@@ lines ${replacement.startLine}-${replacement.endLine} @@\n${replacement.expectedText.split('\n').map(line => `- ${line}`).join('\n')}\n${replacement.replacementText.split('\n').map(line => `+ ${line}`).join('\n')}`
 }
 
+function proposalReplacements(proposal: RemediationProposal): RemediationReplacement[] {
+  const values = proposal.replacements?.length ? proposal.replacements : proposal.replacement ? [proposal.replacement] : []
+  return values.map(replacement => ({ ...replacement, file: replacement.file || proposal.file }))
+}
+
+function proposalFiles(proposal: RemediationProposal): RemediationFileSnapshot[] {
+  return proposal.baseFiles?.length ? proposal.baseFiles : [{ file: proposal.file, sha256: proposal.baseFileSha256 }]
+}
+
+function rollbackFiles(rollback: RemediationRollback): RemediationRollbackFile[] {
+  if (rollback.files?.length) return rollback.files
+  return [{ file: rollback.file, sha256: rollback.beforeSha256, beforeContent: rollback.beforeContent, appliedSha256: rollback.appliedSha256 }]
+}
+
+function reviewedChanges(input: { changes?: Array<{ file: string; startLine: number; endLine: number; expectedText: string; replacementText: string }>; file?: string; startLine?: number; endLine?: number; expectedText?: string; replacementText?: string }): RemediationReplacement[] {
+  const changes = input.changes?.length ? input.changes : input.file !== undefined && input.startLine !== undefined && input.endLine !== undefined && input.expectedText !== undefined && input.replacementText !== undefined ? [{ file: input.file, startLine: input.startLine, endLine: input.endLine, expectedText: input.expectedText, replacementText: input.replacementText }] : []
+  if (!changes.length || changes.length > 20) throw new Error('A reviewed remediation requires one to twenty bounded source changes.')
+  if (new Set(changes.map(change => change.file)).size !== changes.length) throw new Error('A reviewed remediation supports one bounded replacement per file; combine adjacent changes before proposing.')
+  return changes.map(change => ({ file: change.file, startLine: change.startLine, endLine: change.endLine, expectedText: change.expectedText, replacementText: change.replacementText }))
+}
+
 function remediationVerification(scan: ScanRecord, original: Finding): RemediationVerification {
   const matching = scan.findings.filter(finding => finding.ruleId === original.ruleId && finding.locations.some(location => location.file === original.locations[0]?.file))
   return { scanId: scan.id, status: matching.length ? 'still_detected' : 'not_detected', ruleId: original.ruleId, file: original.locations[0]?.file ?? '', matchingFindingIds: matching.map(finding => finding.id), observedAt: new Date().toISOString(), limitation: 'This is a post-change native-analysis observation, not proof that all exploit paths, runtime configurations, or regressions are resolved. Run the proposal test plan and complete source-backed review.' }
@@ -256,17 +279,23 @@ function remediationVerification(scan: ScanRecord, original: Finding): Remediati
  * exact snapshot and exact original source region, then performs the existing
  * rollback and verification workflow.
  */
-export async function proposeReviewedRemediation(workspace: string, config: Config, scanId: string, findingId: string, input: { file: string; startLine: number; endLine: number; expectedText: string; replacementText: string; rationale: string; testPlan: string }): Promise<RemediationProposal> {
+export async function proposeReviewedRemediation(workspace: string, config: Config, scanId: string, findingId: string, input: { changes?: Array<{ file: string; startLine: number; endLine: number; expectedText: string; replacementText: string }>; file?: string; startLine?: number; endLine?: number; expectedText?: string; replacementText?: string; rationale: string; testPlan: string }): Promise<RemediationProposal> {
   const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); const finding = scan.findings.find(item => item.id === findingId)
   if (!finding) throw new Error('Finding was not found in this scan.')
   if (finding.disposition !== 'reportable' || finding.validationRecord?.conclusion !== 'reportable') throw new Error('A reviewed remediation proposal requires a reportable finding with a structured reportable validation receipt.')
-  if (!Number.isInteger(input.startLine) || !Number.isInteger(input.endLine) || input.startLine < 1 || input.endLine < input.startLine || input.endLine - input.startLine > 199) throw new Error('Replacement range must be an inclusive source range of at most 200 lines.')
-  if (!input.expectedText || input.expectedText.length > 100_000 || !input.replacementText || input.replacementText.length > 100_000 || input.expectedText.includes('\r') || input.replacementText.includes('\r')) throw new Error('Replacement text must be non-empty LF text within the bounded size limit.')
   if (input.rationale.trim().length < 20 || input.testPlan.trim().length < 10) throw new Error('A reviewed remediation requires a substantive rationale and test plan.')
-  const root = resolve(workspace); const file = resolve(scan.target, input.file); if (!inside(root, file) || input.file !== finding.locations[0]?.file) throw new Error('Reviewed remediation must target the reportable finding\'s workspace-relative source file.')
-  const source = await readFile(file, 'utf8'); const replacement: RemediationReplacement = { startLine: input.startLine, endLine: input.endLine, expectedText: input.expectedText, replacementText: input.replacementText, testPlan: input.testPlan.trim().slice(0, 20_000) }
-  if (lineReplacement(source, replacement) === undefined) throw new Error('The expected source text does not exactly match the requested line range.')
-  const proposal: RemediationProposal = { id: `rem_${randomUUID()}`, findingId, file: input.file, line: input.startLine, patch: patchFor(input.file, replacement), baseSnapshotDigest: scan.targetSnapshot.snapshotDigest, baseFileSha256: sha256(source), createdAt: new Date().toISOString(), status: 'proposed', requiresApproval: true, requiresReview: true, safeToApply: true, rationale: input.rationale.trim().slice(0, 20_000), replacement }
+  const replacements = reviewedChanges(input); const findingFile = finding.locations[0]?.file
+  if (!findingFile || !replacements.some(replacement => replacement.file === findingFile)) throw new Error('A reviewed remediation must include a bounded replacement in the reportable finding source file.')
+  const receiptPaths = new Set(scan.coverage.receipts.map(receipt => receipt.path)); const root = resolve(workspace); const snapshots: RemediationFileSnapshot[] = []
+  for (const replacement of replacements) {
+    if (!Number.isInteger(replacement.startLine) || !Number.isInteger(replacement.endLine) || replacement.startLine < 1 || replacement.endLine < replacement.startLine || replacement.endLine - replacement.startLine > 199) throw new Error('Replacement ranges must be inclusive source ranges of at most 200 lines.')
+    if (!receiptPaths.has(replacement.file)) throw new Error(`Reviewed remediation file is outside the immutable scan receipt set: ${replacement.file}`)
+    if (!replacement.expectedText || replacement.expectedText.length > 100_000 || !replacement.replacementText || replacement.replacementText.length > 100_000 || replacement.expectedText.includes('\r') || replacement.replacementText.includes('\r')) throw new Error('Replacement text must be non-empty LF text within the bounded size limit.')
+    const file = resolve(scan.target, replacement.file); if (!inside(root, file)) throw new Error('Reviewed remediation file is outside the active workspace.')
+    const source = await readFile(file, 'utf8'); if (lineReplacement(source, replacement) === undefined) throw new Error(`The expected source text does not exactly match ${replacement.file}:${replacement.startLine}-${replacement.endLine}.`)
+    snapshots.push({ file: replacement.file, sha256: sha256(source) })
+  }
+  const findingReplacement = replacements.find(replacement => replacement.file === findingFile)!; const proposal: RemediationProposal = { id: `rem_${randomUUID()}`, findingId, file: findingReplacement.file, line: findingReplacement.startLine, patch: replacements.map(replacement => patchFor(replacement.file, replacement)).join('\n'), baseSnapshotDigest: scan.targetSnapshot.snapshotDigest, baseFileSha256: snapshots.find(snapshot => snapshot.file === findingReplacement.file)!.sha256, baseFiles: snapshots, createdAt: new Date().toISOString(), status: 'proposed', requiresApproval: true, requiresReview: true, safeToApply: true, rationale: input.rationale.trim().slice(0, 20_000), testPlan: input.testPlan.trim().slice(0, 20_000), replacement: findingReplacement, replacements }
   await saveProposal(state, proposal); return proposal
 }
 
@@ -275,9 +304,9 @@ export async function remediationPlan(workspace: string, config: Config, scanId:
   if (!finding) throw new Error('Finding was not found in this scan.')
   const location = finding.locations[0]; const file = resolve(scan.target, location.file); const root = resolve(workspace)
   if (!inside(root, file)) throw new Error('Finding location is outside the active workspace.')
-  const before = await readFile(file, 'utf8'); const replacement = replacementFor(finding, before)
-  const patch = replacement ? `--- a/${location.file}\n+++ b/${location.file}\n@@ line ${location.line} @@\n- ${location.excerpt}\n+ ${replacement.content.split(/\r?\n/)[location.line - 1]?.trim() ?? '<review replacement>'}` : `No mechanically safe replacement is available for ${finding.ruleId}.\nReview ${location.file}:${location.line} and implement: ${finding.remediation}`
-  const proposal: RemediationProposal = { id: `rem_${randomUUID()}`, findingId: finding.id, file: location.file, line: location.line, patch, baseSnapshotDigest: scan.targetSnapshot.snapshotDigest, baseFileSha256: sha256(before), createdAt: new Date().toISOString(), status: 'proposed', requiresApproval: true, requiresReview: true, safeToApply: Boolean(replacement), rationale: replacement?.rationale ?? 'The finding requires application-specific review; no semantics-preserving automatic replacement is available.' }
+  const before = await readFile(file, 'utf8'); const generated = replacementFor(finding, before); const replacement = generated && { file: location.file, startLine: 1, endLine: before.split(/\r?\n/).length, expectedText: before, replacementText: generated.content }
+  const patch = replacement ? patchFor(location.file, replacement) : `No mechanically safe replacement is available for ${finding.ruleId}.\nReview ${location.file}:${location.line} and implement: ${finding.remediation}`
+  const proposal: RemediationProposal = { id: `rem_${randomUUID()}`, findingId: finding.id, file: location.file, line: location.line, patch, baseSnapshotDigest: scan.targetSnapshot.snapshotDigest, baseFileSha256: sha256(before), baseFiles: [{ file: location.file, sha256: sha256(before) }], createdAt: new Date().toISOString(), status: 'proposed', requiresApproval: true, requiresReview: true, safeToApply: Boolean(replacement), rationale: generated?.rationale ?? 'The finding requires application-specific review; no semantics-preserving automatic replacement is available.', replacement, replacements: replacement ? [replacement] : undefined }
   await saveProposal(getStateDir(config.stateDir), proposal)
   await atomicWrite(join(getStateDir(config.stateDir), 'remediations', `${proposal.id}.json`), `${JSON.stringify(proposal, null, 2)}\n`)
   return proposal
@@ -288,13 +317,15 @@ export async function applyRemediationProposal(workspace: string, config: Config
   const scan = await loadScan(getStateDir(config.stateDir), scanId); const proposal = await loadRemediationProposal(getStateDir(config.stateDir), remediationId)
   if (proposal.findingId !== scan.findings.find(finding => finding.id === proposal.findingId)?.id) throw new Error('Remediation proposal does not belong to this scan.')
   if (proposal.status !== 'proposed') throw new Error(`Remediation is ${proposal.status} and cannot be applied.`)
-  const root = resolve(workspace); const file = resolve(scan.target, proposal.file); if (!inside(root, file)) throw new Error('Remediation target is outside the active workspace.')
-  const [current, currentSnapshot] = await Promise.all([readFile(file, 'utf8'), snapshotDigestForDirectory(scan.target, config)])
-  if (sha256(current) !== proposal.baseFileSha256 || currentSnapshot !== proposal.baseSnapshotDigest) { proposal.status = 'stale'; await saveProposal(getStateDir(config.stateDir), proposal); throw new Error('Remediation proposal is stale because the target snapshot or file changed. Generate a new proposal.') }
+  const root = resolve(workspace); const replacements = proposalReplacements(proposal); const snapshots = proposalFiles(proposal)
+  if (!proposal.safeToApply || !replacements.length || replacements.length !== snapshots.length) throw new Error('No mechanically safe replacement is available for this proposal.')
+  const [currentSnapshot, sources] = await Promise.all([snapshotDigestForDirectory(scan.target, config), Promise.all(snapshots.map(async snapshot => { const file = resolve(scan.target, snapshot.file); if (!inside(root, file)) throw new Error('Remediation target is outside the active workspace.'); return { snapshot, file, source: await readFile(file, 'utf8') } }))])
+  if (currentSnapshot !== proposal.baseSnapshotDigest || sources.some(item => sha256(item.source) !== item.snapshot.sha256)) { proposal.status = 'stale'; await saveProposal(getStateDir(config.stateDir), proposal); throw new Error('Remediation proposal is stale because the target snapshot or a proposed file changed. Generate a new proposal.') }
   const finding = scan.findings.find(item => item.id === proposal.findingId); if (!finding) throw new Error('Finding was not found in this scan.')
-  const native = replacementFor(finding, current); const content = proposal.replacement ? lineReplacement(current, proposal.replacement) : native?.content
-  if (!proposal.safeToApply || !content || content === current) throw new Error('No mechanically safe replacement is available for this proposal.')
-  await writeFile(file, content, 'utf8'); const appliedSnapshotDigest = await snapshotDigestForDirectory(scan.target, config); const rollback: RemediationRollback = { id: `rollback_${randomUUID()}`, remediationId: proposal.id, scanId, file: proposal.file, beforeContent: current, beforeSha256: sha256(current), appliedSha256: sha256(content), appliedSnapshotDigest, createdAt: new Date().toISOString(), status: 'available' }
+  const changes = sources.map(item => { const replacement = replacements.find(value => value.file === item.snapshot.file); const content = replacement && lineReplacement(item.source, replacement); if (!content || content === item.source) throw new Error(`No mechanically safe replacement is available for ${item.snapshot.file}.`); return { ...item, content } })
+  const written: typeof changes = []
+  try { for (const change of changes) { await writeFile(change.file, change.content, 'utf8'); written.push(change) } } catch (error) { await Promise.all(written.map(change => writeFile(change.file, change.source, 'utf8'))); throw error }
+  const appliedSnapshotDigest = await snapshotDigestForDirectory(scan.target, config); const rollbackFiles: RemediationRollbackFile[] = changes.map(change => ({ file: change.snapshot.file, sha256: sha256(change.source), beforeContent: change.source, appliedSha256: sha256(change.content) })); const primary = rollbackFiles.find(item => item.file === proposal.file)!; const rollback: RemediationRollback = { id: `rollback_${randomUUID()}`, remediationId: proposal.id, scanId, file: primary.file, beforeContent: primary.beforeContent, beforeSha256: primary.sha256, appliedSha256: primary.appliedSha256, files: rollbackFiles, appliedSnapshotDigest, createdAt: new Date().toISOString(), status: 'available' }
   await saveRollback(getStateDir(config.stateDir), rollback); proposal.status = 'applied'; proposal.appliedAt = new Date().toISOString(); proposal.rollbackId = rollback.id
   const verification = await runScan(scan.target, config, 'standard', scan.threatModel, scan.recipe.scopeRequested, config.stateDir, false)
   await persistInvestigationArtifacts(getStateDir(config.stateDir), verification); await saveScan(getStateDir(config.stateDir), verification); proposal.verificationScanId = verification.id; proposal.verification = remediationVerification(verification, finding); await saveProposal(getStateDir(config.stateDir), proposal)
@@ -314,11 +345,11 @@ export async function runRemediationVerification(workspace: string, config: Conf
   if (proposal.status !== 'applied' || !proposal.rollbackId) throw new Error('Only an applied remediation with an available rollback record can be verified.')
   const rollback = await loadRemediationRollback(state, proposal.rollbackId)
   if (rollback.status !== 'available' || rollback.remediationId !== proposal.id || rollback.scanId !== scanId) throw new Error('The applied remediation rollback record is unavailable.')
-  const root = resolve(workspace); const file = resolve(scan.target, proposal.file); if (!inside(root, file)) throw new Error('Remediation target is outside the active workspace.')
+  const root = resolve(workspace); for (const item of rollbackFiles(rollback)) if (!inside(root, resolve(scan.target, item.file))) throw new Error('Remediation target is outside the active workspace.')
   const commands = [...new Set(scan.preflight.suggestedCommands.map(command => safeCommand(command)))].map(command => ({ command, reason: `Suggested by source scan ${scan.id} preflight for ${scan.preflight.projectFiles.join(', ')}.` }))
   if (!commands.length) throw new Error('No bounded remediation verification command is available from the source scan preflight.')
-  const [current, snapshotDigest] = await Promise.all([readFile(file, 'utf8'), snapshotDigestForDirectory(scan.target, config)])
-  if (sha256(current) !== rollback.appliedSha256 || snapshotDigest !== rollback.appliedSnapshotDigest) throw new Error('Applied remediation changed since application. Create a follow-up scan before verification.')
+  const [snapshotDigest, sources] = await Promise.all([snapshotDigestForDirectory(scan.target, config), Promise.all(rollbackFiles(rollback).map(async item => ({ item, source: await readFile(resolve(scan.target, item.file), 'utf8') })))])
+  if (snapshotDigest !== rollback.appliedSnapshotDigest || sources.some(source => sha256(source.source) !== source.item.appliedSha256)) throw new Error('Applied remediation changed since application. Create a follow-up scan before verification.')
   const receipts = await executeValidationCommands(scan.target, commands.map(item => item.command), timeoutMs, snapshotDigest, signal)
   const after = await snapshotDigestForDirectory(scan.target, config)
   if (after !== snapshotDigest) throw new Error('Target changed during remediation verification; receipts were not attached.')
@@ -335,10 +366,11 @@ export async function rollbackRemediationProposal(workspace: string, config: Con
   const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); const proposal = await loadRemediationProposal(state, remediationId)
   if (proposal.status !== 'applied' || !proposal.rollbackId) throw new Error('Only an applied remediation with an available rollback record can be rolled back.')
   const rollback = await loadRemediationRollback(state, proposal.rollbackId); if (rollback.remediationId !== proposal.id || rollback.scanId !== scanId || rollback.status !== 'available') throw new Error('Rollback record is unavailable or does not belong to this remediation.')
-  const root = resolve(workspace); const file = resolve(scan.target, rollback.file); if (!inside(root, file)) throw new Error('Rollback target is outside the active workspace.')
-  const [current, snapshot] = await Promise.all([readFile(file, 'utf8'), snapshotDigestForDirectory(scan.target, config)])
-  if (sha256(current) !== rollback.appliedSha256 || snapshot !== rollback.appliedSnapshotDigest) { rollback.status = 'stale'; await saveRollback(state, rollback); throw new Error('Rollback record is stale because the applied file or target snapshot changed.') }
-  await writeFile(file, rollback.beforeContent, 'utf8'); rollback.status = 'rolled_back'; rollback.rolledBackAt = new Date().toISOString()
+  const root = resolve(workspace); const files = rollbackFiles(rollback); const [snapshot, sources] = await Promise.all([snapshotDigestForDirectory(scan.target, config), Promise.all(files.map(async item => { const file = resolve(scan.target, item.file); if (!inside(root, file)) throw new Error('Rollback target is outside the active workspace.'); return { item, file, source: await readFile(file, 'utf8') } }))])
+  if (snapshot !== rollback.appliedSnapshotDigest || sources.some(source => sha256(source.source) !== source.item.appliedSha256)) { rollback.status = 'stale'; await saveRollback(state, rollback); throw new Error('Rollback record is stale because an applied file or target snapshot changed.') }
+  const restored: typeof sources = []
+  try { for (const source of sources) { await writeFile(source.file, source.item.beforeContent, 'utf8'); restored.push(source) } } catch (error) { await Promise.all(restored.map(source => writeFile(source.file, source.source, 'utf8'))); throw error }
+  rollback.status = 'rolled_back'; rollback.rolledBackAt = new Date().toISOString()
   const verification = await runScan(scan.target, config, 'standard', scan.threatModel, scan.recipe.scopeRequested, config.stateDir, false); await persistInvestigationArtifacts(state, verification); await saveScan(state, verification); rollback.verificationScanId = verification.id; proposal.status = 'rolled_back'; await saveRollback(state, rollback); await saveProposal(state, proposal)
   return rollback
 }

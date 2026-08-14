@@ -281,6 +281,55 @@ test('reviewed remediation binds an exact validated source range, applies revers
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
+test('reviewed remediation atomically applies and rolls back a source fix with its regression test', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    const source = 'function route(req) { return eval(req.query.code) }\n'
+    const testSource = 'assert.equal(route({ query: { code: "1 + 1" } }), 2)\n'
+    await writeFile(join(root, 'app.ts'), source); await writeFile(join(root, 'route.test.ts'), testSource)
+    const scan = await runScan(root, local, 'standard', '', false, state); await saveScan(state, scan)
+    const finding = scan.findings[0]; const claim = await claimAuditTask(local, scan.id, 'validator', 'validation'); assert.ok(claim)
+    await recordValidation(local, scan.id, finding.candidateId, { conclusion: 'reportable', method: 'static', attacker: 'Remote request sender.', entryPoint: 'route request parameter.', trustBoundary: 'Untrusted request crosses into application execution.', rootControl: 'Dynamic evaluation statement.', sink: 'eval invocation.', impact: 'Attacker-controlled execution.', directEvidence: 'Request data reaches eval without a parser or authorization guard.', counterevidence: 'No local containment was identified.', limitations: 'Runtime route execution was not performed.', confidence: 'medium', sourceReferences: references(finding) }, claim.claimToken)
+    const proposal = await proposeReviewedRemediation(root, local, scan.id, finding.id, { changes: [
+      { file: 'app.ts', startLine: 1, endLine: 1, expectedText: source.trim(), replacementText: 'function route(req) { return safeEvaluate(req.query.code) }' },
+      { file: 'route.test.ts', startLine: 1, endLine: 1, expectedText: testSource.trim(), replacementText: 'assert.throws(() => route({ query: { code: "process.exit()" } }))' },
+    ], rationale: 'Replace the execution primitive and encode the malicious-input regression through the same route boundary.', testPlan: 'Run the focused route regression suite.' })
+    assert.equal(proposal.replacements?.length, 2)
+    assert.match(proposal.patch, /route\.test\.ts/)
+    const applied = await applyRemediationProposal(root, local, scan.id, proposal.id, true)
+    assert.match(await readFile(join(root, 'app.ts'), 'utf8'), /safeEvaluate/)
+    assert.match(await readFile(join(root, 'route.test.ts'), 'utf8'), /assert\.throws/)
+    const rollback = await loadRemediationRollback(state, applied.rollbackId!)
+    assert.equal(rollback.files?.length, 2)
+    await rollbackRemediationProposal(root, local, scan.id, proposal.id, true)
+    assert.equal(await readFile(join(root, 'app.ts'), 'utf8'), source)
+    assert.equal(await readFile(join(root, 'route.test.ts'), 'utf8'), testSource)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('reviewed multi-file remediation rejects drift in a regression test before changing any file', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    const source = 'function route(req) { return eval(req.query.code) }\n'
+    const testSource = 'assert.equal(route({ query: { code: "1 + 1" } }), 2)\n'
+    await writeFile(join(root, 'app.ts'), source); await writeFile(join(root, 'route.test.ts'), testSource)
+    const scan = await runScan(root, local, 'standard', '', false, state); await saveScan(state, scan)
+    const finding = scan.findings[0]; const claim = await claimAuditTask(local, scan.id, 'validator', 'validation'); assert.ok(claim)
+    await recordValidation(local, scan.id, finding.candidateId, { conclusion: 'reportable', method: 'static', attacker: 'Remote request sender.', entryPoint: 'route request parameter.', trustBoundary: 'Untrusted request crosses into application execution.', rootControl: 'Dynamic evaluation statement.', sink: 'eval invocation.', impact: 'Attacker-controlled execution.', directEvidence: 'Request data reaches eval without a parser or authorization guard.', counterevidence: 'No local containment was identified.', limitations: 'Runtime route execution was not performed.', confidence: 'medium', sourceReferences: references(finding) }, claim.claimToken)
+    const proposal = await proposeReviewedRemediation(root, local, scan.id, finding.id, { changes: [
+      { file: 'app.ts', startLine: 1, endLine: 1, expectedText: source.trim(), replacementText: 'function route(req) { return safeEvaluate(req.query.code) }' },
+      { file: 'route.test.ts', startLine: 1, endLine: 1, expectedText: testSource.trim(), replacementText: 'assert.throws(() => route({ query: { code: "process.exit()" } }))' },
+    ], rationale: 'Replace the execution primitive and encode the malicious-input regression through the same route boundary.', testPlan: 'Run the focused route regression suite.' })
+    await writeFile(join(root, 'route.test.ts'), `${testSource}// concurrent test edit\n`)
+    await assert.rejects(() => applyRemediationProposal(root, local, scan.id, proposal.id, true), /stale/)
+    assert.equal(await readFile(join(root, 'app.ts'), 'utf8'), source)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
 test('remediation verification reports a still-detected family without claiming resolution', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
