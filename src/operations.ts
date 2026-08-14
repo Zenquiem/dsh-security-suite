@@ -13,8 +13,11 @@ import { finalizeAndSaveScan, getStateDir, loadScan, persistInvestigationArtifac
 const execFileAsync = promisify(execFile)
 const MAX_COMMAND_OUTPUT = 256_000
 const VALIDATION_COMMAND = /^[A-Za-z0-9_./:@=+%, -]+$/
+const RUNTIME_METHODS = ['realistic_interface_reproduction', 'debugger_trace', 'sanitizer_or_memory_checker'] as const
 
 export interface CommandReceipt { id: string; command: string; cwd: string; exitCode?: number; timedOut: boolean; durationMs: number; stdout: string; stderr: string; snapshotDigest: string; artifactRef?: string }
+export type RuntimeValidationMethod = typeof RUNTIME_METHODS[number]
+export interface RuntimeValidationReceipt extends CommandReceipt { method: RuntimeValidationMethod; fixturePaths: string[]; setupSummary: string; limitation: string }
 export interface ValidationStrategy { method: 'isolated_project_checks' | 'realistic_interface_reproduction' | 'debugger_trace' | 'sanitizer_or_memory_checker' | 'source_trace'; status: 'runnable_with_approval' | 'requires_explicit_setup' | 'not_applicable' | 'available_without_execution'; rationale: string; requiredEvidence: string[] }
 export interface CandidateValidationPlan { id: string; scanId: string; candidateId: string; snapshotDigest: string; projectFiles: string[]; commands: Array<{ command: string; reason: string }>; strategies: ValidationStrategy[]; skipped: Array<{ reason: string }>; createdAt: string }
 export interface CandidateValidationPlanRun extends CandidateValidationPlan { approved: true; executedAt: string; receipts: CommandReceipt[]; artifactRef: string }
@@ -32,6 +35,24 @@ export interface BulkJob { id: string; createdAt: string; updatedAt: string; mod
 function inside(root: string, target: string): boolean { const rel = relative(root, target); return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel)) }
 function safeCommand(command: string): string { const value = command.trim(); if (!value || value.length > 500 || !VALIDATION_COMMAND.test(value)) throw new Error('Validation command contains unsupported shell syntax. Use a simple executable and arguments only.'); return value }
 function splitCommand(command: string): string[] { return safeCommand(command).split(/\s+/).filter(Boolean) }
+function commandExecutable(command: string): string { return splitCommand(command)[0]?.split('/').at(-1)?.toLowerCase() ?? '' }
+function isLoopbackUrl(value: string): boolean { try { const url = new URL(value); return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) } catch { return false } }
+function safeRuntimeCommand(method: RuntimeValidationMethod, command: string): string {
+  const value = safeCommand(command); const args = splitCommand(value); const executable = commandExecutable(value)
+  if (args.some(argument => /^(?:https?|ftp|ssh):\/\//i.test(argument) && !isLoopbackUrl(argument))) throw new Error('Runtime validation may only address loopback URLs from its disposable copy.')
+  if (method === 'debugger_trace') {
+    if (executable === 'gdb' && (args.includes('-batch') || args.includes('--batch')) && args.filter(argument => argument === '-ex' || argument === '--ex').length >= 2) return value
+    if (executable === 'lldb' && args.includes('-b') && args.filter(argument => argument === '-o' || argument === '--one-line').length >= 2) return value
+    throw new Error('Debugger validation requires non-interactive gdb (-batch with commands) or lldb (-b with commands).')
+  }
+  if (method === 'sanitizer_or_memory_checker') {
+    if (/(?:asan|ubsan|msan|tsan|valgrind|sanitize)/i.test(value)) return value
+    throw new Error('Sanitizer validation command must explicitly invoke a sanitizer or memory checker.')
+  }
+  if (!['node', 'nodejs', 'npm', 'pnpm', 'yarn', 'bun', 'python', 'python3', 'pytest', 'ruby', 'php', 'java', 'dotnet', 'go', 'cargo', 'mvn', 'gradle', 'gradlew'].includes(executable)) throw new Error('Interface validation command must use a supported local runtime or test runner.')
+  return value
+}
+function runtimeMethod(value: string): RuntimeValidationMethod { if ((RUNTIME_METHODS as readonly string[]).includes(value)) return value as RuntimeValidationMethod; throw new Error('Runtime validation method is not supported.') }
 function digest(value: string): string { return createHash('sha256').update(value).digest('hex') }
 function proposalPath(stateDir: string, id: string): string { if (!/^rem_[0-9a-f-]+$/.test(id)) throw new Error('Invalid remediation id.'); return join(stateDir, 'remediations', `${id}.json`) }
 function rollbackPath(stateDir: string, id: string): string { if (!/^rollback_[0-9a-f-]+$/.test(id)) throw new Error('Invalid remediation rollback id.'); return join(stateDir, 'remediation-rollbacks', `${id}.json`) }
@@ -95,6 +116,42 @@ export async function runCandidateValidation(workspace: string, config: Config, 
   currentTask.receipt = `test:${receipt.id}`
   await persistInvestigationArtifacts(state, reloaded); await saveScan(state, reloaded)
   return attached
+}
+
+/**
+ * Run a reviewed local interface, debugger, or sanitizer command in a
+ * disposable target copy. The receipt is runtime evidence only: it cannot
+ * independently promote, suppress, or resolve the candidate.
+ */
+export async function runCandidateRuntimeValidation(workspace: string, config: Config, scanId: string, candidateId: string, claimToken: string, methodInput: string, command: string, fixturePaths: string[], setupSummary: string, approved: boolean, timeoutMs = 120_000, signal?: AbortSignal): Promise<RuntimeValidationReceipt> {
+  signal?.throwIfAborted()
+  if (!approved) throw new Error('Runtime validation can execute a reviewed local interface, debugger, or sanitizer command. Set approved to true only after reviewing its fixture paths and command.')
+  const method = runtimeMethod(methodInput); const boundedCommand = safeRuntimeCommand(method, command)
+  const setup = setupSummary.trim(); if (!setup || setup.length > 20_000) throw new Error('Runtime validation requires a bounded setup summary.')
+  const fixtures = [...new Set(fixturePaths.map(path => path.trim()))]
+  if (!fixtures.length || fixtures.length > 20 || fixtures.some(path => !path || isAbsolute(path) || path.split(/[\\/]+/).includes('..'))) throw new Error('Runtime validation requires one to twenty workspace-relative fixture paths.')
+  const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId)
+  if (scan.mode === 'diff') throw new Error('Runtime validation needs a full source snapshot; create a standard or deep follow-up scan for a diff candidate.')
+  if (scan.lifecycle === 'completed') throw new Error('Completed scans cannot accept new validation evidence.')
+  const finding = scan.findings.find(item => item.candidateId === candidateId); if (!finding) throw new Error('Candidate was not found in this scan.')
+  const task = scan.tasks.find(item => item.candidateId === candidateId && item.phase === 'validation' && item.status === 'claimed')
+  if (!task || task.claim?.token !== claimToken) throw new Error('Claim token does not own this candidate validation task.')
+  const receiptPaths = new Set(scan.coverage.receipts.map(receipt => receipt.path))
+  if (fixtures.some(path => !receiptPaths.has(path))) throw new Error('Every runtime validation fixture must be a scan-receipted source path.')
+  const before = await snapshotDigestForDirectory(scan.target, config); if (before !== scan.targetSnapshot.snapshotDigest) throw new Error('Target changed since this scan. Create a follow-up scan before attaching runtime evidence.')
+  const commandReceipt = await runIsolatedValidation(workspace, config, scanId, boundedCommand, timeoutMs, signal)
+  if (commandReceipt.snapshotDigest !== scan.targetSnapshot.snapshotDigest) throw new Error('Target changed during runtime validation; the receipt was retained externally but was not attached to this scan.')
+  const reloaded = await loadScan(state, scanId); const currentFinding = reloaded.findings.find(item => item.candidateId === candidateId); const currentTask = reloaded.tasks.find(item => item.id === task.id)
+  if (!currentFinding || !currentTask || currentTask.status !== 'claimed' || currentTask.claim?.token !== claimToken) throw new Error('Candidate validation task changed while runtime validation was running; the receipt was retained externally but was not attached.')
+  const artifactRef = `artifacts/05_findings/${candidateId}/validation_artifacts/runtime_${commandReceipt.id}.json`
+  const receipt: RuntimeValidationReceipt = { ...commandReceipt, method, fixturePaths: fixtures.sort(), setupSummary: setup, limitation: 'This controlled, disposable-copy execution is runtime evidence only. It does not establish production reachability, prove all attacker paths, or automatically decide the candidate disposition.', artifactRef }
+  await writeArtifact(reloaded, artifactRef, `${JSON.stringify(receipt, null, 2)}\n`)
+  const outcome = receipt.timedOut ? 'timed out' : receipt.exitCode === 0 ? 'completed successfully' : `exited with ${receipt.exitCode ?? 'an unknown status'}`
+  currentFinding.evidence.push({ kind: 'runtime', detail: `${method} command \`${receipt.command}\` ${outcome}; fixture paths: ${receipt.fixturePaths.join(', ')}. Interpret this receipt with source and runtime context.`, artifactRef })
+  currentFinding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition: 'discovered', summary: `Attached ${method} runtime receipt ${receipt.id}: ${outcome}. Final validation conclusion remains pending.`, artifactRef })
+  currentTask.receipt = `runtime:${receipt.id}`
+  await persistInvestigationArtifacts(state, reloaded); await saveScan(state, reloaded)
+  return receipt
 }
 
 /**

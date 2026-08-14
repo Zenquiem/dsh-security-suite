@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { applyRemediationProposal, installPreCommitHook, loadRemediationRollback, planCandidateValidation, proposeReviewedRemediation, remediationPlan, resumeBulkJob, rollbackRemediationProposal, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, runRemediationVerification, startBulkCsvJob } from '../src/operations.ts'
+import { applyRemediationProposal, installPreCommitHook, loadRemediationRollback, planCandidateValidation, proposeReviewedRemediation, remediationPlan, resumeBulkJob, rollbackRemediationProposal, runCandidateRuntimeValidation, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, runRemediationVerification, startBulkCsvJob } from '../src/operations.ts'
 import { runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
 import { claimAuditTask, recordValidation } from '../src/workbench.ts'
@@ -90,6 +90,47 @@ test('candidate validation attaches an isolated receipt to the claimed candidate
     assert.equal(finding.ledger.some(item => item.artifactRef === receipt.artifactRef), true)
     assert.match(await readFile(join(attached.artifacts.directory, receipt.artifactRef ?? ''), 'utf8'), /node --version/)
     await recordValidation(local, scan.id, candidate.candidateId, { conclusion: 'suppressed', method: 'test', attacker: 'none', entryPoint: 'test fixture', trustBoundary: 'isolated copy', rootControl: 'eval call', sink: 'eval', impact: 'none', directEvidence: 'The isolated command is attached as supporting evidence.', counterevidence: 'No reachable route was established.', limitations: 'The command does not exercise an HTTP route.', confidence: 'medium', sourceReferences: references(candidate) }, claim.claimToken)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('runtime validation binds a reviewed local interface reproduction to snapshot-receipted fixtures without deciding the candidate', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function route(req) { return eval(req.query.code) }\n')
+    await writeFile(join(root, 'repro.js'), 'console.log("controlled interface reproduction")\n')
+    const scan = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, scan)
+    const candidate = scan.findings[0]; const claim = await claimAuditTask(local, scan.id, 'runtime-validator', 'validation'); assert.ok(claim)
+    await assert.rejects(() => runCandidateRuntimeValidation(root, local, scan.id, candidate.candidateId, claim.claimToken, 'realistic_interface_reproduction', 'node repro.js', ['repro.js'], 'A disposable local harness records the route-boundary reproduction output.', false), /approved/)
+    await assert.rejects(() => runCandidateRuntimeValidation(root, local, scan.id, candidate.candidateId, claim.claimToken, 'realistic_interface_reproduction', 'node repro.js', ['missing.js'], 'A disposable local harness records the route-boundary reproduction output.', true), /scan-receipted/)
+    const receipt = await runCandidateRuntimeValidation(root, local, scan.id, candidate.candidateId, claim.claimToken, 'realistic_interface_reproduction', 'node repro.js', ['repro.js'], 'A disposable local harness records the route-boundary reproduction output.', true)
+    assert.equal(receipt.method, 'realistic_interface_reproduction')
+    assert.equal(receipt.exitCode, 0)
+    assert.deepEqual(receipt.fixturePaths, ['repro.js'])
+    assert.match(receipt.limitation, /does not establish production reachability/i)
+    const attached = await loadScan(state, scan.id); const finding = attached.findings.find(item => item.candidateId === candidate.candidateId)
+    assert.ok(finding); assert.equal(finding.disposition, 'discovered')
+    assert.equal(finding.evidence.some(item => item.kind === 'runtime' && item.artifactRef === receipt.artifactRef), true)
+    const artifact = await readFile(join(attached.artifacts.directory, receipt.artifactRef!), 'utf8')
+    assert.match(artifact, /node repro\.js/)
+    assert.match(artifact, /route-boundary reproduction output/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('runtime validation rejects unsafe remote, interactive-debugger, and non-sanitizer commands before execution', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function route(req) { return eval(req.query.code) }\n')
+    await writeFile(join(root, 'repro.js'), 'console.log("ok")\n')
+    const scan = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, scan)
+    const claim = await claimAuditTask(local, scan.id, 'runtime-validator', 'validation'); assert.ok(claim)
+    const run = (method: 'realistic_interface_reproduction' | 'debugger_trace' | 'sanitizer_or_memory_checker', command: string) => runCandidateRuntimeValidation(root, local, scan.id, scan.findings[0].candidateId, claim.claimToken, method, command, ['repro.js'], 'A bounded disposable local check.', true)
+    await assert.rejects(() => run('realistic_interface_reproduction', 'node http://example.com'), /loopback URLs/)
+    await assert.rejects(() => run('debugger_trace', 'gdb app'), /non-interactive/)
+    await assert.rejects(() => run('sanitizer_or_memory_checker', 'node repro.js'), /sanitizer or memory checker/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

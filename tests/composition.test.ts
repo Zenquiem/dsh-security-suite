@@ -28,6 +28,7 @@ test('the suite composes with DSH registries and cleans up its native tool surfa
   assert.equal(names.includes('security_resume_deep_discovery'), true)
   assert.equal(names.includes('security_deep_get_worklist'), true)
   assert.equal(names.includes('security_plan_candidate_validation'), true)
+  assert.equal(names.includes('security_run_candidate_runtime_validation'), true)
   assert.equal(names.includes('security_run_candidate_validation_plan'), true)
   assert.equal(names.includes('security_run_remediation_verification'), true)
   assert.equal(names.includes('security_rollback_remediation'), true)
@@ -138,9 +139,18 @@ test('write tools require DSH user approval in addition to approved: true', asyn
     assert.match(missingVerificationAcknowledgement.isError ? missingVerificationAcknowledgement.error.message : '', /requires approved: true/)
     assert.equal(approvalRequests, 1)
 
+    const missingRuntimeAcknowledgement = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'runtime-validation-false' as never, name: 'security_run_candidate_runtime_validation', arguments: { scan_id: 'missing', candidate_id: 'missing', claim_token: 'missing', method: 'realistic_interface_reproduction', command: 'node repro.js', fixture_paths: ['repro.js'], setup_summary: 'A reviewed disposable local harness.', approved: false }, agent: {} as never })
+    assert.equal(missingRuntimeAcknowledgement.isError, true)
+    assert.match(missingRuntimeAcknowledgement.isError ? missingRuntimeAcknowledgement.error.message : '', /requires approved: true/)
+    assert.equal(approvalRequests, 1)
+
+    const approvedRuntime = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'runtime-validation-allowed' as never, name: 'security_run_candidate_runtime_validation', arguments: { scan_id: 'missing', candidate_id: 'missing', claim_token: 'missing', method: 'realistic_interface_reproduction', command: 'node repro.js', fixture_paths: ['repro.js'], setup_summary: 'A reviewed disposable local harness.', approved: true }, agent: {} as never })
+    assert.equal(approvedRuntime.isError, true)
+    assert.equal(approvalRequests, 2)
+
     const approvedVerification = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'remediation-verification-allowed' as never, name: 'security_run_remediation_verification', arguments: { scan_id: 'missing', remediation_id: 'missing', approved: true }, agent: {} as never })
     assert.equal(approvedVerification.isError, true)
-    assert.equal(approvalRequests, 2)
+    assert.equal(approvalRequests, 3)
   } finally {
     process.chdir(previousDirectory)
     await fiber.dispose()
