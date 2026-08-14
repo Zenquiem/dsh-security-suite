@@ -12,6 +12,8 @@ TLS configuration candidates require a client-use evidence chain. Python must pa
 
 PHP cURL TLS candidates follow the same rule: a locally initialized cURL handle must receive `CURLOPT_SSL_VERIFYPEER` as `false` or `0` and later be passed to `curl_exec()` in the same local block. A setting that is never executed, or is applied to a different handle, remains unproven.
 
+Native C/C++ libcurl candidates similarly require one locally initialized `CURL*` handle to receive `CURLOPT_SSL_VERIFYPEER` as `false` or `0`, then reach `curl_easy_perform()` on that same handle in the same local block.
+
 Embedded-credential candidates require a direct assignment of a non-placeholder string literal to a credential-named field. Environment or secret-manager lookups, comments, examples, placeholder values, and ordinary strings are excluded. As with every static candidate, this records source exposure for validation; it does not claim the literal is active, privileged, or reachable in production.
 
 Deep workers are DSH-native child agents. Their scoped tool view is restricted to the immutable worklist, bounded source reads whose digest matches that worklist, candidate submission, and coverage closure. They cannot use remediation, tracking, validation, or general plugin tools during delegated discovery. The published package imports only DSH/Cordis interfaces and its own local analysis modules; no second assistant runtime or security-engine process participates in scans.

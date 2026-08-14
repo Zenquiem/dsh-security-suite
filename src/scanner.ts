@@ -41,7 +41,7 @@ const RULES: Rule[] = [
   { id: 'dangerous-dynamic-code', title: 'Dynamic code execution', cwe: 'CWE-95', severity: 'high', rationale: 'Dynamic evaluation can turn attacker-controlled data into code execution.', pattern: /\beval\s*\(|\bnew\s+Function\s*\(/, languages: [] },
   { id: 'shell-command-construction', title: 'Constructed shell command', cwe: 'CWE-78', severity: 'high', rationale: 'A constructed process command needs an attacker-to-shell data-flow review.', pattern: /(?:exec|execSync|spawn|spawnSync|system|popen|subprocess\.(?:run|call|Popen))\s*\([^\n]*(?:\+|`|\$\{|f["'])/i, context: /(?:req\.|params\.|query\.|argv|input|user)/i },
   { id: 'path-traversal-sink', title: 'Request-derived filesystem path', cwe: 'CWE-22', severity: 'medium', rationale: 'A filesystem sink receives request-derived data and needs canonical containment validation.', pattern: /(?:readFile|writeFile|createReadStream|createWriteStream|sendFile|open)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
-  { id: 'tls-verification-disabled', title: 'TLS verification disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled.', pattern: /(?:CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0))/, languages: ['c', 'cpp', 'csharp'] },
+  { id: 'tls-verification-disabled', title: 'TLS verification disabled', cwe: 'CWE-295', severity: 'high', rationale: 'TLS certificate verification is explicitly disabled.', pattern: /(?:CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0))/, languages: ['csharp'] },
   { id: 'ssrf-request-sink', title: 'Request-derived outbound request', cwe: 'CWE-918', severity: 'medium', rationale: 'An outbound request appears to use request-derived input and needs destination allowlisting.', pattern: /(?:fetch|axios\.(?:get|post|request)|requests\.(?:get|post|request)|http\.request)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input)/i },
   { id: 'sql-injection-query-construction', title: 'Constructed SQL query', cwe: 'CWE-89', severity: 'high', rationale: 'A database query appears to construct SQL syntax from request-derived input.', pattern: /(?:query|execute|raw)\s*\([^\n]*(?:req\.|params\.|query\.|body\.|input|\+|\$\{)/i, context: /(?:select|insert|update|delete|from|where)/i },
 ]
@@ -413,6 +413,23 @@ function phpTlsConfigurationCandidates(file: string, content: string, lines: str
   return candidates
 }
 
+/** Require one native libcurl handle to be configured and then executed. */
+function nativeCurlTlsConfigurationCandidates(file: string, content: string, lines: string[]): Candidate[] {
+  const candidates: Candidate[] = []
+  for (const match of content.matchAll(/\bcurl_easy_setopt\s*\(\s*([A-Za-z_]\w*)\s*,\s*CURLOPT_SSL_VERIFYPEER\s*,\s*(?:false|0)(?:[uUlL]*)\s*\)/gi)) {
+    const handle = match[1]!; const start = match.index ?? 0; const block = containingJavaBlock(content, start); if (!block) continue
+    const window = content.slice(block.start, block.end); const localOffset = start - block.start; const quotedHandle = handle.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+    const initialized = new RegExp(`\\b(?:CURL\\s*\\*\\s*)?${quotedHandle}\\s*=\\s*curl_easy_init\\s*\\(`).exec(window.slice(0, localOffset))
+    const executed = new RegExp(`\\bcurl_easy_perform\\s*\\(\\s*${quotedHandle}\\s*\\)`, 'i').exec(window.slice(localOffset + match[0].length))
+    if (!initialized || !executed) continue
+    const controlLine = lineAt(content, start); const sinkOffset = start + match[0].length + (executed.index ?? 0); const sinkLine = lineAt(content, sinkOffset)
+    const candidate = configurationCandidate(CONFIGURATION_RULES.tls, file, lines, controlLine, 'Configuration analysis found CURLOPT_SSL_VERIFYPEER disabled on a local libcurl handle that is executed later in the same block.')
+    candidate.evidence.push({ kind: 'context', detail: 'The same initialized libcurl handle is passed to curl_easy_perform() after certificate verification was disabled.', location: { file, line: sinkLine, excerpt: sourceLine(lines, sinkLine), role: 'sink' } })
+    candidates.push(candidate)
+  }
+  return candidates
+}
+
 function containingJavaBlock(source: string, offset: number): { start: number; end: number } | undefined {
   for (let open = source.lastIndexOf('{', offset); open >= 0; open = source.lastIndexOf('{', open - 1)) {
     const end = closingBrace(source, open)
@@ -430,6 +447,7 @@ function analyzeSecurityConfiguration(file: string, content: string, onlyRules?:
   if (enabled(CONFIGURATION_RULES.tls) && languageFor(file) === 'python') candidates.push(...pythonTlsConfigurationCandidates(file, content, lines))
   if (enabled(CONFIGURATION_RULES.tls) && languageFor(file) === 'go') candidates.push(...goTlsConfigurationCandidates(file, content, lines))
   if (enabled(CONFIGURATION_RULES.tls) && languageFor(file) === 'php') candidates.push(...phpTlsConfigurationCandidates(file, content, lines))
+  if (enabled(CONFIGURATION_RULES.tls) && ['c', 'cpp'].includes(languageFor(file))) candidates.push(...nativeCurlTlsConfigurationCandidates(file, content, lines))
   if (enabled(CONFIGURATION_RULES.cors) && !['javascript', 'typescript'].includes(languageFor(file))) {
     for (const match of content.matchAll(/\bcors\s*\(\s*\{([\s\S]{0,1200}?)\}\s*\)/gi)) {
       const block = match[1]

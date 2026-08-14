@@ -112,6 +112,17 @@ test('directory assessment ties PHP cURL TLS disablement to an initialized handl
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment ties native libcurl TLS disablement to the same executed handle', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'client.c'), 'void used(void) {\n  CURL *handle = curl_easy_init();\n  curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 0L);\n  curl_easy_perform(handle);\n}\nvoid unused(void) {\n  CURL *handle = curl_easy_init();\n  curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 0);\n}\nvoid other_handle(void) {\n  CURL *handle = curl_easy_init();\n  CURL *other = curl_easy_init();\n  curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, false);\n  curl_easy_perform(other);\n}\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'tls-verification-disabled')
+    assert.deepEqual(candidates.map(item => item.line), [3])
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink' && item.location.line === 4), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment recognizes only non-placeholder embedded credential assignments outside JavaScript', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -942,6 +953,23 @@ test('diff scan retains an added PHP cURL execution that activates an existing d
     assert.ok(finding)
     assert.equal(finding.locations[0]?.line, 4)
     assert.equal(finding.evidence.some(item => item.location?.role === 'sink' && item.location.line === 5), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan retains an added native libcurl execution that activates an existing disabled setting', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'client.c'), 'void request(void) {\n  CURL *handle = curl_easy_init();\n  curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 0L);\n}\n')
+    await execFileAsync('git', ['add', 'client.c'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'client.c'), 'void request(void) {\n  CURL *handle = curl_easy_init();\n  curl_easy_setopt(handle, CURLOPT_SSL_VERIFYPEER, 0L);\n  curl_easy_perform(handle);\n}\n')
+    const scan = await runDiffScan(root, undefined, '', '', false)
+    const finding = scan.findings.find(item => item.ruleId === 'tls.verification.disabled')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.line, 3)
+    assert.equal(finding.evidence.some(item => item.location?.role === 'sink' && item.location.line === 4), true)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
