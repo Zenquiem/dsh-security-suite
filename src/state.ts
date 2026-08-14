@@ -91,23 +91,100 @@ export async function readArtifact(scan: ScanRecord, path: string): Promise<stri
   return readFile(source, 'utf8')
 }
 
+/**
+ * Taxonomy category label for the primary broken security control, aligned with
+ * the codex-security findings contract (Apache-2.0, adapted): the concrete
+ * vulnerability class, not a CWE identifier.
+ */
+const TAXONOMY_CATEGORY_LABELS: Record<string, string> = {
+  'sql-injection': 'SQL injection',
+  'path-traversal': 'Path traversal',
+  'ssrf': 'Server-side request forgery',
+  'shell-command': 'Command injection',
+  'command-injection': 'Command injection',
+  'dynamic-code': 'Code injection / dynamic evaluation',
+  'unsafe-deserialization': 'Insecure deserialization',
+  'tls-verification': 'TLS certificate verification disabled',
+  'jwt-verification': 'JWT signature verification disabled',
+  'cors': 'Credentialed CORS misconfiguration',
+  'xml': 'XML external entity risk',
+  'authorization': 'Authorization bypass',
+  'authentication': 'Authentication bypass',
+  'weak-randomness': 'Weak cryptographic randomness',
+  'embedded-credential': 'Hardcoded credentials',
+  'prototype-pollution': 'Prototype pollution',
+  'removed-authorization': 'Removed authorization control',
+  'removed-input-validation': 'Removed input-validation control',
+  'ci': 'CI/CD trust-boundary risk',
+}
+
+function taxonomyCategory(ruleId: string): string {
+  const prefix = (ruleId.split('.')[0] ?? ruleId).replaceAll('-', '.')
+  const key = prefix.replaceAll('.', '-')
+  return TAXONOMY_CATEGORY_LABELS[key] ?? prefix.replaceAll('-', ' ').replace(/^./, char => char.toUpperCase())
+}
+
+/** codex-security findings document (Apache-2.0 field tree, adapted). */
 function findingsDocument(scan: ScanRecord): Record<string, unknown> {
   return {
     documentType: 'dsh-security-suite.findings', schemaVersion: '1.0', scanId: scan.id,
-    findings: scan.findings.filter(finding => finding.disposition === 'reportable').map(finding => ({
-      findingId: finding.id, occurrenceId: `occ_${sha256(`${scan.id}:${finding.fingerprint}`).slice(0, 24)}`, ruleId: finding.ruleId, identity: finding.identity,
-      fingerprints: { algorithm: 'dsh-security-suite/v1', primary: `dsh-security-suite/v1:sha256:${finding.fingerprint}` }, title: finding.title,
-      summary: `${finding.rootCause} Impact: ${finding.impact}`,
-      severity: { level: finding.severity, rationale: finding.attackPathRecord?.severityRationale ?? finding.impact, changeConditions: finding.attackPathRecord?.changeConditions ?? 'Reassess if the entry point, authorization boundary, deployment exposure, or sink behavior changes.' },
-      confidence: { level: finding.confidence, rationale: finding.validationRecord?.directEvidence ?? finding.validation, missingProof: finding.validationRecord?.limitations ?? 'No additional proof gap was recorded.' },
-      taxonomy: { category: finding.ruleId.split('.')[0], cwe: [finding.cwe] }, locations: finding.locations.map(location => ({ path: location.file, startLine: location.line, endLine: location.line, role: location.role })),
-      codeEvidence: finding.evidence.filter(item => item.location).map((item, index) => ({ id: `evidence-${index + 1}`, label: item.kind, path: item.location?.file, startLine: item.location?.line, endLine: item.location?.line, role: item.location?.role ?? 'root_control', code: item.location?.excerpt, explanation: item.detail })),
-      rootCause: { summary: finding.rootCause, evidenceRefs: finding.evidence.filter(item => item.location).map((_item, index) => `evidence-${index + 1}`) },
-      validation: finding.validationRecord ? { ...finding.validationRecord, evidenceRefs: finding.evidence.filter(item => item.location).map((_item, index) => `evidence-${index + 1}`) } : { method: 'static', conclusion: 'reportable', directEvidence: finding.validation, counterevidence: finding.counterevidence, limitations: 'No structured validation receipt was retained.' },
-      attackPath: finding.attackPathRecord ? { ...finding.attackPathRecord, evidenceRefs: finding.attackPathRecord.sourceReferences.map(reference => `${reference.file}:${reference.line}`) } : { dataflow: finding.attackPath, reachability: finding.attackPath, evidenceRefs: [] },
-      remediation: { summary: finding.remediation, tests: [`Run the focused regression test plan for ${finding.ruleId}.`], preventiveControls: ['Keep the source-to-sink control centralized, reviewed, and covered by regression tests.'] },
-      provenance: { source: 'dsh-security-suite native analysis' }, extensions: { candidateId: finding.candidateId, writeup: finding.writeup ?? null },
-    })),
+    findings: scan.findings.filter(finding => finding.disposition === 'reportable').map(finding => {
+      const catalog = finding.evidence
+        .filter(item => item.location && item.location.excerpt.trim().length > 0)
+        .map((item, index) => ({
+          id: `evidence-${index + 1}`, label: item.kind, path: item.location?.file, startLine: item.location?.line,
+          endLine: item.location?.line, role: item.location?.role ?? 'root_control', code: item.location?.excerpt, explanation: item.detail,
+        }))
+      const refs = catalog.map(item => item.id)
+      const locations = [...finding.locations]
+        .sort((left, right) => (left.role === 'root_control' ? 0 : 1) - (right.role === 'root_control' ? 0 : 1))
+        .map(location => ({ path: location.file, startLine: location.line, role: location.role }))
+      const validation = finding.validationRecord ? {
+        method: finding.validationRecord.method,
+        summary: finding.validationRecord.directEvidence,
+        evidenceRefs: finding.validationRecord.sourceReferences.map(reference => `${reference.file}:${reference.line}`),
+        assertions: [`Attacker: ${finding.validationRecord.attacker}. Entry point: ${finding.validationRecord.entryPoint}. Trust boundary: ${finding.validationRecord.trustBoundary}.`, `Broken control/sink: ${finding.validationRecord.rootControl}. Sensitive operation: ${finding.validationRecord.sink}.`],
+        limitations: [finding.validationRecord.limitations],
+      } : undefined
+      const attackPath = finding.attackPathRecord ? {
+        summary: finding.attackPathRecord.dataflow,
+        dataflow: {
+          summary: finding.attackPathRecord.dataflow,
+          source: finding.attackPathRecord.entryPoint,
+          sink: finding.attackPathRecord.outcome,
+          outcome: finding.attackPathRecord.outcome,
+          evidenceRefs: finding.attackPathRecord.sourceReferences.map(reference => `${reference.file}:${reference.line}`),
+        },
+        reachability: {
+          summary: finding.attackPathRecord.preconditions,
+          attacker: finding.attackPathRecord.attacker,
+          entrypoint: finding.attackPathRecord.entryPoint,
+          outcome: finding.attackPathRecord.outcome,
+        },
+        evidenceRefs: finding.attackPathRecord.sourceReferences.map(reference => `${reference.file}:${reference.line}`),
+        impact: { level: finding.severity, why: finding.impact },
+        likelihood: { level: finding.confidence, why: finding.attackPathRecord.severityRationale },
+        limitations: [finding.attackPathRecord.changeConditions],
+      } : undefined
+      return {
+        findingId: finding.id, occurrenceId: `occ_${sha256(`${scan.id}:${finding.fingerprint}`).slice(0, 24)}`, ruleId: finding.ruleId, identity: finding.identity,
+        fingerprints: { algorithm: 'dsh-security-suite/v1', primary: `dsh-security-suite/v1:sha256:${finding.fingerprint}` }, title: finding.title,
+        summary: `${finding.rootCause} Impact: ${finding.impact}`,
+        severity: { level: finding.severity, rationale: finding.attackPathRecord?.severityRationale ?? finding.impact, changeConditions: finding.attackPathRecord?.changeConditions ?? 'Reassess if the entry point, authorization boundary, deployment exposure, or sink behavior changes.' },
+        confidence: { level: finding.confidence, rationale: [finding.validationRecord?.directEvidence ?? finding.validation, finding.validationRecord?.limitations].filter(Boolean).join(' ') || 'No additional proof gap was recorded.' },
+        taxonomy: { category: taxonomyCategory(finding.ruleId), cwe: finding.cwe ? [finding.cwe] : [] },
+        locations,
+        ...(finding.writeup ? { writeup: { reportPath: finding.writeup.reportPath } } : {}),
+        codeEvidence: catalog.length ? catalog : undefined,
+        rootCause: { summary: finding.rootCause, evidenceRefs: refs },
+        validation,
+        attackPath,
+        remediation: finding.remediation,
+        remediationTests: [`Run the focused regression test plan for ${finding.ruleId}.`],
+        preventiveControls: ['Keep the source-to-sink control centralized, reviewed, and covered by regression tests.'],
+        provenance: { source: 'local_plugin' }, extensions: { candidateId: finding.candidateId },
+      }
+    }),
   }
 }
 
@@ -228,22 +305,45 @@ export async function generateDerivedHardening(record: ScanRecord): Promise<Deri
   return derived
 }
 
+/** codex-security coverage document (Apache-2.0 field tree, adapted). */
 function coverageDocument(scan: ScanRecord): Record<string, unknown> {
+  // inventoryStrategy describes how the producer enumerated sources,
+  // independently of the requested mode: a Git-backed repository scan is
+  // 'repository' even when repeated deep discovery is workflow metadata; only a
+  // deterministic non-Git directory inventory is 'directory'.
+  const inventoryStrategy = scan.coverage.mode === 'diff' || scan.coverage.mode === 'commit' || scan.coverage.mode === 'branch_diff' || scan.coverage.mode === 'working_tree'
+    ? 'diff'
+    : scan.targetSnapshot.kind === 'directory_snapshot' ? 'directory' : 'repository'
+  const deferred = scan.coverage.deferred
+  const hasFollowUp = scan.coverage.surfaces.some(surface => surface.disposition === 'needs_follow_up')
+  const completeness = deferred.length || hasFollowUp ? 'partial' : scan.coverage.complete ? 'complete' : 'unknown'
   return {
     documentType: 'dsh-security-suite.coverage', schemaVersion: '1.0', scanId: scan.id, mode: scan.coverage.mode,
-    completeness: scan.coverage.complete ? 'complete' : 'partial', inventoryStrategy: scan.mode === 'diff' ? 'diff' : scan.recipe.scopeRequested ? 'scoped_path' : 'directory',
-    includePaths: [scan.recipe.scopeRequested ? '.' : '.'], excludePaths: scan.coverage.exclusions,
-    surfaces: scan.coverage.surfaces, explicitExclusions: scan.coverage.exclusions.map(pattern => ({ pattern, reason: 'Generated, dependency, VCS, unreadable, oversized, or configured exclusion.' })), deferred: scan.coverage.deferred,
-    receipts: scan.coverage.receipts,
+    completeness, inventoryStrategy,
+    includePaths: ['.'], excludePaths: scan.coverage.exclusions,
+    surfaces: scan.coverage.surfaces, explicitExclusions: scan.coverage.exclusions.map(pattern => ({ pattern, reason: 'Generated, dependency, VCS, unreadable, oversized, or configured exclusion.' })), deferred,
   }
 }
 
 function manifestDocument(scan: ScanRecord, artifacts: Array<{ path: string; sha256: string; mediaType: string }>): Record<string, unknown> {
+  const target = { ...scan.targetSnapshot }
+  // A clean immutable Git revision records its revision and omits the snapshot
+  // digest (codex-security target-kind contract).
+  if (target.kind === 'git_revision' && !target.snapshotDigest) {
+    const { snapshotDigest: _omitted, ...revisionTarget } = target
+    return manifestWithTarget(scan, artifacts, revisionTarget)
+  }
+  return manifestWithTarget(scan, artifacts, target)
+}
+
+function manifestWithTarget(scan: ScanRecord, artifacts: Array<{ path: string; sha256: string; mediaType: string }>, target: Record<string, unknown>): Record<string, unknown> {
   return {
     documentType: 'dsh-security-suite.scan-manifest', schemaVersion: '1.0',
-    scan: { id: scan.id, producer: { name: 'dsh-security-suite', version: '0.54.28' }, status: 'completed', startedAt: scan.createdAt, completedAt: scan.completedAt, sealedAt: scan.completedAt, target: scan.targetSnapshot,
-      scope: { includePaths: ['.'], excludePaths: scan.coverage.exclusions, summary: `${scan.coverage.reviewedFiles} source files reviewed.`, limitations: scan.coverage.deferred.map(item => item.reason) },
-      threatModel: { summary: scan.threatModel }, coverageRef: 'coverage.json', findingsRef: 'findings.json', artifacts },
+    scan: { id: scan.id, producer: { name: 'dsh-security-suite', version: '0.54.28' }, status: 'completed', startedAt: scan.createdAt, completedAt: scan.completedAt, sealedAt: scan.completedAt, target,
+      scope: { includePaths: ['.'], excludePaths: scan.coverage.exclusions, summary: `${scan.coverage.reviewedFiles} source files reviewed.`, runtimeStatus: scan.lifecycle, validationMode: 'DSH-native source, isolated-test, or runtime evidence as recorded per finding.', limitations: scan.coverage.deferred.map(item => item.reason) },
+      threatModel: { summary: scan.threatModel },
+      ...(scan.hardening ? { hardening: { portfolioPath: 'hardening/hardening.md' } } : {}),
+      coverageRef: 'coverage.json', findingsRef: 'findings.json', artifacts },
   }
 }
 
@@ -362,6 +462,16 @@ export async function verifyScanBundle(record: ScanRecord): Promise<{ valid: boo
   }
   for (const path of [record.artifacts.manifest, record.artifacts.findings, record.artifacts.coverage].filter(Boolean) as string[]) {
     try { await readArtifact(record, path) } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
+  }
+  // codex-security canonical size limits: manifest 16 MiB, findings 128 MiB,
+  // coverage 32 MiB; oversized documents are rejected before sealing.
+  const sizeLimits: Array<[string | undefined, number]> = [[record.artifacts.manifest, 16 * 1024 * 1024], [record.artifacts.findings, 128 * 1024 * 1024], [record.artifacts.coverage, 32 * 1024 * 1024]]
+  for (const [path, limit] of sizeLimits) {
+    if (!path) continue
+    try {
+      const content = await readArtifact(record, path)
+      if (content.length > limit) errors.push(`Canonical document ${path} exceeds the ${Math.round(limit / 1024 / 1024)} MiB size limit.`)
+    } catch { /* already reported above */ }
   }
   if (record.artifacts.manifest) {
     try {

@@ -118,7 +118,11 @@ The native engine confines repository and knowledge-base arguments to the active
 
 ## Attribution
 
-This project is implemented as a standalone DSH plugin. It contains no third-party security-runtime source code or dependency.
+This project is implemented as a standalone DSH plugin. Its worker prompt
+templates, canonical scan-contract field trees, severity policy, and deep-scan
+configuration semantics are adapted from
+[openai/codex-security](https://github.com/openai/codex-security) (Apache-2.0).
+No third-party security-runtime source code or dependency is executed.
 
 ## License
 

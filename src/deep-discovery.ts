@@ -14,15 +14,34 @@ import { assignFindingIdentity, candidateId, findingId, getStateDir, loadScan, p
 const WORKERS_PER_ROUND = 6
 const jobWrites = new Map<string, Promise<void>>()
 export interface DeepCandidateInput { ruleId: string; title: string; severity: Severity; cwe: string; file: string; line: number; rootCause: string; remediationIdentity?: string }
-export interface DeepCandidate extends DeepCandidateInput { id: string; workerId: string; workerIds: string[]; reportIds: string[]; excerpt: string; fingerprint: string; remediationSubsumption: { remediationIdentity: string; decision: 'not_merged' | 'merged_equivalent_reports'; rationale: string; absorbedReportIds: string[] }; reportedAt: string }
+export interface DeepCandidate extends DeepCandidateInput { id: string; workerId: string; workerIds: string[]; reportIds: string[]; excerpt: string; fingerprint: string; remediationSubsumption: { remediationIdentity: string; decision: 'not_merged' | 'merged_equivalent_reports'; rationale: string; absorbedReportIds: string[] }; reportedAt: string; /** Set by the semantic reducer: this candidate was absorbed into the target candidate. */
+  absorbedBy?: string }
 export interface DeepWorkerReport { threatModel: string; reviewedWorkItemIds: string[]; deferred: Array<{ workItemId: string; reason: string }>; coverageSummary: string; reportedAt: string }
-/** Each worker receives the same canonical discovery brief and immutable worklist. */
-export interface DeepWorker { id: string; round: number; status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed'; token: string; sessionId?: string; transcript?: string; error?: string; candidateIds: string[]; report?: DeepWorkerReport }
+/**
+ * Distinct attack-surface review lenses (codex-security investigator
+ * perspectives, adapted): each worker receives its own lens, so the six
+ * workers of a round do not all run the identical brief.
+ */
+export const DEEP_REVIEW_LENSES: Array<{ id: string; label: string; brief: string }> = [
+  { id: 'forward', label: 'Forward dataflow', brief: 'Follow attacker-controlled input, identity, trust boundaries, and controls toward sensitive operations.' },
+  { id: 'backward', label: 'Backward from sinks', brief: 'Start at sensitive operations, parsers, execution, credential issuance, or protected assets and trace callers back to a plausible attacker.' },
+  { id: 'authorization', label: 'Authorization and business logic', brief: 'Inspect ownership, tenants, permissions, sessions, capabilities, lifecycle transitions, and guard differences across sibling operations.' },
+  { id: 'open-ended', label: 'Open-ended source review', brief: 'Investigate promising source-backed security evidence without restricting the search to a predefined vulnerability class or component.' },
+  { id: 'parsers', label: 'Parsers and deserialization', brief: 'Focus on parsing, deserialization, template expansion, code generation, interpretation, and representation-change boundaries.' },
+  { id: 'secrets', label: 'Secrets and cryptography', brief: 'Focus on credential issuance, key handling, cryptographic misuse, and sensitive-data exposure paths.' },
+]
+/** Each worker receives its distinct review lens and the immutable worklist. */
+export interface DeepWorker { id: string; round: number; lens?: string; status: 'pending' | 'running' | 'completed' | 'cancelled' | 'failed'; token: string; sessionId?: string; transcript?: string; error?: string; candidateIds: string[]; report?: DeepWorkerReport }
 export interface DeepRound { number: number; workerIds: string[]; candidateCount: number; novelty: number; status: 'running' | 'complete' | 'incomplete'; artifactRefs?: string[] }
 /** An immutable, bounded source region. IDs deliberately bind file, snapshot, and range. */
 export interface DeepWorkItem { id: string; path: string; sha256: string; language: string; startLine: number; endLine: number; priority: number; riskSignals: string[] }
 export interface CanonicalThreatModel { artifactRef: string; digest: string; workerIds: string[]; createdAt: string }
-export interface DeepDiscoveryJob { id: string; scanId: string; target: string; createdAt: string; updatedAt: string; lifecycle: 'queued' | 'running' | 'saturated' | 'capped' | 'incomplete' | 'cancelled' | 'failed'; maxRounds: number; worklist: DeepWorkItem[]; worklistDigest: string; rounds: DeepRound[]; workers: DeepWorker[]; candidates: DeepCandidate[]; canonicalThreatModel?: CanonicalThreatModel }
+/** One semantic-merge decision produced by the LLM reducer for a round. */
+export interface DeepReducerMerge { targetId: string; absorbedIds: string[]; rationale: string }
+export interface DeepReducer { id: string; round: number; status: 'pending' | 'running' | 'completed' | 'failed'; token: string; transcript?: string; error?: string; merges: DeepReducerMerge[] }
+export interface DeepDiscoveryJob { id: string; scanId: string; target: string; createdAt: string; updatedAt: string; lifecycle: 'queued' | 'running' | 'saturated' | 'capped' | 'incomplete' | 'cancelled' | 'failed'; maxRounds: number; worklist: DeepWorkItem[]; worklistDigest: string; rounds: DeepRound[]; workers: DeepWorker[]; candidates: DeepCandidate[]; canonicalThreatModel?: CanonicalThreatModel; /** codex-security stop_after_no_new accounting: consecutive complete rounds with zero novelty. */
+  consecutiveNoNew?: number; /** Semantic reducers, one per completed round (codex-security deep_scan_dedup). */
+  reducers?: DeepReducer[] }
 
 type NativeAgents = { create?: unknown }
 
@@ -171,7 +190,11 @@ export async function readScanSource(config: Config, scanId: string, path: strin
 }
 
 function transcript(agent: { session: { deriveMessages(): Array<{ role: string; content: Array<{ type: string; text?: string }> }> } }): string { return agent.session.deriveMessages().filter(message => message.role === 'assistant').flatMap(message => message.content.filter(block => block.type === 'text' || block.type === 'reasoning').map(block => block.text ?? '')).join('\n\n').slice(-200_000) }
-function brief(job: DeepDiscoveryJob, worker: DeepWorker): string { return `You are one of six independent DSH security discovery workers. You have exactly four DSH tools: security_deep_get_worklist, security_deep_read_source, security_deep_report_candidate, and security_deep_report_worker. Do not modify source, validate or fix findings, or use external services. Call security_deep_get_worklist with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}; confirm its digest is ${job.worklistDigest}; then inspect every returned immutable source region with security_deep_read_source by work_item_id in descending priority order, using risk signals as review leads rather than proof. Independently create a source-evidenced worker threat model; do not use another worker's analysis. For every distinct candidate with a concrete local source line, call security_deep_report_candidate with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, stable rule_id, title, severity, CWE, workspace-relative file, line, and root_cause. When all worklist regions are closed, call security_deep_report_worker with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, your worker threat model, every reviewed_work_item_id, explicit deferred work_item_id rows with reasons, and a coverage summary. A worker run without that report is incomplete. Report only candidates you can support with source evidence.` }
+function brief(job: DeepDiscoveryJob, worker: DeepWorker): string {
+  const lens = DEEP_REVIEW_LENSES.find(item => item.id === worker.lens)
+  const lensParagraph = lens ? `\n\nYour distinct review lens is ${lens.label}: ${lens.brief} Use it as the starting perspective for your region reviews, while still tracing supporting evidence anywhere in the authorized source.` : ''
+  return `You are one of six independent DSH security discovery workers, each with a distinct review lens. You have exactly four DSH tools: security_deep_get_worklist, security_deep_read_source, security_deep_report_candidate, and security_deep_report_worker. Do not modify source, validate or fix findings, or use external services. Call security_deep_get_worklist with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}; confirm its digest is ${job.worklistDigest}; then inspect every returned immutable source region with security_deep_read_source by work_item_id in descending priority order, using risk signals as review leads rather than proof. Read every assigned region from start to finish; do not stop reviewing a region after finding one bug. Preserve exact source-backed hints: a nearby finding with the same CWE does not close a different seeded control, and independently reachable vulnerable operations stay separate even when they share a helper. Independently create a source-evidenced worker threat model; do not use another worker's analysis. For every distinct candidate with a concrete local source line, call security_deep_report_candidate with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, stable rule_id, title, severity, CWE, workspace-relative file, line, and root_cause; include the actual entry point, closest broken control, and sensitive sink as affected candidate locations. When all worklist regions are closed, call security_deep_report_worker with job_id ${job.id}, worker_id ${worker.id}, claim_token ${worker.token}, your worker threat model, every reviewed_work_item_id, explicit deferred work_item_id rows with reasons, and a coverage summary. A worker run without that report is incomplete. Report only candidates you can support with source evidence.${lensParagraph}`
+}
 
 function cancelled(signal: AbortSignal | undefined): boolean { return signal?.aborted === true }
 
@@ -213,6 +236,98 @@ async function runWorker(ctx: Context, config: Config, job: DeepDiscoveryJob, wo
   }
 }
 
+/** The worker-bound tool view for the semantic reducer (codex-security dedup worker). */
+export const DEEP_REDUCER_TOOLS = ['security_deep_get_reducer_input', 'security_deep_report_reducer'] as const
+
+function activeReducer(job: DeepDiscoveryJob, reducerId: string, token: string): DeepReducer {
+  if (job.lifecycle !== 'running') throw new Error('Deep discovery job is not running.')
+  const reducer = job.reducers?.find(item => item.id === reducerId)
+  if (!reducer) throw new Error('Reducer is not part of this deep discovery job.')
+  if (reducer.status !== 'running') throw new Error('Reducer is not active for this deep discovery job.')
+  if (reducer.token !== token) throw new Error('Reducer claim token does not own this reducer.')
+  return reducer
+}
+
+/** Read the semantic-merge input for one active reducer: this round's candidates and the authoritative worklist. */
+export async function getDeepReducerInput(config: Config, jobId: string, reducerId: string, token: string): Promise<{ jobId: string; scanId: string; worklistDigest: string; round: number; candidates: Array<{ id: string; ruleId: string; title: string; severity: Severity; cwe: string; file: string; line: number; rootCause: string; remediationIdentity: string; workerIds: string[]; reportIds: string[]; excerpt: string }> }> {
+  const job = await loadDeepDiscoveryJob(config, jobId)
+  const reducer = activeReducer(job, reducerId, token)
+  const roundWorkers = new Set(job.rounds.find(round => round.number === reducer.round)?.workerIds ?? [])
+  const candidates = job.candidates.filter(candidate => candidate.workerIds.some(workerId => roundWorkers.has(workerId)) && !candidate.absorbedBy).map(candidate => ({ id: candidate.id, ruleId: candidate.ruleId, title: candidate.title, severity: candidate.severity, cwe: candidate.cwe, file: candidate.file, line: candidate.line, rootCause: candidate.rootCause, remediationIdentity: candidate.remediationSubsumption.remediationIdentity, workerIds: candidate.workerIds, reportIds: candidate.reportIds, excerpt: candidate.excerpt }))
+  return { jobId, scanId: job.scanId, worklistDigest: job.worklistDigest, round: reducer.round, candidates }
+}
+
+/** Apply one batch of semantic-merge decisions: absorbed candidates union into the target and are excluded from canonical reconciliation. */
+export async function reportDeepReducer(config: Config, jobId: string, reducerId: string, token: string, merges: Array<{ targetId: string; absorbedIds: string[]; rationale: string }>): Promise<{ merged: number; absorbed: number }> {
+  let merged = 0
+  let absorbed = 0
+  await updateJob(config, jobId, async current => {
+    const reducer = activeReducer(current, reducerId, token)
+    for (const merge of merges) {
+      if (!merge.targetId || !Array.isArray(merge.absorbedIds) || !merge.rationale.trim()) throw new Error('Reducer merge requires a targetId, absorbedIds, and a concrete rationale.')
+      const target = current.candidates.find(candidate => candidate.id === merge.targetId)
+      if (!target) throw new Error(`Reducer merge target ${merge.targetId} does not exist.`)
+      if (target.absorbedBy) throw new Error(`Reducer merge target ${merge.targetId} is itself absorbed.`)
+      const absorbedSet = new Set<string>()
+      for (const absorbedId of merge.absorbedIds) {
+        const source = current.candidates.find(candidate => candidate.id === absorbedId)
+        if (!source || source.id === target.id) throw new Error(`Reducer merge source ${absorbedId} does not exist.`)
+        if (source.absorbedBy) throw new Error(`Reducer merge source ${absorbedId} was already absorbed.`)
+        source.absorbedBy = target.id
+        absorbedSet.add(source.id)
+        absorbed++
+      }
+      if (!absorbedSet.size) continue
+      target.workerIds = [...new Set([...target.workerIds, ...merges.find(m => m.targetId === target.id)?.absorbedIds.flatMap(id => current.candidates.find(candidate => candidate.id === id)?.workerIds ?? []) ?? []])]
+      target.reportIds = [...new Set([...target.reportIds, ...current.candidates.filter(candidate => absorbedSet.has(candidate.id)).flatMap(candidate => candidate.reportIds)])]
+      target.remediationSubsumption = { remediationIdentity: target.remediationSubsumption.remediationIdentity, decision: 'merged_equivalent_reports', rationale: `${target.remediationSubsumption.rationale} Semantic reducer merged ${[...absorbedSet].join(', ')} because ${merge.rationale}`, absorbedReportIds: [...new Set([...target.remediationSubsumption.absorbedReportIds, ...current.candidates.filter(candidate => absorbedSet.has(candidate.id)).flatMap(candidate => candidate.reportIds)])] }
+      merged++
+    }
+    reducer.merges = merges
+  })
+  return { merged, absorbed }
+}
+
+async function runDeepReducer(ctx: Context, config: Config, job: DeepDiscoveryJob, reducer: DeepReducer, signal?: AbortSignal): Promise<void> {
+  const sessionId = SessionId(`dsh-security-deep-reducer-${randomUUID()}`)
+  await updateJob(config, job.id, current => { const record = current.reducers?.find(item => item.id === reducer.id); if (!record) throw new Error('Deep reducer was not created.'); record.status = 'running' })
+  let handle: Awaited<ReturnType<typeof ctx.agents.create>> | undefined
+  let disposePromise: Promise<void> | undefined
+  const dispose = (): Promise<void> => handle ? (disposePromise ??= handle.dispose().catch(() => undefined)) : Promise.resolve()
+  let cancelledByCaller = cancelled(signal)
+  const onAbort = (): void => { cancelledByCaller = true; void dispose() }
+  signal?.addEventListener('abort', onAbort, { once: true })
+  try {
+    if (cancelledByCaller) return
+    const agents = nativeAgents(ctx) as typeof ctx.agents | undefined
+    if (!agents || typeof agents.create !== 'function') throw new Error('The active DSH profile has no native agent-creation service.')
+    const { deepReducerPrompt } = await import('./llm/prompts.js')
+    const prompt = deepReducerPrompt({ jobId: job.id, reducerId: reducer.id, token: reducer.token, round: reducer.round, worklistDigest: job.worklistDigest })
+    handle = await agents.create({ sessionId, meta: { cwd: resolve(job.target), origin: 'subagent', delegationDepth: 1 }, setup(agentCtx) {
+      agentCtx.tools.restrict({ allow: [...DEEP_REDUCER_TOOLS] })
+      agentCtx.systemPrompt.section({ name: `dsh-security-suite:deep-reducer:${reducer.id}`, order: 162, text: prompt })
+    } })
+    if (cancelledByCaller) return
+    handle.agent.followup(createUserMessage({ content: [{ type: 'text', text: prompt }], source: { kind: 'plugin', plugin: 'dsh-security-suite', form: 'relay' } }))
+    if (signal) {
+      let removeAbortWait = (): void => undefined
+      const aborted = new Promise<void>(resolveAbort => { const wake = (): void => resolveAbort(); signal.addEventListener('abort', wake, { once: true }); removeAbortWait = (): void => signal.removeEventListener('abort', wake) })
+      try { await Promise.race([handle.agent.whenIdle(), aborted]) } finally { removeAbortWait() }
+    } else await handle.agent.whenIdle()
+    if (cancelledByCaller) return
+    const reducerTranscript = transcript(handle.agent)
+    await updateJob(config, job.id, current => { const record = current.reducers?.find(item => item.id === reducer.id); if (record && record.status === 'running') { record.transcript = reducerTranscript; record.status = 'completed' } })
+  } catch (error) {
+    if (cancelledByCaller) return
+    const message = error instanceof Error ? error.message : String(error)
+    await updateJob(config, job.id, current => { const record = current.reducers?.find(item => item.id === reducer.id); if (record && record.status === 'running') { record.status = 'failed'; record.error = message } })
+  } finally {
+    signal?.removeEventListener('abort', onAbort)
+    if (cancelledByCaller) await updateJob(config, job.id, current => { const record = current.reducers?.find(item => item.id === reducer.id); if (record && record.status !== 'completed') { record.status = 'failed'; record.error = 'Cancelled by the owning DSH tool call.' } })
+    await dispose()
+  }
+}
+
 function addCandidate(scan: ScanRecord, candidate: DeepCandidate): void {
   const anchor = slug(`${candidate.ruleId}-${candidate.excerpt}`); const id = candidateId(candidate.ruleId, candidate.file, candidate.line); const reporters = candidate.workerIds.join(', '); const finding: Finding = { id: findingId('discovery', candidate.ruleId, anchor), candidateId: id, fingerprint: candidate.fingerprint, ruleId: candidate.ruleId, identity: { anchor }, title: candidate.title, severity: candidate.severity, confidence: 'low', cwe: candidate.cwe, status: 'open', disposition: 'discovered', locations: [{ file: candidate.file, line: candidate.line, excerpt: candidate.excerpt, role: 'root_control' }], rootCause: candidate.rootCause, validation: 'Discovery-only delegated candidate. Validate source, closest control, sink, reachability, impact, and counterevidence.', attackPath: 'Not established.', impact: 'Not established.', remediation: 'Determine the narrowest effective control after validation.', counterevidence: 'No validation has been completed.', evidence: [{ kind: 'pattern', detail: `Independent delegated discovery workers ${reporters} reported this candidate; absorbed report ids: ${candidate.reportIds.join(', ')}.`, location: { file: candidate.file, line: candidate.line, excerpt: candidate.excerpt, role: 'root_control' } }], ledger: [{ at: candidate.reportedAt, phase: 'discovery', disposition: 'discovered', summary: `Delegated workers ${reporters} reported ${candidate.ruleId}; absorbed reports: ${candidate.reportIds.join(', ')}.` }] }
   assignFindingIdentity(finding, scan.targetSnapshot.targetId, new Set(scan.findings.map(item => `${item.ruleId}:${item.identity.anchor}:${item.identity.instance ?? ''}`)))
@@ -226,7 +341,7 @@ function completeWorkerIds(job: DeepDiscoveryJob): Set<string> {
 
 function canonicalCandidates(job: DeepDiscoveryJob): DeepCandidate[] {
   const complete = completeWorkerIds(job)
-  return job.candidates.filter(candidate => candidate.workerIds.some(workerId => complete.has(workerId)))
+  return job.candidates.filter(candidate => !candidate.absorbedBy && candidate.workerIds.some(workerId => complete.has(workerId)))
 }
 
 async function persistRoundArtifacts(scan: ScanRecord, job: DeepDiscoveryJob, round: DeepRound): Promise<string[]> {
@@ -277,7 +392,7 @@ export async function runDeepDiscovery(ctx: Context, config: Config, jobId: stri
   while (completedRounds < job.maxRounds) {
     number++
     if (cancelled(signal)) { job.lifecycle = 'cancelled'; await save(state, job); return job }
-    const workers = Array.from({ length: WORKERS_PER_ROUND }, (_, index): DeepWorker => ({ id: `worker_${number}_${index + 1}`, round: number, status: 'pending', token: randomUUID(), candidateIds: [] })); job.workers.push(...workers); const round: DeepRound = { number, workerIds: workers.map(worker => worker.id), candidateCount: 0, novelty: 0, status: 'running' }; job.rounds.push(round); await save(state, job)
+    const workers = Array.from({ length: WORKERS_PER_ROUND }, (_, index): DeepWorker => ({ id: `worker_${number}_${index + 1}`, round: number, lens: DEEP_REVIEW_LENSES[index % DEEP_REVIEW_LENSES.length].id, status: 'pending', token: randomUUID(), candidateIds: [] })); job.workers.push(...workers); const round: DeepRound = { number, workerIds: workers.map(worker => worker.id), candidateCount: 0, novelty: 0, status: 'running' }; job.rounds.push(round); await save(state, job)
     await Promise.all(workers.map(worker => runWorker(ctx, config, job, worker, signal)))
     job = await loadDeepDiscoveryJob(config, jobId)
     const completedRound = job.rounds.find(item => item.number === number); if (!completedRound) throw new Error('Deep discovery round state is missing.')
@@ -285,7 +400,19 @@ export async function runDeepDiscovery(ctx: Context, config: Config, jobId: stri
     const source = await loadScan(state, job.scanId); completedRound.artifactRefs = await persistRoundArtifacts(source, job, completedRound); await save(state, job)
     if (cancelled(signal)) { job.lifecycle = 'cancelled'; await save(state, job); return job }
     if (incomplete) { job.lifecycle = 'incomplete'; await save(state, job); return job }
-    if (completedRound.novelty === 0) { job.lifecycle = 'saturated'; break }
+    // Semantic reduction (codex-security dedup): one independent reducer per
+    // completed round merges equivalent candidates across workers.
+    const reducer: DeepReducer = { id: `reducer_${number}`, round: number, status: 'pending', token: randomUUID(), merges: [] }
+    await updateJob(config, jobId, current => { current.reducers = [...(current.reducers ?? []), reducer] })
+    await runDeepReducer(ctx, config, job, reducer, signal)
+    job = await loadDeepDiscoveryJob(config, jobId)
+    const reducerRecord = job.reducers?.find(item => item.id === reducer.id)
+    if (reducerRecord?.status === 'failed') { job.lifecycle = 'incomplete'; await save(state, job); return job }
+    // codex-security stop_after_no_new: saturate only after that many
+    // consecutive complete rounds with zero novelty; default 6.
+    job.consecutiveNoNew = completedRound.novelty === 0 ? (job.consecutiveNoNew ?? 0) + 1 : 0
+    const stopAfterNoNew = Math.max(1, config.deepScan?.stopAfterNoNew ?? 6)
+    if (completedRound.novelty === 0 && job.consecutiveNoNew >= stopAfterNoNew) { job.lifecycle = 'saturated'; await save(state, job); break }
     completedRounds++
     if (completedRounds === job.maxRounds) job.lifecycle = 'capped'
   }

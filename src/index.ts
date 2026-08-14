@@ -10,9 +10,11 @@ import { applyRemediationProposal, bulkScan, fixFinding, installPreCommitHook, p
 import { cancelInvestigation, claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation, resumeInvestigation } from './workbench.js'
 import { generateHardeningPortfolio, importFindings, importGitHubSecurityFindings, importSecurityTickets, triageFindingBacklog, triageImportedFinding } from './analysis.js'
 import { createGitHubAdvisory, createTracking, previewGitHubAdvisory, previewTracking } from './tracking.js'
-import { createDeepClosureJob, createDeepDiscoveryJob, deepDiscoveryCapability, getDeepWorklist, readDeepSource, readScanSource, reportDeepCandidate, reportDeepWorker, runDeepClosure, runDeepDiscovery } from './deep-discovery.js'
+import { createDeepClosureJob, createDeepDiscoveryJob, deepDiscoveryCapability, getDeepReducerInput, getDeepWorklist, readDeepSource, readScanSource, reportDeepCandidate, reportDeepReducer, reportDeepWorker, runDeepClosure, runDeepDiscovery } from './deep-discovery.js'
 import { createDeepInvestigationJob, runDeepInvestigation } from './deep-workflow.js'
 import { createDisclosureCampaign, getDisclosureAssignment, readDisclosureExperimentArtifact, readDisclosureSource, runDisclosureCampaign, submitDisclosureReport } from './disclosure.js'
+import { createLlmDiscoveryJob, getLlmScope, llmDiscoveryCapability, readLlmSource, reportLlmCandidates, reportLlmWorker, runLlmDiscovery, runLlmScan, searchLlmSource } from './llm/discovery.js'
+import { createDiffDiscoveryJob, diffDiscoveryCapability, getDiffReviewItems, readDiffSource, reportDiffCandidates, reportDiffWorker, runDiffDiscovery, runDiffLlmReview } from './llm/diff.js'
 
 export const name = 'dsh-security-suite'
 export const inject = ['tools', 'systemPrompt']
@@ -88,6 +90,42 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }))
 
   ctx.tools.register(defineTool({
+    name: 'security_llm_discovery_capability', description: 'Report whether this DSH profile exposes the native agent runtime required for codex-security-style LLM discovery (one baseline auditor plus focused investigators over source-backed packets). This performs no scan and creates no agent.', parameters: {},
+    output: { schema: { type: 'object', properties: { available: { type: 'boolean' }, workers: { type: 'number' }, reason: { type: 'string' } }, required: ['available', 'workers'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute() { return llmDiscoveryCapability(ctx) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_llm_get_scope', description: 'Read the authoritative scope for one active LLM discovery worker: scan id, target, frozen in-scope worklist digest and paths, threat model, user context, repository policy, knowledge base, and the assigned investigation packet and lens. Available only to active workers.', parameters: { job_id: { type: 'string', required: true }, worker_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true } },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return JSON.parse(JSON.stringify(getLlmScope(config, args.job_id, args.worker_id, args.claim_token))) as Record<string, JsonValue> },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_llm_read_source', description: 'Read a bounded range from one in-scope receipted source file for an active LLM discovery worker. The file digest must match the frozen worklist; changed source is refused.', parameters: { job_id: { type: 'string', required: true }, worker_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true }, path: { type: 'string', required: true }, start_line: { type: 'number' }, end_line: { type: 'number' } },
+    output: { schema: { type: 'object', properties: { path: { type: 'string' }, sha256: { type: 'string' }, startLine: { type: 'number' }, endLine: { type: 'number' }, content: { type: 'string' } }, required: ['path', 'sha256', 'startLine', 'endLine', 'content'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.content ?? '' }] },
+    async execute(args) { return readLlmSource(config, args.job_id, args.worker_id, args.claim_token, args.path, args.start_line, args.end_line) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_llm_search', description: 'Deterministic regex search over the receipted in-scope files for one active LLM discovery worker. Results are bounded and never execute anything.', parameters: { job_id: { type: 'string', required: true }, worker_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true }, pattern: { type: 'string', required: true }, max_results: { type: 'number' } },
+    output: { schema: { type: 'array', items: { type: 'object', properties: { path: { type: 'string' }, line: { type: 'number' }, text: { type: 'string' } }, required: ['path', 'line', 'text'], additionalProperties: false } }, render: (_args, value) => [{ type: 'text', text: (value as Array<{ path: string; line: number; text: string }>).map(row => `${row.path}:${row.line}: ${row.text}`).join('\n') }] },
+    async execute(args) { return searchLlmSource(config, args.job_id, args.worker_id, args.claim_token, args.pattern, args.max_results) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_llm_report_candidates', description: 'Submit one batch of source-backed discovery candidates for an active LLM discovery worker. Every candidate location must be inside the frozen in-scope worklist; the worker report must then be closed with security_llm_report_worker.', parameters: { job_id: { type: 'string', required: true }, worker_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true }, candidates: { type: 'array', required: true, items: { type: 'object', properties: { ruleId: { type: 'string', required: true }, title: { type: 'string', required: true }, summary: { type: 'string', required: true }, cwe: { type: 'string' }, severity: { type: 'string', required: true, enum: ['critical', 'high', 'medium', 'low'] }, confidence: { type: 'string', required: true, enum: ['high', 'medium', 'low'] }, attacker: { type: 'string', required: true }, violatedInvariant: { type: 'string', required: true }, sourceToSink: { type: 'string', required: true }, impact: { type: 'string', required: true }, remediation: { type: 'string', required: true }, counterevidence: { type: 'string', required: true }, locations: { type: 'array', required: true, items: { type: 'object', properties: { path: { type: 'string', required: true }, startLine: { type: 'number', required: true }, endLine: { type: 'number' }, role: { type: 'string' } }, additionalProperties: false } }, evidence: { type: 'array', items: { type: 'object', properties: { location: { type: 'object', properties: { path: { type: 'string', required: true }, startLine: { type: 'number', required: true }, endLine: { type: 'number' }, role: { type: 'string' } }, additionalProperties: false }, explanation: { type: 'string', required: true } }, additionalProperties: false } } }, additionalProperties: false } } },
+    output: { schema: { type: 'object', properties: { recorded: { type: 'number' }, candidateIds: { type: 'array', items: { type: 'string' } } }, required: ['recorded', 'candidateIds'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return reportLlmCandidates(config, args.job_id, args.worker_id, args.claim_token, args.candidates as Parameters<typeof reportLlmCandidates>[4]) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_llm_report_worker', description: 'Close one active LLM discovery worker with its resolved questions and truthful fully-reviewed file count. A worker that is not closed is incomplete and its candidates cannot enter canonical reconciliation.', parameters: { job_id: { type: 'string', required: true }, worker_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true }, resolved_questions: { type: 'array', items: { type: 'string' } }, fully_reviewed_file_count: { type: 'number', required: true } },
+    output: { schema: { type: 'object', properties: { closed: { type: 'boolean' } }, required: ['closed'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { await reportLlmWorker(config, args.job_id, args.worker_id, args.claim_token, { findings: [], resolvedQuestions: args.resolved_questions ?? [], fullyReviewedFileCount: args.fully_reviewed_file_count }); return { closed: true } },
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'security_run_deep_investigation', description: 'Run a complete DSH-native deep security investigation: create a receipt-bound deep scan, execute independent six-worker discovery rounds, centrally validate every candidate, analyze every reportable attack path, and finalize only when all ledger receipts close. Interrupted work returns a durable job id for security_resume_deep_investigation; it never substitutes an external agent runtime or auto-confirms a static match.', parameters: { path: { type: 'string', description: 'Optional workspace-relative scan scope.' }, threat_model: { type: 'string', description: 'Optional in-scope assets, actors, and assumptions.' }, max_rounds: { type: 'number', description: 'Maximum complete discovery rounds from 1 to 10; default 10.' } },
     output: { schema: { type: 'object', properties: { id: { type: 'string' }, scanId: { type: 'string' }, phase: { type: 'string' }, lifecycle: { type: 'string' }, discoveryJobId: { type: 'string' }, validationClosureJobId: { type: 'string' }, attackPathClosureJobId: { type: 'string' } }, required: ['id', 'scanId', 'phase', 'lifecycle', 'discoveryJobId'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args, exec) { const target = resolveSafeTarget(process.cwd(), args.path); const job = await createDeepInvestigationJob(target, config, args.threat_model ?? '', args.path !== undefined, args.max_rounds ?? 10); return runDeepInvestigation(ctx, config, job.id, exec.signal) },
@@ -133,6 +171,48 @@ export function apply(ctx: Context, config: PluginConfig): void {
     name: 'security_read_scan_source', description: 'Read a bounded source range only when that exact path and digest belong to a saved scan receipt. This is for centralized DSH validation and attack-path workers; it refuses changed or unreceipted source.', parameters: { scan_id: { type: 'string', required: true }, path: { type: 'string', required: true }, start_line: { type: 'number' }, end_line: { type: 'number' } },
     output: { schema: { type: 'object', properties: { path: { type: 'string' }, startLine: { type: 'number' }, endLine: { type: 'number' }, content: { type: 'string' }, sha256: { type: 'string' } }, required: ['path', 'startLine', 'endLine', 'content', 'sha256'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.content ?? '' }] },
     async execute(args) { return readScanSource(config, args.scan_id, args.path, args.start_line, args.end_line) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_deep_get_reducer_input', description: 'Read the semantic-merge input for one active deep discovery reducer: this round\'s candidates with worker provenance and the authoritative worklist. Available only to active reducers.', parameters: { job_id: { type: 'string', required: true }, reducer_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true } },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return JSON.parse(JSON.stringify(await getDeepReducerInput(config, args.job_id, args.reducer_id, args.claim_token))) as Record<string, JsonValue> },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_deep_report_reducer', description: 'Submit one batch of semantic-merge decisions for an active deep discovery reducer. Absorbed candidates union their worker and report provenance into the target and are excluded from canonical reconciliation; independently reachable sibling instances must stay separate.', parameters: { job_id: { type: 'string', required: true }, reducer_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true }, merges: { type: 'array', required: true, items: { type: 'object', properties: { targetId: { type: 'string', required: true }, absorbedIds: { type: 'array', required: true, items: { type: 'string' } }, rationale: { type: 'string', required: true } }, additionalProperties: false } } },
+    output: { schema: { type: 'object', properties: { merged: { type: 'number' }, absorbed: { type: 'number' } }, required: ['merged', 'absorbed'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return reportDeepReducer(config, args.job_id, args.reducer_id, args.claim_token, args.merges as Array<{ targetId: string; absorbedIds: string[]; rationale: string }>) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_diff_discovery_capability', description: 'Report whether this DSH profile exposes the native agent runtime required for LLM diff file review. This performs no scan and creates no agent.', parameters: {},
+    output: { schema: { type: 'object', properties: { available: { type: 'boolean' }, workers: { type: 'number' }, reason: { type: 'string' } }, required: ['available', 'workers'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute() { return diffDiscoveryCapability(ctx) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_diff_get_review_items', description: 'Read the assigned changed files and context for one active diff file-review worker. Available only to active workers.', parameters: { job_id: { type: 'string', required: true }, worker_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true } },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return JSON.parse(JSON.stringify(getDiffReviewItems(config, args.job_id, args.worker_id, args.claim_token))) as Record<string, JsonValue> },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_diff_read_source', description: 'Read a bounded range from one changed file assigned to an active diff file-review worker. The file digest must match the frozen worklist; changed source is refused.', parameters: { job_id: { type: 'string', required: true }, worker_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true }, path: { type: 'string', required: true }, start_line: { type: 'number' }, end_line: { type: 'number' } },
+    output: { schema: { type: 'object', properties: { path: { type: 'string' }, sha256: { type: 'string' }, startLine: { type: 'number' }, endLine: { type: 'number' }, content: { type: 'string' } }, required: ['path', 'sha256', 'startLine', 'endLine', 'content'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.content ?? '' }] },
+    async execute(args) { return readDiffSource(config, args.job_id, args.worker_id, args.claim_token, args.path, args.start_line, args.end_line) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_diff_report_candidates', description: 'Submit one batch of source-backed candidates for an active diff file-review worker. Every candidate location must be inside an assigned changed file.', parameters: { job_id: { type: 'string', required: true }, worker_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true }, candidates: { type: 'array', required: true, items: { type: 'object', properties: { ruleId: { type: 'string', required: true }, title: { type: 'string', required: true }, summary: { type: 'string', required: true }, cwe: { type: 'string' }, severity: { type: 'string', required: true, enum: ['critical', 'high', 'medium', 'low'] }, confidence: { type: 'string', required: true, enum: ['high', 'medium', 'low'] }, attacker: { type: 'string', required: true }, violatedInvariant: { type: 'string', required: true }, sourceToSink: { type: 'string', required: true }, impact: { type: 'string', required: true }, remediation: { type: 'string', required: true }, counterevidence: { type: 'string', required: true }, locations: { type: 'array', required: true, items: { type: 'object', properties: { path: { type: 'string', required: true }, startLine: { type: 'number', required: true }, endLine: { type: 'number' }, role: { type: 'string' } }, additionalProperties: false } }, evidence: { type: 'array', items: { type: 'object', properties: { location: { type: 'object', properties: { path: { type: 'string', required: true }, startLine: { type: 'number', required: true }, endLine: { type: 'number' }, role: { type: 'string' } }, additionalProperties: false }, explanation: { type: 'string', required: true } }, additionalProperties: false } } }, additionalProperties: false } } },
+    output: { schema: { type: 'object', properties: { recorded: { type: 'number' }, candidateIds: { type: 'array', items: { type: 'string' } } }, required: ['recorded', 'candidateIds'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { return reportDiffCandidates(config, args.job_id, args.worker_id, args.claim_token, args.candidates as Parameters<typeof reportDiffCandidates>[4]) },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_diff_report_worker', description: 'Close one active diff file-review worker with its resolved questions and truthful fully-reviewed file count. A worker that is not closed is incomplete.', parameters: { job_id: { type: 'string', required: true }, worker_id: { type: 'string', required: true }, claim_token: { type: 'string', required: true }, resolved_questions: { type: 'array', items: { type: 'string' } }, fully_reviewed_file_count: { type: 'number', required: true } },
+    output: { schema: { type: 'object', properties: { closed: { type: 'boolean' } }, required: ['closed'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) { await reportDiffWorker(config, args.job_id, args.worker_id, args.claim_token, { resolvedQuestions: args.resolved_questions ?? [], fullyReviewedFileCount: args.fully_reviewed_file_count }); return { closed: true } },
   }))
 
   ctx.tools.register(defineTool({
@@ -397,10 +477,11 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: 'security_review_diff',
-    description: 'Perform a read-only native Git change-set candidate review. working_tree covers staged, unstaged, and eligible untracked source changes; commit compares one commit with its parent; branch_diff compares HEAD with a supplied merge-base or branch ref. It analyzes added code and added JS/TS, Python, Go, Java, C#, PHP, Ruby, C, C++, or Rust call paths into local sink wrappers; detects GitHub Actions pull_request_target shell interpolation, broad permissions, mutable action references, and pull-request-head checkout before execution; detects deleted authorization or input-validation controls; saves a validation investigation; and never auto-confirms static candidates.',
+    description: 'Perform a read-only Git change-set candidate review. working_tree covers staged, unstaged, and eligible untracked source changes; commit compares one commit with its parent; branch_diff compares HEAD with a supplied merge-base or branch ref. discovery llm (default) adds restricted DSH file-review subagents that read every changed file in full and report source-backed candidates; discovery engine runs only the deterministic added-line, multi-language, CI workflow, and removed-control analyses; the engine detects GitHub Actions pull_request_target shell interpolation, broad permissions, mutable action references, and pull-request-head checkout before execution and detects deleted authorization or input-validation controls. It saves a validation investigation and never auto-confirms static candidates.',
     parameters: {
       mode: { type: 'string', enum: ['working_tree', 'commit', 'branch_diff'], description: 'Change-set workflow. Defaults to working_tree when base is absent and branch_diff when base is supplied.' },
       base: { type: 'string', description: 'Commit ref for commit mode, merge-base or branch ref for branch_diff, and omitted for working_tree.' },
+      discovery: { type: 'string', enum: ['llm', 'engine'], description: 'llm (default) delegates changed-file review to DSH file-review subagents; engine runs only the deterministic diff engine.' },
     },
     output: {
       schema: {
@@ -410,25 +491,41 @@ export function apply(ctx: Context, config: PluginConfig): void {
           mode: { type: 'string' },
           diff: { type: 'string' },
           truncated: { type: 'boolean' },
+          discoveryJobId: { type: 'string' },
         },
         required: ['scanId', 'mode', 'diff', 'truncated'],
         additionalProperties: false,
       },
       render: (_args, value) => [{ type: 'text', text: value.diff ?? '' }],
     },
-    async execute(args) {
-      const scan = await runDiffScan(process.cwd(), args.base, '', config.stateDir, false, args.mode as 'working_tree' | 'commit' | 'branch_diff' | undefined)
-      await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan)
+    async execute(args, exec) {
+      if ((args.discovery ?? 'llm') === 'engine') {
+        const scan = await runDiffScan(process.cwd(), args.base, '', config.stateDir, false, args.mode as 'working_tree' | 'commit' | 'branch_diff' | undefined)
+        await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan)
+        const diff = scan.findings.map(finding => `${finding.locations[0].file}:${finding.locations[0].line} ${finding.ruleId}: ${finding.locations[0].excerpt}`).join('\n')
+        return { scanId: scan.id, mode: scan.coverage.mode, diff, truncated: !scan.coverage.complete }
+      }
+      const result = await runDiffLlmReview(ctx, config, process.cwd(), args.base, '', exec.signal, args.mode as 'working_tree' | 'commit' | 'branch_diff' | undefined)
+      const scan = result.scan
       const diff = scan.findings.map(finding => `${finding.locations[0].file}:${finding.locations[0].line} ${finding.ruleId}: ${finding.locations[0].excerpt}`).join('\n')
-      return { scanId: scan.id, mode: scan.coverage.mode, diff, truncated: !scan.coverage.complete }
+      return { scanId: scan.id, mode: scan.coverage.mode, diff, truncated: !scan.coverage.complete, discoveryJobId: result.jobId || undefined }
     },
   }))
 
   ctx.tools.register(defineTool({
-    name: 'security_scan', description: 'Run a standard or deep read-only native discovery scan and save candidate evidence outside the target repository. It never auto-confirms vulnerabilities; claim and validate candidates before finalization.',
-    parameters: { path: { type: 'string', description: 'Optional workspace-relative scan scope.' }, mode: { type: 'string', enum: ['standard', 'deep'], description: 'standard performs one rule pass; deep executes independent injection and trust-boundary rule passes before reduction.' }, threat_model: { type: 'string', description: 'Optional security assumptions and protected assets.' } },
-    output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, findings: { type: 'number' }, reviewedFiles: { type: 'number' }, complete: { type: 'boolean' } }, required: ['scanId', 'findings', 'reviewedFiles', 'complete'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
-    async execute(args) { const scan = await runScan(resolveSafeTarget(process.cwd(), args.path), config, args.mode === 'deep' ? 'deep' : 'standard', args.threat_model ?? '', args.path !== undefined, config.stateDir, false); await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan); return { scanId: scan.id, findings: scan.findings.length, reviewedFiles: scan.coverage.reviewedFiles, complete: scan.coverage.complete } },
+    name: 'security_scan', description: 'Run a standard or deep read-only discovery scan and save candidate evidence outside the target repository. discovery llm (default) runs the codex-security-style standard scan: one independent baseline auditor plus focused investigator DSH subagents over source-backed packets. discovery engine runs the deterministic rule/AST engine. It never auto-confirms vulnerabilities; claim and validate candidates before finalization.',
+    parameters: { path: { type: 'string', description: 'Optional workspace-relative scan scope.' }, mode: { type: 'string', enum: ['standard', 'deep'], description: 'standard performs one discovery pass; deep executes independent multi-pass discovery with six-worker rounds before reduction.' }, discovery: { type: 'string', enum: ['llm', 'engine'], description: 'standard-mode discovery driver: llm (default) delegates to DSH review subagents; engine runs the deterministic scanner. Ignored when mode is deep.' }, threat_model: { type: 'string', description: 'Optional security assumptions and protected assets.' } },
+    output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, findings: { type: 'number' }, reviewedFiles: { type: 'number' }, complete: { type: 'boolean' }, discoveryJobId: { type: 'string' } }, required: ['scanId', 'findings', 'reviewedFiles', 'complete'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args, exec) {
+      const target = resolveSafeTarget(process.cwd(), args.path)
+      if (args.mode === 'deep' || (args.discovery ?? 'llm') === 'engine') {
+        const scan = await runScan(target, config, args.mode === 'deep' ? 'deep' : 'standard', args.threat_model ?? '', args.path !== undefined, config.stateDir, false)
+        await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan)
+        return { scanId: scan.id, findings: scan.findings.length, reviewedFiles: scan.coverage.reviewedFiles, complete: scan.coverage.complete }
+      }
+      const result = await runLlmScan(ctx, config, target, { threatModel: args.threat_model, scopeRequested: args.path !== undefined, signal: exec.signal })
+      return { scanId: result.scan.id, findings: result.scan.findings.length, reviewedFiles: result.scan.coverage.reviewedFiles, complete: result.scan.coverage.complete, discoveryJobId: result.jobId }
+    },
   }))
 
   ctx.tools.register(defineTool({

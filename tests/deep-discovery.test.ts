@@ -3,7 +3,7 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { createDeepClosureJob, createDeepDiscoveryJob, getDeepWorklist, loadDeepDiscoveryJob, readDeepSource, readScanSource, reportDeepCandidate, reportDeepWorker, runDeepClosure, runDeepDiscovery } from '../src/deep-discovery.ts'
+import { createDeepClosureJob, createDeepDiscoveryJob, getDeepWorklist, loadDeepDiscoveryJob, readDeepSource, readScanSource, reportDeepCandidate, reportDeepReducer, reportDeepWorker, runDeepClosure, runDeepDiscovery } from '../src/deep-discovery.ts'
 import { runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
 import { claimAuditTask, recordAttackPath, recordValidation } from '../src/workbench.ts'
@@ -77,6 +77,14 @@ function deepWorkerContext(config: { stateDir: string }, reports: boolean, failA
             async whenIdle() {
               if (index === failAt) throw new Error('worker driver failed')
               if (!reports) return
+              // Semantic reducer agent: parse reducer ids and close without merges.
+              if (prompt.includes('Deep Discovery Semantic Reducer')) {
+                const reducerId = /reducer_id ([a-z0-9_]+)/.exec(prompt)?.[1]
+                const reducerToken = /claim_token ([0-9a-f-]+)/.exec(prompt)?.[1]
+                if (!reducerId || !reducerToken) throw new Error('reducer brief was incomplete')
+                await reportDeepReducer(config, /job_id (deep_[0-9a-f-]+)/.exec(prompt)?.[1] ?? '', reducerId, reducerToken, [])
+                return
+              }
               const jobId = /job_id (deep_[0-9a-f-]+)/.exec(prompt)?.[1]
               const workerId = /worker_id (worker_\d+_\d+)/.exec(prompt)?.[1]
               const token = /claim_token ([0-9a-f-]+)/.exec(prompt)?.[1]
@@ -97,7 +105,7 @@ function deepWorkerContext(config: { stateDir: string }, reports: boolean, failA
 test('deep discovery creates six native DSH workers per round and only saturates after a complete zero-novelty round', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
-  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state, deepScan: { workers: 'auto' as const, subagents: 0, stopAfterNoNew: 1, stopAfterConsecutiveErrors: 3, maxDiscoveryRuns: 60, maxTimeHours: 96 } }
   try {
     await writeFile(join(root, 'app.ts'), 'runUntrustedCommand(input)\n')
     const scan = await runScan(root, config, 'deep', '', false, state, false)
@@ -105,15 +113,16 @@ test('deep discovery creates six native DSH workers per round and only saturates
     const job = await createDeepDiscoveryJob(config, scan.id, 2)
     const fake = deepWorkerContext(config, true)
     const result = await runDeepDiscovery(fake.ctx as never, config, job.id)
-    assert.equal(fake.count(), 12)
+    assert.equal(fake.count(), 14) // 12 discovery workers + 2 semantic reducers
     assert.deepEqual(fake.restrictions[0], ['security_deep_get_worklist', 'security_deep_read_source', 'security_deep_report_candidate', 'security_deep_report_worker'])
     assert.equal(result.lifecycle, 'saturated')
     assert.deepEqual(result.rounds.map(round => round.status), ['complete', 'complete'])
     assert.deepEqual(result.rounds.map(round => round.novelty), [1, 0])
-    assert.equal(result.workers.slice(0, 6).every(worker => !('lens' in worker)), true)
+    assert.deepEqual(result.workers.slice(0, 6).map(worker => worker.lens), ['forward', 'backward', 'authorization', 'open-ended', 'parsers', 'secrets'])
     const canonicalBriefs = fake.prompts.slice(0, 6).map(prompt => prompt.replace(/worker_id worker_1_\d+/g, 'worker_id <worker>').replace(/claim_token [0-9a-f-]+/g, 'claim_token <token>'))
-    assert.equal(new Set(canonicalBriefs).size, 1)
-    assert.equal(canonicalBriefs[0]?.includes('review lens'), false)
+    assert.equal(new Set(canonicalBriefs).size, 6)
+    assert.equal(canonicalBriefs[0]?.includes('distinct review lens is Forward dataflow'), true)
+    assert.equal(canonicalBriefs[1]?.includes('distinct review lens is Backward from sinks'), true)
     assert.equal(result.canonicalThreatModel?.workerIds.length, 12)
     const persisted = await loadScan(state, scan.id)
     assert.equal(persisted.findings.some(finding => finding.ruleId === 'custom.delegated-sink'), true)
@@ -130,7 +139,7 @@ test('deep discovery creates six native DSH workers per round and only saturates
 test('an incomplete deep round retains process evidence but cannot merge or saturate provisional candidates', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
-  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state, deepScan: { workers: 'auto' as const, subagents: 0, stopAfterNoNew: 1, stopAfterConsecutiveErrors: 3, maxDiscoveryRuns: 60, maxTimeHours: 96 } }
   try {
     await writeFile(join(root, 'app.ts'), 'runUntrustedCommand(input)\n')
     const scan = await runScan(root, config, 'deep', '', false, state, false); await saveScan(state, scan)
@@ -189,7 +198,7 @@ test('deep worklists split large files into immutable source regions and bind ca
 test('worker closure rejects an incomplete authoritative worklist', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
-  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state, deepScan: { workers: 'auto' as const, subagents: 0, stopAfterNoNew: 1, stopAfterConsecutiveErrors: 3, maxDiscoveryRuns: 60, maxTimeHours: 96 } }
   try {
     await writeFile(join(root, 'app.ts'), 'runUntrustedCommand(input)\n')
     await writeFile(join(root, 'other.ts'), 'const x = 1\n')
@@ -365,7 +374,7 @@ test('cancelled centralized deep closure preserves completed receipts and resume
 test('workers that omit their threat-model and coverage closure make the deep round incomplete', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
-  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state, deepScan: { workers: 'auto' as const, subagents: 0, stopAfterNoNew: 1, stopAfterConsecutiveErrors: 3, maxDiscoveryRuns: 60, maxTimeHours: 96 } }
   try {
     await writeFile(join(root, 'app.ts'), 'runUntrustedCommand(input)\n')
     const scan = await runScan(root, config, 'deep', '', false, state, false)
@@ -380,7 +389,7 @@ test('workers that omit their threat-model and coverage closure make the deep ro
 test('failed worker produces incomplete discovery and does not merge candidates into the scan', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
-  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state, deepScan: { workers: 'auto' as const, subagents: 0, stopAfterNoNew: 1, stopAfterConsecutiveErrors: 3, maxDiscoveryRuns: 60, maxTimeHours: 96 } }
   try {
     await writeFile(join(root, 'app.ts'), 'runUntrustedCommand(input)\n')
     const scan = await runScan(root, config, 'deep', '', false, state, false)
@@ -412,7 +421,7 @@ test('missing DSH agent runtime marks the queued job failed without a fallback e
 test('cancelling deep discovery disposes active DSH workers and preserves the incomplete round without merging it', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
-  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state, deepScan: { workers: 'auto' as const, subagents: 0, stopAfterNoNew: 1, stopAfterConsecutiveErrors: 3, maxDiscoveryRuns: 60, maxTimeHours: 96 } }
   try {
     await writeFile(join(root, 'app.ts'), 'runUntrustedCommand(input)\n')
     const scan = await runScan(root, config, 'deep', '', false, state, false)
@@ -451,7 +460,7 @@ test('cancelling deep discovery disposes active DSH workers and preserves the in
 test('a cancelled deep discovery resumes with fresh workers and merges only its completed round', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
-  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state, deepScan: { workers: 'auto' as const, subagents: 0, stopAfterNoNew: 1, stopAfterConsecutiveErrors: 3, maxDiscoveryRuns: 60, maxTimeHours: 96 } }
   try {
     await writeFile(join(root, 'app.ts'), 'runUntrustedCommand(input)\n')
     const scan = await runScan(root, config, 'deep', '', false, state, false)
@@ -468,5 +477,34 @@ test('a cancelled deep discovery resumes with fresh workers and merges only its 
     assert.equal(resumed.rounds.length, 2)
     assert.deepEqual(resumed.rounds.map(round => round.status), ['incomplete', 'complete'])
     assert.equal((await loadScan(state, scan.id)).findings.some(finding => finding.ruleId === 'custom.delegated-sink'), true)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('the semantic reducer merges equivalent candidates across workers and preserves provenance', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-reducer-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-reducer-state-'))
+  const config = { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function route(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'deep', '', false, state, false)
+    await saveScan(state, scan)
+    const job = await createDeepDiscoveryJob(config, scan.id, 1)
+    job.lifecycle = 'running'
+    job.workers.push({ id: 'worker_1_1', round: 1, status: 'completed', token: 'a', candidateIds: ['one'] }, { id: 'worker_1_2', round: 1, status: 'completed', token: 'b', candidateIds: ['two'] })
+    job.rounds.push({ number: 1, workerIds: ['worker_1_1', 'worker_1_2'], candidateCount: 2, novelty: 2, status: 'complete' })
+    job.reducers = [{ id: 'reducer_1', round: 1, status: 'running', token: 'red', merges: [] }]
+    job.candidates.push(
+      { ruleId: 'dynamic-code.eval', title: 'eval sink', severity: 'high', cwe: 'CWE-95', file: 'app.ts', line: 1, rootCause: 'Request input reaches eval.', remediationIdentity: 'Reject untrusted input before eval.', id: 'one', workerId: 'worker_1_1', workerIds: ['worker_1_1'], reportIds: ['r1'], excerpt: 'eval(req.query.code)', fingerprint: 'f1', remediationSubsumption: { remediationIdentity: 'Reject untrusted input before eval.', decision: 'not_merged', rationale: '', absorbedReportIds: [] }, reportedAt: new Date().toISOString() },
+      { ruleId: 'dynamic-code.eval', title: 'eval sink (same control)', severity: 'high', cwe: 'CWE-95', file: 'app.ts', line: 1, rootCause: 'Attacker input flows into dynamic evaluation.', remediationIdentity: 'Reject untrusted input before eval.', id: 'two', workerId: 'worker_1_2', workerIds: ['worker_1_2'], reportIds: ['r2'], excerpt: 'eval(req.query.code)', fingerprint: 'f2', remediationSubsumption: { remediationIdentity: 'Reject untrusted input before eval.', decision: 'not_merged', rationale: '', absorbedReportIds: [] }, reportedAt: new Date().toISOString() },
+    )
+    await writeFile(join(state, 'deep-discovery', `${job.id}.json`), `${JSON.stringify(job)}\n`)
+    const merged = await reportDeepReducer(config, job.id, 'reducer_1', 'red', [{ targetId: 'one', absorbedIds: ['two'], rationale: 'Both candidates reach the same eval sink through the same missing control.' }])
+    assert.equal(merged.merged, 1)
+    assert.equal(merged.absorbed, 1)
+    const persisted = await loadDeepDiscoveryJob(config, job.id)
+    assert.equal(persisted.candidates.find(candidate => candidate.id === 'one')?.workerIds.includes('worker_1_2'), true)
+    assert.equal(persisted.candidates.find(candidate => candidate.id === 'two')?.absorbedBy, 'one')
+    assert.deepEqual(persisted.candidates.find(candidate => candidate.id === 'one')?.remediationSubsumption.absorbedReportIds, ['r2'])
+    assert.equal(persisted.reducers?.[0].status, 'running')
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })

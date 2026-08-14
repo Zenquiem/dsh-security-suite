@@ -8,7 +8,7 @@ import { createHash, randomUUID } from 'node:crypto'
 import type { Config } from './config.js'
 import type { Finding, ScanRecord } from './contracts.js'
 import { runScan, resolveSafeTarget, snapshotDigestForDirectory } from './scanner.js'
-import { finalizeAndSaveScan, getStateDir, loadScan, persistInvestigationArtifacts, saveScan, sha256, writeArtifact } from './state.js'
+import { getStateDir, loadScan, persistInvestigationArtifacts, saveScan, sha256, writeArtifact } from './state.js'
 
 const execFileAsync = promisify(execFile)
 const MAX_COMMAND_OUTPUT = 256_000
@@ -84,7 +84,6 @@ export async function runIsolatedValidation(workspace: string, config: Config, s
     try { const result = await execFileAsync(args[0], args.slice(1), { cwd: copyTarget, timeout, maxBuffer: MAX_COMMAND_OUTPUT, encoding: 'utf8', windowsHide: true, signal }); stdout = result.stdout; stderr = result.stderr; exitCode = 0 } catch (error: unknown) { rethrowIfCancelled(signal, error); const value = error as { stdout?: string; stderr?: string; code?: number | string; killed?: boolean }; stdout = value.stdout ?? ''; stderr = value.stderr ?? ''; exitCode = typeof value.code === 'number' ? value.code : undefined; timedOut = Boolean(value.killed) }
     const receipt: CommandReceipt = { id: `cmd_${randomUUID()}`, command: args.join(' '), cwd: '.', exitCode, timedOut, durationMs: Date.now() - started, stdout: stdout.slice(0, MAX_COMMAND_OUTPUT), stderr: stderr.slice(0, MAX_COMMAND_OUTPUT), snapshotDigest: await snapshotDigestForDirectory(target, config) }
     const receiptPath = join(getStateDir(config.stateDir), 'validation-receipts', `${receipt.id}.json`)
-    await atomicWrite(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`)
     receipt.artifactRef = receiptPath
     await atomicWrite(receiptPath, `${JSON.stringify(receipt, null, 2)}\n`)
     return receipt

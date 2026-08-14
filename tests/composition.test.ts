@@ -74,7 +74,7 @@ test('public scan entry points create an investigation instead of auto-confirmin
   try {
     await writeFile(join(workspace, 'app.ts'), 'function route(req) { return eval(req.query.code) }\n')
     process.chdir(workspace)
-    const result = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'public-scan' as never, name: 'security_scan', arguments: {}, agent: {} as never })
+    const result = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'public-scan' as never, name: 'security_scan', arguments: { discovery: 'engine' }, agent: {} as never })
     assert.equal(result.isError, false, result.isError ? result.error.message : '')
     const value = result.value as { scanId: string; findings: number; complete: boolean }
     assert.equal(value.findings, 1)

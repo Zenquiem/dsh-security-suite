@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
 import { createDeepInvestigationJob, loadDeepInvestigationJob, runDeepInvestigation } from '../src/deep-workflow.ts'
-import { getDeepWorklist, reportDeepCandidate, reportDeepWorker } from '../src/deep-discovery.ts'
+import { getDeepWorklist, reportDeepCandidate, reportDeepReducer, reportDeepWorker } from '../src/deep-discovery.ts'
 import { loadScan, verifyScanBundle } from '../src/state.ts'
 import { claimAuditTask, recordAttackPath, recordValidation } from '../src/workbench.ts'
 
@@ -20,6 +20,13 @@ function nativeWorkflowContext(config: { stateDir: string }) {
       agent: {
         followup(message: { content: Array<{ text?: string }> }) { prompt = message.content[0]?.text ?? '' },
         async whenIdle() {
+          if (allowed.includes('security_deep_report_reducer')) {
+            const reducerId = /reducer_id ([a-z0-9_]+)/.exec(prompt)?.[1]
+            const reducerToken = /claim_token ([0-9a-f-]+)/.exec(prompt)?.[1]
+            if (!reducerId || !reducerToken) throw new Error('Reducer assignment was incomplete.')
+            await reportDeepReducer(config as never, /job_id (deep_[0-9a-f-]+)/.exec(prompt)?.[1] ?? '', reducerId, reducerToken, [])
+            return
+          }
           if (allowed.includes('security_deep_report_candidate')) {
             const jobId = /job_id (deep_[0-9a-f-]+)/.exec(prompt)?.[1]
             const workerId = /worker_id (worker_\d+_\d+)/.exec(prompt)?.[1]
@@ -69,7 +76,7 @@ test('a durable DSH deep investigation runs discovery, validation, attack-path c
     assert.equal(result.phase, 'finalization')
     assert.ok(result.validationClosureJobId)
     assert.ok(result.attackPathClosureJobId)
-    assert.equal(native.count(), 18)
+    assert.equal(native.count(), 19) // 6 discovery workers + 1 semantic reducer + 6 validation closure + 6 attack-path closure
     assert.deepEqual(native.restrictions[0], ['security_deep_get_worklist', 'security_deep_read_source', 'security_deep_report_candidate', 'security_deep_report_worker'])
     const persistedJob = await loadDeepInvestigationJob(config, result.id)
     assert.equal(persistedJob.lifecycle, 'completed')
