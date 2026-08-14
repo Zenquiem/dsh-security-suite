@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { applyRemediationProposal, installPreCommitHook, loadRemediationRollback, planCandidateValidation, proposeReviewedRemediation, remediationPlan, resumeBulkJob, rollbackRemediationProposal, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, startBulkCsvJob } from '../src/operations.ts'
+import { applyRemediationProposal, installPreCommitHook, loadRemediationRollback, planCandidateValidation, proposeReviewedRemediation, remediationPlan, resumeBulkJob, rollbackRemediationProposal, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, runRemediationVerification, startBulkCsvJob } from '../src/operations.ts'
 import { runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
 import { claimAuditTask, recordValidation } from '../src/workbench.ts'
@@ -21,7 +21,7 @@ test('remediationPlan proposes but does not apply a TLS fix', async () => {
     const plan = await remediationPlan(root, { ...config, stateDir: state }, scan.id, scan.findings[0].id)
     assert.match(plan.patch, /rejectUnauthorized: true/)
     assert.match(await readFile(join(root, 'client.ts'), 'utf8'), /false/)
-  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+  } finally { await rm(root, { recursive: true, force: true }) }
 })
 
 test('pre-commit hook requires approval and preserves an existing hook', async () => {
@@ -175,6 +175,47 @@ test('safe TLS remediation saves a snapshot-bound rollback record and verifies a
     const restored = await rollbackRemediationProposal(root, local, scan.id, proposal.id, true)
     assert.equal(restored.status, 'rolled_back'); assert.ok(restored.verificationScanId)
     assert.equal(await readFile(join(root, 'client.ts'), 'utf8'), original)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('remediation verification runs only source-preflight commands after an exact applied patch without closing the original finding', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'package.json'), '{"scripts":{"test":"node verify.js","build":"node --version"}}\n')
+    await writeFile(join(root, 'verify.js'), 'import { readFileSync } from "node:fs"\nif (!readFileSync("client.ts", "utf8").includes("rejectUnauthorized: true")) process.exit(1)\n')
+    await writeFile(join(root, 'client.ts'), 'request({ rejectUnauthorized: false })\n')
+    const scan = await runScan(root, local, 'standard', '', false, state); await saveScan(state, scan)
+    const proposal = await remediationPlan(root, local, scan.id, scan.findings[0].id)
+    const applied = await applyRemediationProposal(root, local, scan.id, proposal.id, true)
+    await assert.rejects(() => runRemediationVerification(root, local, scan.id, proposal.id, false), /approved/)
+    const run = await runRemediationVerification(root, local, scan.id, proposal.id, true)
+    assert.deepEqual(run.commands.map(item => item.command), ['npm test', 'npm run build'])
+    assert.equal(run.outcome, 'passed')
+    assert.equal(run.receipts.every(receipt => receipt.exitCode === 0), true)
+    assert.match(await readFile(run.artifactRef, 'utf8'), /not prove/i)
+    assert.match(run.limitation, /not prove/i)
+    assert.equal((await loadRemediationRollback(state, applied.rollbackId!)).status, 'available')
+    assert.equal((await loadScan(state, scan.id)).findings[0]?.status, 'open')
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('remediation verification retains failing project checks and rejects an altered applied target', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'package.json'), '{"scripts":{"test":"node --invalid-option"}}\n')
+    await writeFile(join(root, 'client.ts'), 'request({ rejectUnauthorized: false })\n')
+    const scan = await runScan(root, local, 'standard', '', false, state); await saveScan(state, scan)
+    const proposal = await remediationPlan(root, local, scan.id, scan.findings[0].id)
+    await applyRemediationProposal(root, local, scan.id, proposal.id, true)
+    const failed = await runRemediationVerification(root, local, scan.id, proposal.id, true)
+    assert.equal(failed.outcome, 'failed')
+    assert.notEqual(failed.receipts[0]?.exitCode, 0)
+    await writeFile(join(root, 'client.ts'), 'request({ rejectUnauthorized: true })\n// drift\n')
+    await assert.rejects(() => runRemediationVerification(root, local, scan.id, proposal.id, true), /changed since application/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

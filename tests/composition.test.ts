@@ -29,6 +29,7 @@ test('the suite composes with DSH registries and cleans up its native tool surfa
   assert.equal(names.includes('security_deep_get_worklist'), true)
   assert.equal(names.includes('security_plan_candidate_validation'), true)
   assert.equal(names.includes('security_run_candidate_validation_plan'), true)
+  assert.equal(names.includes('security_run_remediation_verification'), true)
   assert.equal(names.includes('security_rollback_remediation'), true)
   assert.equal(names.includes('security_tracking_advisory_preview'), true)
   assert.equal(names.includes('security_create_github_security_advisory'), true)
@@ -131,6 +132,15 @@ test('write tools require DSH user approval in addition to approved: true', asyn
     assert.equal(approved.isError, false, approved.isError ? approved.error.message : '')
     assert.equal(approvalRequests, 1)
     assert.match(await readFile(join(workspace, '.git', 'hooks', 'pre-commit'), 'utf8'), /dsh run/)
+
+    const missingVerificationAcknowledgement = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'remediation-verification-false' as never, name: 'security_run_remediation_verification', arguments: { scan_id: 'missing', remediation_id: 'missing', approved: false }, agent: {} as never })
+    assert.equal(missingVerificationAcknowledgement.isError, true)
+    assert.match(missingVerificationAcknowledgement.isError ? missingVerificationAcknowledgement.error.message : '', /requires approved: true/)
+    assert.equal(approvalRequests, 1)
+
+    const approvedVerification = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'remediation-verification-allowed' as never, name: 'security_run_remediation_verification', arguments: { scan_id: 'missing', remediation_id: 'missing', approved: true }, agent: {} as never })
+    assert.equal(approvedVerification.isError, true)
+    assert.equal(approvalRequests, 2)
   } finally {
     process.chdir(previousDirectory)
     await fiber.dispose()

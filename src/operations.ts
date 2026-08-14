@@ -20,7 +20,8 @@ export interface CandidateValidationPlan { id: string; scanId: string; candidate
 export interface CandidateValidationPlanRun extends CandidateValidationPlan { approved: true; executedAt: string; receipts: CommandReceipt[]; artifactRef: string }
 export interface RemediationReplacement { startLine: number; endLine: number; expectedText: string; replacementText: string; testPlan: string }
 export interface RemediationVerification { scanId: string; status: 'not_detected' | 'still_detected'; ruleId: string; file: string; matchingFindingIds: string[]; observedAt: string; limitation: string }
-export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; createdAt: string; status: 'proposed' | 'applied' | 'rolled_back' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; safeToApply: boolean; rationale: string; replacement?: RemediationReplacement; appliedAt?: string; verificationScanId?: string; verification?: RemediationVerification; rollbackId?: string }
+export interface RemediationVerificationRun { id: string; remediationId: string; sourceScanId: string; snapshotDigest: string; commands: Array<{ command: string; reason: string }>; receipts: CommandReceipt[]; outcome: 'passed' | 'failed'; executedAt: string; artifactRef: string; limitation: string }
+export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; createdAt: string; status: 'proposed' | 'applied' | 'rolled_back' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; safeToApply: boolean; rationale: string; replacement?: RemediationReplacement; appliedAt?: string; verificationScanId?: string; verification?: RemediationVerification; postApplyVerification?: RemediationVerificationRun; rollbackId?: string }
 export interface RemediationRollback { id: string; remediationId: string; scanId: string; file: string; beforeContent: string; beforeSha256: string; appliedSha256: string; appliedSnapshotDigest: string; createdAt: string; status: 'available' | 'rolled_back' | 'stale'; rolledBackAt?: string; verificationScanId?: string }
 
 export interface BulkResult { path: string; scanId?: string; findings?: number; error?: string }
@@ -298,6 +299,34 @@ export async function applyRemediationProposal(workspace: string, config: Config
   const verification = await runScan(scan.target, config, 'standard', scan.threatModel, scan.recipe.scopeRequested, config.stateDir, false)
   await persistInvestigationArtifacts(getStateDir(config.stateDir), verification); await saveScan(getStateDir(config.stateDir), verification); proposal.verificationScanId = verification.id; proposal.verification = remediationVerification(verification, finding); await saveProposal(getStateDir(config.stateDir), proposal)
   return proposal
+}
+
+/**
+ * Run only scan-time preflight commands against an already-applied exact patch.
+ * Command success is retained as repair evidence, never as an automatic finding
+ * resolution or a substitute for an attacker-path revalidation.
+ */
+export async function runRemediationVerification(workspace: string, config: Config, scanId: string, remediationId: string, approved: boolean, timeoutMs = 120_000, signal?: AbortSignal): Promise<RemediationVerificationRun> {
+  signal?.throwIfAborted()
+  if (!approved) throw new Error('Running remediation verification can execute project test/build scripts. Set approved to true only after reviewing the scan-time commands.')
+  const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); const proposal = await loadRemediationProposal(state, remediationId)
+  if (proposal.findingId !== scan.findings.find(finding => finding.id === proposal.findingId)?.id) throw new Error('Remediation proposal does not belong to this scan.')
+  if (proposal.status !== 'applied' || !proposal.rollbackId) throw new Error('Only an applied remediation with an available rollback record can be verified.')
+  const rollback = await loadRemediationRollback(state, proposal.rollbackId)
+  if (rollback.status !== 'available' || rollback.remediationId !== proposal.id || rollback.scanId !== scanId) throw new Error('The applied remediation rollback record is unavailable.')
+  const root = resolve(workspace); const file = resolve(scan.target, proposal.file); if (!inside(root, file)) throw new Error('Remediation target is outside the active workspace.')
+  const commands = [...new Set(scan.preflight.suggestedCommands.map(command => safeCommand(command)))].map(command => ({ command, reason: `Suggested by source scan ${scan.id} preflight for ${scan.preflight.projectFiles.join(', ')}.` }))
+  if (!commands.length) throw new Error('No bounded remediation verification command is available from the source scan preflight.')
+  const [current, snapshotDigest] = await Promise.all([readFile(file, 'utf8'), snapshotDigestForDirectory(scan.target, config)])
+  if (sha256(current) !== rollback.appliedSha256 || snapshotDigest !== rollback.appliedSnapshotDigest) throw new Error('Applied remediation changed since application. Create a follow-up scan before verification.')
+  const receipts = await executeValidationCommands(scan.target, commands.map(item => item.command), timeoutMs, snapshotDigest, signal)
+  const after = await snapshotDigestForDirectory(scan.target, config)
+  if (after !== snapshotDigest) throw new Error('Target changed during remediation verification; receipts were not attached.')
+  const id = `remverify_${randomUUID()}`; const artifactRef = join(state, 'remediation-verification', `${id}.json`)
+  const run: RemediationVerificationRun = { id, remediationId: proposal.id, sourceScanId: scan.id, snapshotDigest, commands, receipts, outcome: receipts.every(receipt => !receipt.timedOut && receipt.exitCode === 0) ? 'passed' : 'failed', executedAt: new Date().toISOString(), artifactRef, limitation: 'These isolated project-check receipts do not prove that the original attacker path is closed, that production configuration is safe, or that the original finding is resolved. Revalidate the source-to-sink path and preserved behavior separately.' }
+  await atomicWrite(artifactRef, `${JSON.stringify(run, null, 2)}\n`)
+  proposal.postApplyVerification = run; await saveProposal(state, proposal)
+  return run
 }
 
 /** Restore one proposal's exact pre-application content only when its applied state remains intact. */
