@@ -87,6 +87,41 @@ test('public scan entry points create an investigation instead of auto-confirmin
   }
 })
 
+test('the DSH tool pipeline records reviewed runtime evidence without auto-confirming the candidate', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-security-suite-runtime-tool-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-runtime-tool-state-'))
+  const previousDirectory = process.cwd()
+  const ctx = new Context()
+  new SystemPrompt(ctx, {})
+  new ToolRegistry(ctx, {})
+  let approvalRequests = 0
+  ctx.provide('approval', { async request() { approvalRequests++; return 'allowed-once' } })
+  const fiber = await ctx.plugin({ name, inject, apply }, { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state })
+  try {
+    await writeFile(join(workspace, 'app.ts'), 'function route(req) { return eval(req.query.code) }\n')
+    await writeFile(join(workspace, 'repro.js'), 'console.log("local reproduction harness")\n')
+    process.chdir(workspace)
+    const start = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'runtime-start' as never, name: 'security_start_investigation', arguments: {}, agent: {} as never })
+    assert.equal(start.isError, false, start.isError ? start.error.message : '')
+    const scanId = (start.value as { scanId: string }).scanId
+    const claim = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'runtime-claim' as never, name: 'security_claim_audit_task', arguments: { scan_id: scanId, owner: 'composition-test', phase: 'validation' }, agent: {} as never })
+    assert.equal(claim.isError, false, claim.isError ? claim.error.message : '')
+    const task = claim.value as { candidateId: string; claimToken: string }
+    const run = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'runtime-run' as never, name: 'security_run_candidate_runtime_validation', arguments: { scan_id: scanId, candidate_id: task.candidateId, claim_token: task.claimToken, method: 'realistic_interface_reproduction', command: 'node repro.js', fixture_paths: ['repro.js'], setup_summary: 'Run the source-receipted local harness in a disposable target copy.', approved: true }, agent: {} as never })
+    assert.equal(run.isError, false, run.isError ? run.error.message : '')
+    assert.equal((run.value as { method: string }).method, 'realistic_interface_reproduction')
+    assert.equal(approvalRequests, 1)
+    const scan = await (await import('../src/state.ts')).loadScan(state, scanId)
+    assert.equal(scan.findings[0]?.disposition, 'discovered')
+    assert.equal(scan.findings[0]?.evidence.some(item => item.kind === 'runtime'), true)
+  } finally {
+    process.chdir(previousDirectory)
+    await fiber.dispose()
+    await rm(workspace, { recursive: true, force: true })
+    await rm(state, { recursive: true, force: true })
+  }
+})
+
 test('the built npm entrypoint registers and executes through the real DSH tool pipeline', async () => {
   const packageRoot = fileURLToPath(new URL('..', import.meta.url))
   if (!existsSync(new URL('../dist/index.js', import.meta.url))) await execFileAsync('npm', ['run', 'build'], { cwd: packageRoot })
