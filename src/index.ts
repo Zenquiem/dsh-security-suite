@@ -17,6 +17,7 @@ import { createLlmDiscoveryJob, getLlmScope, llmDiscoveryCapability, readLlmSour
 import { createDiffDiscoveryJob, diffDiscoveryCapability, getDiffReviewItems, readDiffSource, reportDiffCandidates, reportDiffWorker, runDiffDiscovery, runDiffLlmReview } from './llm/diff.js'
 import { buildValidationRubric, proofTupleFor } from './llm/validation.js'
 import { COUNTEREVIDENCE_CHECKLIST } from './llm/attack-path.js'
+import { reportAcceptanceChecklist, WRITEUP_SECTIONS } from './llm/writeup.js'
 
 export const name = 'dsh-security-suite'
 export const inject = ['tools', 'systemPrompt']
@@ -492,6 +493,12 @@ export function apply(ctx: Context, config: PluginConfig): void {
     name: 'security_threat_model_template', description: 'Generate a source-evidenced threat model for a repository or component. It records observed architecture signals separately from deployment assumptions and open questions.', parameters: { scope: { type: 'string', description: 'Repository-relative system or component scope.' }, context: { type: 'string', description: 'Known deployment, actors, assets, or constraints supplied by the user.' } },
     output: { schema: { type: 'object', properties: { markdown: { type: 'string' } }, required: ['markdown'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: value.markdown ?? '' }] },
     async execute(args) { const target = resolveSafeTarget(process.cwd(), args.scope); return { markdown: await generateSourceThreatModel(target, config, args.context ?? '') } },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_writeup_guidance', description: 'Read-only vulnerability-report format guidance: the seven required headings in order (report-format.md) and the acceptance checklist. Disclosure writers and report authors use it to structure and self-check reports; it performs no scan and records nothing.', parameters: {},
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute() { return JSON.parse(JSON.stringify({ sections: WRITEUP_SECTIONS, acceptanceChecklist: reportAcceptanceChecklist() })) as Record<string, JsonValue> },
   }))
 
   ctx.tools.register(defineTool({

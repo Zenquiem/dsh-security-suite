@@ -107,6 +107,6 @@ trees are adapted from `openai/codex-security` (Apache-2.0).
 | --- | --- |
 | 1. Validation deep: 28-class proof tuple table + routing (`proofTupleFor`), bounded validation rubric, codex numerical confidence ladder (1.0/0.9/0.8/0.3/0.0), instance-preserving suppression rules — `src/llm/validation.ts` + `security_validation_guidance` tool | ✅ done |
 | 2. Attack-path facts: 20+ field structured model, mechanical final policy pass (hard suppression -> network-scope weighting -> matrix + critical escalation -> reportability), seven-dimension counterevidence checklist, markdown facts renderer — `src/llm/attack-path.ts` + `security_attack_path_guidance` tool | ✅ done |
-| 3. Workbench state machines: triage close_reason + append-only decisions log, remediation 8-state machine + optimistic lock, comparison `reopened` | ⏳ next |
-| 4. Ranking/normalization byte-level: generate_rank_input exclusions/preview/shards/pool plan, normalize_candidates identity hash (algorithm parity, DSH namespace) | ⏳ next |
-| 5. vulnerability-writeup seven-section format + single-finding drafting prompt into disclosure | ⏳ next |
+| 3. Workbench state machines: triage close_reason + append-only decisions log, remediation 8-state machine + optimistic lock, comparison `reopened` | ✅ done |
+| 4. Ranking/normalization byte-level: `src/llm/rank.ts` ports EXCLUDED_DIRS/FILENAMES/TEXT_CODE_EXTENSIONS verbatim, `pathIsExcluded`, `candidateIdentity` (sort_keys/compact/null-instance parity), `combineCandidates`, structural preview | ✅ done |
+| 5. vulnerability-writeup: `src/llm/writeup.ts` ports the seven required headings + order validation, the single-finding drafting prompt, and the acceptance checklist; disclosure writer brief now requires the seven-section organization; `security_writeup_guidance` tool | ✅ done |
