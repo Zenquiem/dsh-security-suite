@@ -72,6 +72,7 @@ PHP deserialization analysis follows request-derived values through same-directo
 SARIF imports retain their rule id, CWE, message, severity, and physical file/line. Imported triage returns `affected` only when a compatible native local-analysis candidate matches that cited location; a readable file alone is never confirmation. Every completed scan with reportable findings also generates a derived `hardening/hardening.md` and `hardening/hardening.json` portfolio from those findings and their detailed reports. The main report links that derived portfolio; canonical bundle verification remains independent of derived projections, while `verifyScanProjections` detects a missing or stale report, write-up, or hardening artifact and `regenerateScanProjections` restores them deterministically.
 
 - `security_scan`, `security_assess`, `security_review_diff`, `security_bulk_scan`, `security_bulk_scan_csv`, `security_resume_bulk_scan`, `security_rerun_scan`
+- `security_scan` and `security_review_diff` accept `discovery: llm|engine` (llm default). LLM discovery is orchestrated through worker-only tools: `security_llm_get_scope`, `security_llm_read_source`, `security_llm_search`, `security_llm_report_candidates`, `security_llm_report_worker`, `security_diff_get_review_items`, `security_diff_read_source`, `security_diff_report_candidates`, `security_diff_report_worker`, and `security_llm_discovery_capability` / `security_diff_discovery_capability`. Deep discovery adds `security_deep_get_reducer_input` and `security_deep_report_reducer` for per-round semantic reduction.
 - `security_scan_history`, `security_get_scan`, `security_compare_scans`, `security_export_scan`
 - `security_threat_model_template`, `security_import_findings`, `security_triage_imported_finding`, `security_finding_writeup`, `security_hardening_proposal`; completed reportable findings also persist an evidence-bound report under `findings/<candidate-id>/`.
 - `security_start_disclosure_campaign` turns supplied vulnerability notes and a selected local source snapshot into one isolated DSH writer assignment per vulnerability. Writers can read only their assigned receipt-bound source, must submit a source-cited report with counterevidence, limitations, remediation, and reproduction status, and cannot claim executed reproduction unless the campaign explicitly authorizes controlled experiments. An authorized campaign can freeze an already existing user-supplied local experiment artifact, but the plugin never generates, modifies, or executes it; an execution claim must cite that frozen artifact and fails on evidence drift.
@@ -112,7 +113,27 @@ config:
   enabled: true
   maxFiles: 500
   maxFileBytes: 262144
+  # Deep-scan engine (codex-security `[deep_scan]` semantics).
+  deepScan:
+    workers: auto        # positive integer or 'auto' (half of parallelism, capped at 6)
+    subagents: 3
+    stopAfterNoNew: 6    # saturate after this many complete rounds with zero novelty
+    stopAfterConsecutiveErrors: 3
+    maxDiscoveryRuns: 60
+    maxTimeHours: 96
+  # Read-only security knowledge base: files or directories of Markdown/plain text.
+  knowledgeBase: []
+  # Extra shared scan instructions passed to every LLM discovery worker.
+  scanPrompt: ''
 ```
+
+`security_scan` and `security_review_diff` default to `discovery: llm`:
+standard scans run one independent baseline auditor plus focused investigator
+DSH subagents over source-backed investigation packets, and diff scans run one
+restricted file-review subagent per changed file. Pass `discovery: engine` to
+run only the deterministic rule/AST engine. Deep discovery assigns each of the
+six workers a distinct review lens and runs one semantic reducer subagent per
+completed round to merge equivalent candidates across workers.
 
 The native engine confines repository and knowledge-base arguments to the active workspace, forwards cancellation, seals the entire retained evidence directory (including deep-worker, coverage, canonical-model, and closure records), and rejects completed bundles with altered, missing, or unregistered evidence files. State is placed under `DSH_SECURITY_SUITE_STATE_DIR` or `stateDir` (default: `~/.dsh-security-suite`).
 
