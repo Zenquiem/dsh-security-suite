@@ -990,6 +990,20 @@ async function boundedGitDiff(workspace: string, args: string[], allowDifference
 
 export async function reviewGitDiff(workspace: string, base: string | undefined): Promise<{ mode: string; diff: string; truncated: boolean }> {
   if (base !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(base) || base.startsWith('-'))) throw new Error('Git base ref contains unsupported characters.')
+  const hasHead = await execFileAsync('git', ['rev-parse', '--verify', 'HEAD'], { cwd: resolve(workspace), encoding: 'utf8' }).then(() => true).catch(() => false)
+  if (base === undefined && !hasHead) {
+    const { stdout: listed } = await execFileAsync('git', ['ls-files', '--cached', '--others', '--exclude-standard', '-z'], { cwd: resolve(workspace), encoding: 'utf8', maxBuffer: MAX_DIFF_BYTES + 1 })
+    let diff = ''; let truncated = false
+    for (const path of [...new Set(listed.split('\0').filter(Boolean))]) {
+      if (!TEXT_EXTENSIONS.has(extname(path).toLowerCase()) && !isGitHubWorkflow(path)) continue
+      const remaining = MAX_DIFF_BYTES - Buffer.byteLength(diff, 'utf8'); if (remaining <= 0) return { mode: 'working-tree-empty-baseline', diff, truncated: true }
+      const addition = await boundedGitDiff(workspace, ['diff', '--no-index', '--no-ext-diff', '--unified=20', '--', '/dev/null', path], true)
+      if (Buffer.byteLength(addition.output, 'utf8') > remaining) return { mode: 'working-tree-empty-baseline', diff: diff + addition.output.slice(0, remaining), truncated: true }
+      diff += addition.output; truncated ||= addition.truncated
+      if (truncated) return { mode: 'working-tree-empty-baseline', diff, truncated }
+    }
+    return { mode: 'working-tree-empty-baseline', diff, truncated }
+  }
   const args = ['diff', '--no-ext-diff', '--unified=20']; const mode = base === undefined ? 'working-tree' : `base:${base}`
   // Comparing against HEAD includes both staged and unstaged worktree changes.
   if (base === undefined) args.push('HEAD'); else args.push(`${base}...HEAD`)
