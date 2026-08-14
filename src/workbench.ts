@@ -180,3 +180,34 @@ export async function completeScan(config: Config, scanId: string): Promise<Scan
   const activeTasks = scan.tasks.filter(task => task.status === 'pending' || task.status === 'claimed'); if (activeTasks.length) throw new Error(`Cannot finalize while audit tasks remain: ${activeTasks.map(task => task.id).join(', ')}`)
   scan.lifecycle = scan.coverage.complete ? 'completed' : 'incomplete'; scan.completedAt = new Date().toISOString(); scan.activity.push({ at: scan.completedAt, phase: 'reporting', message: 'Canonical scan bundle finalized after all candidate ledgers closed.' }); await finalizeAndSaveScan(state, scan); return scan
 }
+
+/** codex-security finding_triage close reasons. */
+export type TriageCloseReason = 'already_fixed' | 'wont_fix' | 'false_positive'
+
+/**
+ * Record one append-only triage decision (codex-security finding_decisions +
+ * finding_triage semantics): the (status, closeReason, note) triple is
+ * appended to the finding's audit log only when it changes, then the current
+ * triage state is updated. closed requires a close reason; open requires none.
+ */
+export async function recordTriageDecision(config: Config, scanId: string, findingId: string, input: { status: 'open' | 'closed'; closeReason?: TriageCloseReason; note?: string }): Promise<{ updated: boolean; findingId: string; decisions: number }> {
+  return updateScan(config, scanId, async scan => {
+    const finding = scan.findings.find(item => item.id === findingId)
+    if (!finding) throw new Error('Finding was not found in this scan.')
+    if (input.status === 'closed' && !input.closeReason) throw new Error('A closed triage decision requires a close reason: already_fixed, wont_fix, or false_positive.')
+    if (input.status === 'open' && input.closeReason) throw new Error('An open triage decision cannot carry a close reason.')
+    if (input.closeReason === 'false_positive' && finding.validationRecord?.conclusion !== 'suppressed' && finding.validationRecord?.conclusion !== 'not_applicable') throw new Error('A false-positive close requires a suppressed or not_applicable validation receipt.')
+    if (input.closeReason === 'already_fixed' && finding.status !== 'resolved' && finding.validationRecord?.conclusion !== 'reportable') throw new Error('An already_fixed close requires a resolved annotation or a reportable validation receipt.')
+    const current = { status: input.status, closeReason: input.closeReason, note: input.note?.trim() || undefined }
+    const decisions = finding.triageDecisions ?? []
+    const last = decisions.at(-1)
+    const changed = !last || last.status !== current.status || (last.closeReason ?? undefined) !== current.closeReason || (last.note ?? undefined) !== current.note
+    if (!changed) return { updated: false, findingId, decisions: decisions.length }
+    decisions.push({ ...current, at: new Date().toISOString() })
+    finding.triageDecisions = decisions
+    finding.status = current.status === 'closed' ? (current.closeReason === 'false_positive' ? 'false_positive' : current.closeReason === 'already_fixed' ? 'resolved' : 'resolved') : 'open'
+    finding.closeReason = current.closeReason
+    await saveScan(getStateDir(config.stateDir), scan)
+    return { updated: true, findingId, decisions: decisions.length }
+  })
+}

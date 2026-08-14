@@ -79,6 +79,10 @@ export interface Finding {
     evidenceDigest: string
     poc: { status: 'not_generated'; rationale: string }
   }
+  /** codex-security finding_triage close reason; present only when closed. */
+  closeReason?: 'already_fixed' | 'wont_fix' | 'false_positive'
+  /** Append-only triage audit log (codex-security finding_decisions). */
+  triageDecisions?: Array<{ status: 'open' | 'closed'; closeReason?: 'already_fixed' | 'wont_fix' | 'false_positive'; note?: string; at: string }>
 }
 
 export interface FileReceipt { path: string; bytes: number; sha256: string; language: string }
