@@ -397,9 +397,10 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: 'security_review_diff',
-    description: 'Perform a read-only native Git diff candidate review across staged, unstaged, and eligible untracked source changes. It analyzes added code and added JS/TS, Python, Go, Java, C#, PHP, Ruby, C, C++, or Rust call paths into local sink wrappers; detects GitHub Actions pull_request_target shell interpolation, broad permissions, mutable action references, and pull-request-head checkout before execution; detects deleted authorization or input-validation controls; saves a validation investigation; and never auto-confirms static candidates.',
+    description: 'Perform a read-only native Git change-set candidate review. working_tree covers staged, unstaged, and eligible untracked source changes; commit compares one commit with its parent; branch_diff compares HEAD with a supplied merge-base or branch ref. It analyzes added code and added JS/TS, Python, Go, Java, C#, PHP, Ruby, C, C++, or Rust call paths into local sink wrappers; detects GitHub Actions pull_request_target shell interpolation, broad permissions, mutable action references, and pull-request-head checkout before execution; detects deleted authorization or input-validation controls; saves a validation investigation; and never auto-confirms static candidates.',
     parameters: {
-      base: { type: 'string', description: 'Optional Git base ref. Defaults to the working tree diff.' },
+      mode: { type: 'string', enum: ['working_tree', 'commit', 'branch_diff'], description: 'Change-set workflow. Defaults to working_tree when base is absent and branch_diff when base is supplied.' },
+      base: { type: 'string', description: 'Commit ref for commit mode, merge-base or branch ref for branch_diff, and omitted for working_tree.' },
     },
     output: {
       schema: {
@@ -416,10 +417,10 @@ export function apply(ctx: Context, config: PluginConfig): void {
       render: (_args, value) => [{ type: 'text', text: value.diff ?? '' }],
     },
     async execute(args) {
-      const scan = await runDiffScan(process.cwd(), args.base, '', config.stateDir, false)
+      const scan = await runDiffScan(process.cwd(), args.base, '', config.stateDir, false, args.mode as 'working_tree' | 'commit' | 'branch_diff' | undefined)
       await persistInvestigationArtifacts(getStateDir(config.stateDir), scan); await saveScan(getStateDir(config.stateDir), scan)
       const diff = scan.findings.map(finding => `${finding.locations[0].file}:${finding.locations[0].line} ${finding.ruleId}: ${finding.locations[0].excerpt}`).join('\n')
-      return { scanId: scan.id, mode: scan.mode, diff, truncated: !scan.coverage.complete }
+      return { scanId: scan.id, mode: scan.coverage.mode, diff, truncated: !scan.coverage.complete }
     },
   }))
 

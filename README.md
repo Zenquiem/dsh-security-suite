@@ -22,7 +22,7 @@ Deep workers are DSH-native child agents. Their scoped tool view is restricted t
 
 | Workflow | DSH Security Suite capability |
 | --- | --- |
-| Standard, scoped, diff, and deep scans | Native candidate discovery with `security_scan`, patch-aware `security_review_diff`, deep multi-pass analysis, durable validation queues, resumable bulk jobs, and `security_run_deep_investigation` for the complete DSH-native deep workflow |
+| Standard, scoped, diff, and deep scans | Native candidate discovery with `security_scan`, patch-aware `security_review_diff` (explicit `working_tree`, `commit`, and `branch_diff` workflows with immutable base/head receipts), deep multi-pass analysis, durable validation queues, resumable bulk jobs, and `security_run_deep_investigation` for the complete DSH-native deep workflow |
 | Threat model and security policy | Native source-evidenced threat model, policy, and invariant tools |
 | Discovery, validation, attack paths, triage | Native evidence-backed findings and persistent validation state |
 | Scan history, rerun, semantic match, comparison | Native workbench records and scan comparison |

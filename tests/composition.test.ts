@@ -46,6 +46,7 @@ test('the suite composes with DSH registries and cleans up its native tool surfa
   assert.equal(names.includes('security_deep_read_source'), true)
   assert.equal(ctx.tools.get('security_scan')?.output.schema.type, 'object')
   assert.match(ctx.tools.get('security_review_diff')?.description ?? '', /GitHub Actions pull_request_target shell interpolation/)
+  assert.deepEqual(ctx.tools.get('security_review_diff')?.parameters.properties.mode.enum, ['working_tree', 'commit', 'branch_diff'])
   assert.deepEqual(ctx.tools.get('security_scan')?.output.schema.required, ['scanId', 'findings', 'reviewedFiles', 'complete'])
   assert.deepEqual(ctx.tools.get('security_assess')?.output.schema.required, ['scanId', 'filesScanned', 'filesSkipped', 'candidates'])
   assert.deepEqual(ctx.tools.get('security_review_diff')?.output.schema.required, ['scanId', 'mode', 'diff', 'truncated'])

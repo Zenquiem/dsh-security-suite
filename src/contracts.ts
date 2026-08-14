@@ -107,6 +107,9 @@ export interface TargetSnapshot {
   snapshotDigest: string
 }
 
+/** The exact Git change-set workflow represented by a diff scan. */
+export type DiffScanMode = 'working_tree' | 'commit' | 'branch_diff'
+
 export interface Preflight {
   status: 'ready' | 'warn' | 'blocked'
   checks: Array<{ id: string; status: 'pass' | 'warn' | 'blocked'; detail: string }>
@@ -116,7 +119,7 @@ export interface Preflight {
 }
 
 export interface Coverage {
-  mode: 'repository' | 'scoped_path' | 'diff' | 'deep_repository'
+  mode: 'repository' | 'scoped_path' | 'diff' | 'commit' | 'branch_diff' | 'working_tree' | 'deep_repository'
   reviewedFiles: number
   skippedFiles: number
   exclusions: string[]
@@ -144,7 +147,7 @@ export interface ScanRecord {
   coverage: Coverage
   activity: ScanActivity[]
   tasks: AuditTask[]
-  recipe: { mode: 'standard' | 'deep' | 'diff'; scopeRequested: boolean; passes: string[] }
+  recipe: { mode: 'standard' | 'deep' | 'diff'; scopeRequested: boolean; passes: string[]; diffMode?: DiffScanMode; diffBase?: string; diffHead?: string }
   artifacts: { directory: string; manifest?: string; findings?: string; coverage?: string; report?: string }
   /** Derived architecture guidance; absent when no reportable finding survives finalization. */
   hardening?: {

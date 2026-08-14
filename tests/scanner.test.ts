@@ -641,11 +641,62 @@ test('working-tree diff review includes staged and untracked source changes', as
     await execFileAsync('git', ['add', 'staged.ts'], { cwd: root })
     await writeFile(join(root, 'untracked.ts'), 'export function untracked(req) { return eval(req.query.code) }\n')
     const scan = await runDiffScan(root, undefined, '', state)
-    assert.equal(scan.coverage.mode, 'diff')
+    assert.equal(scan.coverage.mode, 'working_tree')
+    assert.equal(scan.recipe.diffMode, 'working_tree')
+    assert.match(scan.targetSnapshot.baseRevision ?? '', /^[0-9a-f]{40}$/)
+    assert.match(scan.targetSnapshot.headRevision ?? '', /^[0-9a-f]{40}$/)
     assert.equal(scan.coverage.surfaces[0]?.label, 'working-tree')
     assert.equal(scan.findings.some(finding => finding.locations[0]?.file === 'staged.ts' && finding.ruleId === 'dangerous.dynamic.code'), true)
     assert.equal(scan.findings.some(finding => finding.locations[0]?.file === 'untracked.ts' && finding.ruleId === 'dangerous.dynamic.code'), true)
     assert.deepEqual(scan.coverage.receipts.map(receipt => receipt.path).sort(), ['staged.ts', 'untracked.ts'])
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('commit and branch diff scans preserve distinct baselines and target revisions', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-modes-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'route.ts'), 'export const safe = true\n')
+    await execFileAsync('git', ['add', 'route.ts'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    const baseline = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim()
+    await writeFile(join(root, 'route.ts'), 'export function changed(req) { return eval(req.query.code) }\n')
+    await execFileAsync('git', ['add', 'route.ts'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'risky change'], { cwd: root })
+    const changed = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim()
+
+    const commit = await runDiffScan(root, changed, '', state, false, 'commit')
+    assert.equal(commit.coverage.mode, 'commit')
+    assert.equal(commit.recipe.diffMode, 'commit')
+    assert.equal(commit.targetSnapshot.baseRevision, baseline)
+    assert.equal(commit.targetSnapshot.headRevision, changed)
+    assert.equal(commit.findings.some(finding => finding.ruleId === 'dangerous.dynamic.code'), true)
+
+    const branch = await runDiffScan(root, baseline, '', state, false, 'branch_diff')
+    assert.equal(branch.coverage.mode, 'branch_diff')
+    assert.equal(branch.recipe.diffMode, 'branch_diff')
+    assert.equal(branch.targetSnapshot.baseRevision, baseline)
+    assert.equal(branch.targetSnapshot.headRevision, changed)
+    assert.equal(branch.findings.some(finding => finding.ruleId === 'dangerous.dynamic.code'), true)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('commit diff scans an initial commit against an explicit empty baseline', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-initial-commit-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'route.ts'), 'export function initial(req) { return eval(req.query.code) }\n')
+    await execFileAsync('git', ['add', 'route.ts'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'initial'], { cwd: root })
+    const initial = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: root })).stdout.trim()
+    const scan = await runDiffScan(root, initial, '', state, false, 'commit')
+    assert.equal(scan.coverage.mode, 'commit')
+    assert.equal(scan.targetSnapshot.baseRevision, undefined)
+    assert.equal(scan.targetSnapshot.headRevision, initial)
+    assert.equal(scan.findings.some(finding => finding.ruleId === 'dangerous.dynamic.code'), true)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
