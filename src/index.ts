@@ -6,7 +6,7 @@ import { SECURITY_REVIEW_GUIDANCE } from './prompt.js'
 import { FULL_SECURITY_WORKFLOW } from './workflows.js'
 import { generateSourceThreatModel, runDiffScan, runScan, resolveSafeTarget } from './scanner.js'
 import { finalizeAndSaveScan, getStateDir, listScans, loadScan, persistInvestigationArtifacts, renderCsv, renderFindingWriteup, renderMarkdownReport, saveTriageAnnotation, saveScan, toSarif, verifyScanBundle } from './state.js'
-import { applyRemediationProposal, bulkScan, installPreCommitHook, planCandidateValidation, proposeReviewedRemediation, remediationPlan, rerunSavedScan, resumeBulkJob, rollbackRemediationProposal, runCandidateRuntimeValidation, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, runRemediationVerification, startBulkCsvJob } from './operations.js'
+import { applyRemediationProposal, bulkScan, fixFinding, installPreCommitHook, planCandidateValidation, proposeReviewedRemediation, remediationPlan, rerunSavedScan, resumeBulkJob, rollbackRemediationProposal, runCandidateRuntimeValidation, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, runRemediationVerification, startBulkCsvJob } from './operations.js'
 import { cancelInvestigation, claimAuditTask, completeScan, pendingCandidates, recordAttackPath, recordValidation, resumeInvestigation } from './workbench.js'
 import { generateHardeningPortfolio, importFindings, importGitHubSecurityFindings, importSecurityTickets, triageFindingBacklog, triageImportedFinding } from './analysis.js'
 import { createGitHubAdvisory, createTracking, previewGitHubAdvisory, previewTracking } from './tracking.js'
@@ -28,6 +28,7 @@ const WRITE_ACTION_APPROVALS: Readonly<Record<string, string>> = {
   security_install_precommit_hook: 'Install the suite pre-commit hook in this repository.',
   security_create_tracking_issue: 'Create one external security tracking issue using the supplied provider credentials.',
   security_create_github_security_advisory: 'Create one private GitHub draft security advisory for a verified immutable source revision.',
+  security_fix_finding: 'Apply the reviewed exact-range remediation for one validated security finding and run its bounded verification workflow.',
 }
 
 function hasExplicitApproval(argumentsValue: unknown): boolean {
@@ -475,6 +476,12 @@ export function apply(ctx: Context, config: PluginConfig): void {
     name: 'security_apply_remediation', description: 'Apply one explicitly reviewable safe remediation only after reviewed acknowledgement plus DSH one-shot user approval. It rejects stale targets, saves an exact rollback record, rescans, and records the verification scan.', parameters: { scan_id: { type: 'string', required: true, description: 'Source scan identifier.' }, remediation_id: { type: 'string', required: true, description: 'Identifier from security_remediation_plan.' }, approved: { type: 'boolean', required: true, description: 'Set true only after reviewing the patch; this does not replace DSH user approval.' } },
     output: { schema: { type: 'object', properties: { id: { type: 'string' }, findingId: { type: 'string' }, status: { type: 'string' }, appliedAt: { type: 'string' }, verificationScanId: { type: 'string' }, verification: { type: 'object', additionalProperties: true }, rollbackId: { type: 'string' } }, required: ['id', 'findingId', 'status'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args) { return JSON.parse(JSON.stringify(await applyRemediationProposal(process.cwd(), config, args.scan_id, args.remediation_id, args.approved))) as { id: string; findingId: string; status: string; appliedAt?: string; verificationScanId?: string; verification?: Record<string, JsonValue>; rollbackId?: string } },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_fix_finding', description: 'Run a complete DSH-native fix workflow for one formally reportable finding: freeze an exact multi-file patch, require reviewed acknowledgement plus DSH approval, apply it atomically with rollback, then run bounded project checks and a native rescan. It returns fixed, no_change, or blocked and never silently resolves a finding.', parameters: { scan_id: { type: 'string', required: true }, finding_id: { type: 'string', required: true }, changes: { type: 'array', required: true, items: { type: 'object', properties: { file: { type: 'string', required: true }, start_line: { type: 'number', required: true }, end_line: { type: 'number', required: true }, expected_text: { type: 'string', required: true }, replacement_text: { type: 'string', required: true } }, additionalProperties: false } }, rationale: { type: 'string', required: true }, test_plan: { type: 'string', required: true }, approved: { type: 'boolean', required: true }, timeout_ms: { type: 'number' } },
+    output: { schema: { type: 'object', properties: { outcome: { type: 'string' }, scanId: { type: 'string' }, findingId: { type: 'string' }, remediationId: { type: 'string' }, stages: { type: 'array', items: { type: 'object', additionalProperties: true } }, limitation: { type: 'string' } }, required: ['outcome', 'scanId', 'findingId', 'stages', 'limitation'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args, exec) { return fixFinding(process.cwd(), config, args.scan_id, args.finding_id, { changes: args.changes.map(change => ({ file: change.file, startLine: change.start_line, endLine: change.end_line, expectedText: change.expected_text, replacementText: change.replacement_text })), rationale: args.rationale, testPlan: args.test_plan }, args.approved, args.timeout_ms ?? 120_000, exec.signal) },
   }))
 
   ctx.tools.register(defineTool({

@@ -33,6 +33,7 @@ test('the suite composes with DSH registries and cleans up its native tool surfa
   assert.equal(names.includes('security_run_candidate_runtime_validation'), true)
   assert.equal(names.includes('security_run_candidate_validation_plan'), true)
   assert.equal(names.includes('security_run_remediation_verification'), true)
+  assert.equal(names.includes('security_fix_finding'), true)
   assert.equal(names.includes('security_rollback_remediation'), true)
   assert.equal(names.includes('security_tracking_advisory_preview'), true)
   assert.equal(names.includes('security_create_github_security_advisory'), true)
@@ -184,6 +185,11 @@ test('write tools require DSH user approval in addition to approved: true', asyn
     const missingVerificationAcknowledgement = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'remediation-verification-false' as never, name: 'security_run_remediation_verification', arguments: { scan_id: 'missing', remediation_id: 'missing', approved: false }, agent: {} as never })
     assert.equal(missingVerificationAcknowledgement.isError, true)
     assert.match(missingVerificationAcknowledgement.isError ? missingVerificationAcknowledgement.error.message : '', /requires approved: true/)
+    assert.equal(approvalRequests, 1)
+
+    const missingFixAcknowledgement = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'fix-false' as never, name: 'security_fix_finding', arguments: { scan_id: 'missing', finding_id: 'missing', changes: [], rationale: 'reviewed', test_plan: 'run focused tests', approved: false }, agent: {} as never })
+    assert.equal(missingFixAcknowledgement.isError, true)
+    assert.match(missingFixAcknowledgement.isError ? missingFixAcknowledgement.error.message : '', /requires approved: true/)
     assert.equal(approvalRequests, 1)
 
     const missingRuntimeAcknowledgement = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'runtime-validation-false' as never, name: 'security_run_candidate_runtime_validation', arguments: { scan_id: 'missing', candidate_id: 'missing', claim_token: 'missing', method: 'realistic_interface_reproduction', command: 'node repro.js', fixture_paths: ['repro.js'], setup_summary: 'A reviewed disposable local harness.', approved: false }, agent: {} as never })

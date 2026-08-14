@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import test from 'node:test'
-import { applyRemediationProposal, installPreCommitHook, loadRemediationRollback, planCandidateValidation, proposeReviewedRemediation, remediationPlan, resumeBulkJob, rollbackRemediationProposal, runCandidateRuntimeValidation, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, runRemediationVerification, startBulkCsvJob } from '../src/operations.ts'
+import { applyRemediationProposal, fixFinding, installPreCommitHook, loadRemediationRollback, planCandidateValidation, proposeReviewedRemediation, remediationPlan, resumeBulkJob, rollbackRemediationProposal, runCandidateRuntimeValidation, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, runRemediationVerification, startBulkCsvJob } from '../src/operations.ts'
 import { runScan } from '../src/scanner.ts'
 import { finalizeAndSaveScan, loadScan, renderFindingWriteup, saveScan, verifyScanBundle } from '../src/state.ts'
 import { claimAuditTask, recordValidation } from '../src/workbench.ts'
@@ -307,6 +307,26 @@ test('semantic findings retain a review-only remediation proposal instead of a b
     const proposal = await remediationPlan(root, { ...config, stateDir: state }, scan.id, scan.findings[0].id)
     assert.equal(proposal.safeToApply, false)
     await assert.rejects(() => applyRemediationProposal(root, { ...config, stateDir: state }, scan.id, proposal.id, true), /No mechanically safe replacement/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('standalone fix workflow keeps the formal gates and reports bounded verification outcome', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'package.json'), '{"scripts":{"test":"node --version","build":"node --version"}}\n')
+    const original = 'function route(req) { return eval(req.query.code) }\n'
+    await writeFile(join(root, 'app.ts'), original)
+    const scan = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, scan)
+    const finding = scan.findings[0]; const claim = await claimAuditTask(local, scan.id, 'fix-validator', 'validation'); assert.ok(claim)
+    await recordValidation(local, scan.id, finding.candidateId, { conclusion: 'reportable', method: 'static', attacker: 'Remote request sender.', entryPoint: 'Route query parameter.', trustBoundary: 'HTTP request to application execution.', rootControl: 'Dynamic evaluation statement.', sink: 'eval invocation.', impact: 'Attacker-controlled execution.', directEvidence: 'Request value reaches eval.', counterevidence: 'No local guard was found.', limitations: 'No runtime reproduction.', confidence: 'medium', sourceReferences: references(finding) }, claim.claimToken)
+    const validated = await loadScan(state, scan.id); const current = validated.findings.find(item => item.id === finding.id)!; const pathClaim = await claimAuditTask(local, scan.id, 'fix-path', 'attack_path'); assert.ok(pathClaim)
+    await (await import('../src/workbench.ts')).recordAttackPath(local, scan.id, current.candidateId, { attacker: 'Remote request sender.', entryPoint: 'HTTP route.', preconditions: 'Route is deployed.', dataflow: 'Request -> eval.', outcome: 'Code execution.', severityRationale: 'Remote source reaches sensitive sink.', changeConditions: 'A complete authorization boundary would change severity.', sourceReferences: references(current) }, pathClaim.claimToken)
+    const result = await fixFinding(root, local, scan.id, current.id, { changes: [{ file: 'app.ts', startLine: 1, endLine: 1, expectedText: original.trim(), replacementText: 'function route(_req) { return 1 }' }], rationale: 'Remove the dynamic execution boundary while preserving a deterministic safe response for this focused fixture.', testPlan: 'Run the package test command.' }, true)
+    assert.equal(result.outcome, 'fixed', JSON.stringify(result))
+    assert.equal(result.stages.every(stage => stage.status === 'passed'), true)
+    assert.match(await readFile(join(root, 'app.ts'), 'utf8'), /return 1/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

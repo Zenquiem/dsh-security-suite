@@ -42,7 +42,7 @@ test('deep candidate reports fail closed when the frozen source receipt drifts',
 })
 
 function deepWorkerContext(config: { stateDir: string }, reports: boolean, failAt?: number, closesCoverage = true) {
-  let created = 0; const restrictions: string[][] = []
+  let created = 0; const restrictions: string[][] = []; const prompts: string[] = []
   const ctx = {
     agents: {
       async create(options: { setup?: (ctx: { tools: { restrict(filter: { allow: string[] }): void }; systemPrompt: { section(section: { name: string }): void } }) => void }) {
@@ -51,7 +51,7 @@ function deepWorkerContext(config: { stateDir: string }, reports: boolean, failA
         options.setup?.({ tools: { restrict(filter) { restrictions.push(filter.allow) } }, systemPrompt: { section() {} } })
         return {
           agent: {
-            followup(message: { content: Array<{ type: string; text?: string }> }) { prompt = message.content[0]?.text ?? '' },
+            followup(message: { content: Array<{ type: string; text?: string }> }) { prompt = message.content[0]?.text ?? ''; prompts.push(prompt) },
             async whenIdle() {
               if (index === failAt) throw new Error('worker driver failed')
               if (!reports) return
@@ -69,7 +69,7 @@ function deepWorkerContext(config: { stateDir: string }, reports: boolean, failA
       },
     },
   }
-  return { ctx, count: () => created, restrictions }
+  return { ctx, count: () => created, restrictions, prompts }
 }
 
 test('deep discovery creates six native DSH workers per round and only saturates after a complete zero-novelty round', async () => {
@@ -88,7 +88,10 @@ test('deep discovery creates six native DSH workers per round and only saturates
     assert.equal(result.lifecycle, 'saturated')
     assert.deepEqual(result.rounds.map(round => round.status), ['complete', 'complete'])
     assert.deepEqual(result.rounds.map(round => round.novelty), [1, 0])
-    assert.deepEqual(new Set(result.workers.slice(0, 6).map(worker => worker.lens)).size, 6)
+    assert.equal(result.workers.slice(0, 6).every(worker => !('lens' in worker)), true)
+    const canonicalBriefs = fake.prompts.slice(0, 6).map(prompt => prompt.replace(/worker_id worker_1_\d+/g, 'worker_id <worker>').replace(/claim_token [0-9a-f-]+/g, 'claim_token <token>'))
+    assert.equal(new Set(canonicalBriefs).size, 1)
+    assert.equal(canonicalBriefs[0]?.includes('review lens'), false)
     assert.equal(result.canonicalThreatModel?.workerIds.length, 12)
     const persisted = await loadScan(state, scan.id)
     assert.equal(persisted.findings.some(finding => finding.ruleId === 'custom.delegated-sink'), true)

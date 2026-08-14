@@ -106,7 +106,8 @@ export function renderFindingWriteup(scan: ScanRecord, finding: Finding): string
   return `# ${finding.title}\n\n## Identity\n\n- Scan: \`${scan.id}\`\n- Finding: \`${finding.id}\`\n- Candidate: \`${finding.candidateId}\`\n- Snapshot: \`${scan.targetSnapshot.snapshotDigest}\`\n- CWE: ${finding.cwe}\n- Severity: ${finding.severity}\n- Confidence: ${finding.confidence}\n\n## Affected Code\n\n${locations || `- \`${location.file}:${location.line}\` (${location.role ?? 'root_control'})`}\n\n## Root Cause\n\n${finding.rootCause}\n\n## Evidence\n\n${evidence}\n\n## Validation\n\n${validation ? `- Method: ${validation.method}\n- Attacker: ${validation.attacker}\n- Entry point: ${validation.entryPoint}\n- Trust boundary: ${validation.trustBoundary}\n- Root control: ${validation.rootControl}\n- Sink: ${validation.sink}\n- Source references: ${citations(validation.sourceReferences)}${validation.runtimeReceiptRefs?.length ? `\n- Runtime receipts: ${validation.runtimeReceiptRefs.map(path => `\`${path}\``).join(', ')}` : ''}\n- Direct evidence: ${validation.directEvidence}\n- Counterevidence: ${validation.counterevidence}\n- Limitations: ${validation.limitations}` : finding.validation}\n\n## Attack Path\n\n${attackPath ? `- Attacker: ${attackPath.attacker}\n- Entry point: ${attackPath.entryPoint}\n- Preconditions: ${attackPath.preconditions}\n- Dataflow: ${attackPath.dataflow}\n- Source references: ${citations(attackPath.sourceReferences)}\n- Outcome: ${attackPath.outcome}\n- Severity rationale: ${attackPath.severityRationale}\n- Change conditions: ${attackPath.changeConditions}` : finding.attackPath}\n\n## Reproduction Status\n\n${reproduction}\n\n## Impact\n\n${finding.impact}\n\n## Remediation\n\n${finding.remediation}\n\n## Evidence Boundary\n\nThis report is generated only from this DSH scan's retained local evidence. It does not assert reachability, credentials, production configuration, or exploitability beyond the validation and attack-path records above.\n`
 }
 
-async function persistFindingWriteups(record: ScanRecord): Promise<void> {
+/** Reserve deterministic projection locations before canonical JSON is sealed. */
+function assignFindingWriteupMetadata(record: ScanRecord): void {
   for (const finding of record.findings.filter(item => item.disposition === 'reportable')) {
     const reportPath = writeupPath(finding)
     finding.writeup = {
@@ -115,8 +116,11 @@ async function persistFindingWriteups(record: ScanRecord): Promise<void> {
       evidenceDigest: writeupEvidenceDigest(finding),
       poc: { status: 'not_generated', rationale: 'No standalone exploit artifact is generated without bounded runtime evidence and an explicitly safe reproduction environment.' },
     }
-    await writeArtifact(record, reportPath, renderFindingWriteup(record, finding))
   }
+}
+
+async function persistFindingWriteups(record: ScanRecord): Promise<void> {
+  for (const finding of record.findings.filter(item => item.disposition === 'reportable')) await writeArtifact(record, finding.writeup?.reportPath ?? writeupPath(finding), renderFindingWriteup(record, finding))
 }
 
 function hardeningOpportunity(findings: Finding[]): { title: string; invariant: string; evidence: Finding[] } | undefined {
@@ -136,18 +140,61 @@ function hardeningEvidenceDigest(findings: Finding[]): string {
 }
 
 /** Generate the scan's derived hardening portfolio from surviving local evidence. */
-export async function generateDerivedHardening(record: ScanRecord): Promise<DerivedHardening | undefined> {
+function deriveHardening(record: ScanRecord): DerivedHardening | undefined {
   const findings = record.findings.filter(finding => finding.disposition === 'reportable')
   if (!findings.length) return undefined
-  const opportunity = hardeningOpportunity(findings); const evidence = opportunity?.evidence ?? []
+  const opportunity = hardeningOpportunity(findings)
   const outcome: DerivedHardening['outcome'] = opportunity ? 'structural_hardening_recommended' : 'local_remediation_preferred'
   const portfolioPath = 'hardening/hardening.md'; const structuredPath = 'hardening/hardening.json'
   const evidenceDigest = hardeningEvidenceDigest(findings)
-  const structured = { scanId: record.id, outcome, evidenceDigest, evidence: evidence.map(finding => ({ findingId: finding.id, title: finding.title, ruleId: finding.ruleId, location: finding.locations[0], writeupPath: finding.writeup?.reportPath })), opportunities: opportunity ? [{ id: opportunity.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, ''), title: opportunity.title, violatedInvariant: opportunity.invariant, options: [{ id: 'central-owned-boundary', title: 'Central owned enforcement boundary', securityEffect: 'Moves duplicated or implicit controls into one reviewed owner.', tradeoffs: { performance: 'One additional wrapper or policy check on sensitive paths.', reliability: 'Central owner must fail closed and be observable.', migration: 'Incremental migration with old callsites rejected after adoption.' } }, { id: 'local-strengthening', title: 'Strengthen each local callsite', securityEffect: 'Addresses observed sites without a larger ownership change.', tradeoffs: { performance: 'Minimal runtime overhead.', reliability: 'Control drift remains likely as new callsites are added.', migration: 'Low immediate disruption but repeated review work.' } }] }] : [], limitations: record.coverage.deferred }
-  const portfolio = ['# Security Hardening Portfolio', '', `- Scan: \`${record.id}\``, `- Outcome: ${outcome}`, `- Evidence digest: \`${evidenceDigest}\``, '', '## Evidence', ...(evidence.length ? evidence.map(finding => `- [${finding.title}](../${finding.writeup?.reportPath ?? ''}) at \`${finding.locations[0].file}:${finding.locations[0].line}\`: ${finding.rootCause}`) : findings.map(finding => `- [${finding.title}](../${finding.writeup?.reportPath ?? ''}) at \`${finding.locations[0].file}:${finding.locations[0].line}\`.`)), '', '## Assessment', opportunity ? `The observed evidence indicates that ${opportunity.title.toLowerCase()}. The proposed invariant is: ${opportunity.invariant}` : 'The current evidence favors focused local remediations. A larger design change would not be justified without repeated or cross-boundary evidence.', '', '## Options', ...(opportunity ? ['1. **Central owned enforcement boundary**: move the sensitive control into one reviewed API; retain focused fixes during migration.', '2. **Local strengthening**: patch each observed callsite; lower disruption but retain drift risk.', '', '## Recommendation', 'Adopt the central boundary when the affected operations are expected to grow or are owned by multiple components. Prefer local strengthening when the evidence remains isolated and the migration cost is disproportionate.'] : ['Use the verified local remediation plan for each finding, then rescan before considering architectural changes.'])].join('\n') + '\n'
-  await writeArtifact(record, portfolioPath, portfolio)
-  await writeArtifact(record, structuredPath, json(structured))
   return { outcome, portfolioPath, structuredPath, evidenceDigest }
+}
+
+function hardeningMaterial(record: ScanRecord, derived: DerivedHardening): { context: string; structured: Record<string, unknown>; portfolio: string; proposal?: { path: string; content: string }; diagrams: Array<{ path: string; content: string }> } {
+  const findings = record.findings.filter(finding => finding.disposition === 'reportable')
+  const opportunity = hardeningOpportunity(findings); const evidence = opportunity?.evidence ?? []
+  const evidenceRows = findings.map(finding => ({ id: finding.id, title: finding.title, ruleId: finding.ruleId, location: finding.locations[0], writeupPath: finding.writeup?.reportPath, rootCause: finding.rootCause, impact: finding.impact }))
+  const context = ['# Hardening Evidence Context', '', `- Scan: \`${record.id}\``, `- Snapshot: \`${record.targetSnapshot.snapshotDigest}\``, `- Evidence digest: \`${derived.evidenceDigest}\``, '', '## Findings', ...evidenceRows.map(row => `- **${row.title}** (\`${row.id}\`, ${row.ruleId}, \`${row.location.file}:${row.location.line}\`): ${row.rootCause} Impact: ${row.impact}`), '', '## Evidence Limits', ...(record.coverage.deferred.length ? record.coverage.deferred.map(row => `- ${row.reason}`) : ['- No deferred coverage was recorded.']), ''].join('\n')
+  if (!opportunity) {
+    const structured = { schemaVersion: 'dsh-security-suite.hardening/v1', scanId: record.id, outcome: derived.outcome, evidenceDigest: derived.evidenceDigest, evidence: evidenceRows, opportunities: [], limitations: record.coverage.deferred }
+    return { context, structured, portfolio: ['# Security Hardening Portfolio', '', `- Scan: \`${record.id}\``, `- Outcome: ${derived.outcome}`, '', '## Assessment', 'The surviving evidence does not show a repeated control owner or a privileged choke point whose architectural change is justified. Focused remediation remains proportionate; this portfolio does not claim that a local patch has resolved any finding.', '', '## Evidence', ...evidenceRows.map(row => `- [${row.title}](../${row.writeupPath ?? ''}) at \`${row.location.file}:${row.location.line}\`.`), '', '## Follow-up', 'Apply and independently validate each reviewed remediation, then rescan the affected paths before considering structural changes.', ''].join('\n'), diagrams: [] }
+  }
+  const opportunityId = opportunity.title.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+  const options = [
+    { id: 'central-owned-boundary', title: 'Central owned enforcement boundary', securityEffect: 'Moves each observed sensitive operation behind one reviewed owner that applies the invariant before the sink.', tradeoffs: { performance: 'Adds one explicit boundary call; measure latency on the affected request or job path.', memory: 'No inherent additional retention beyond the boundary context.', reliability: 'The owner must fail closed and expose rejected decisions.', operations: 'Adds one policy surface to observe and audit.', migration: 'Incremental migration can reject legacy callsites after coverage is complete.', rollback: 'Keep the existing local guard during migration and route traffic back if the owner regresses.' } },
+    { id: 'local-strengthening', title: 'Strengthen each local callsite', securityEffect: 'Addresses every currently observed callsite while retaining the existing distributed ownership model.', tradeoffs: { performance: 'Minimal runtime overhead.', memory: 'No architectural allocation change expected.', reliability: 'Each new callsite can drift from the intended control.', operations: 'Lower immediate operational change but repeated review work.', migration: 'Small, independently deployable patches.', rollback: 'Revert individual patches if focused regression tests fail.' } },
+  ]
+  const before = ['flowchart LR', '  A[Untrusted or lower-trust input] --> B[Distributed caller]', '  B --> C[Sensitive operation]', '  D[Local control, if present] -. varies by caller .-> C', ''].join('\n')
+  const after = ['flowchart LR', '  A[Untrusted or lower-trust input] --> B[Caller]', '  B --> P[Owned security boundary]', '  P -->|invariant enforced| C[Sensitive operation]', '  P -->|reject and observe| R[Safe failure]', ''].join('\n')
+  const proposalPath = `hardening/proposals/${opportunityId}.md`
+  const optionLines = options.flatMap((option, index) => [
+    `### ${index + 1}. ${option.title}`, '', `${option.securityEffect} This option remains a proposal; the original findings require their own remediation and validation.`, '',
+    '| Dimension | Expected direction | Basis and validation |', '| --- | --- | --- |',
+    `| Security | ${option.securityEffect} | Source-derived from the retained finding paths; rescan and add focused regressions. |`,
+    `| Performance | ${option.tradeoffs.performance} | Measure the affected request or job path before rollout. |`,
+    `| Memory | ${option.tradeoffs.memory} | Inspect retained boundary context under representative load. |`,
+    `| Reliability | ${option.tradeoffs.reliability} | Exercise reject, fail-open prevention, and recovery paths. |`,
+    `| Operations | ${option.tradeoffs.operations} | Add logs/metrics for allow, deny, and error outcomes. |`,
+    `| Migration | ${option.tradeoffs.migration} | Gate completion on inventorying all known callers. |`,
+    `| Rollback | ${option.tradeoffs.rollback} | Test rollback before expanding rollout. |`, '',
+  ])
+  const proposalLines = ['# ' + opportunity.title, '', '## Evidence', ...evidence.map(finding => `- **${finding.title}** (\`${finding.id}\`) at \`${finding.locations[0].file}:${finding.locations[0].line}\` establishes: ${finding.rootCause}`), '', '## Observed', `The evidence shows that ${opportunity.title.toLowerCase()}. This is an observed pattern in the scan evidence, not a claim that every similar path is vulnerable.`, '', '## Desired Invariant', opportunity.invariant, '', '## Options', ...optionLines, '## Recommendation', 'Adopt option 1 when this control is expected to grow across components or when ownership ambiguity is itself the recurring risk. Prefer option 2 when the evidence remains isolated and migration cost outweighs the measurable reduction in drift. The recommendation changes if further coverage shows the control is already centrally owned or the affected operations are intentionally independent.', '', '## Implementation Conditions', '- Preserve tactical fixes while migrating.', '- Add a regression for each evidence-backed source-to-sink path.', '- Run the original scan and validation workflow after implementation.', '- Do not mark a finding resolved until its original path is independently revalidated.', '']
+  const proposal = proposalLines.join('\n')
+  const structured = { schemaVersion: 'dsh-security-suite.hardening/v1', scanId: record.id, outcome: derived.outcome, evidenceDigest: derived.evidenceDigest, evidence: evidenceRows, opportunities: [{ id: opportunityId, title: opportunity.title, observed: `Repeated or privileged control evidence was found in ${evidence.length} reportable finding(s).`, violatedInvariant: opportunity.invariant, proposalPath, diagrams: { before: `diagrams/${opportunityId}-before.mmd`, after: `diagrams/${opportunityId}-after.mmd` }, options }], limitations: record.coverage.deferred }
+  const portfolio = ['# Security Hardening Portfolio', '', `- Scan: \`${record.id}\``, `- Outcome: ${derived.outcome}`, `- Evidence digest: \`${derived.evidenceDigest}\``, '', '## Decision Summary', `The recorded evidence supports one structural opportunity: **${opportunity.title}**. The proposed invariant is: ${opportunity.invariant}`, '', '## Evidence', ...evidence.map(finding => `- [${finding.title}](../${finding.writeup?.reportPath ?? ''}) at \`${finding.locations[0].file}:${finding.locations[0].line}\`: ${finding.rootCause}`), '', '## Options', ...options.map((option, index) => `${index + 1}. **${option.title}**: ${option.securityEffect}`), '', '## Recommendation', `Read [the full proposal](./proposals/${opportunityId}.md) before selecting an option. The diagrams at [before](./diagrams/${opportunityId}-before.mmd) and [after](./diagrams/${opportunityId}-after.mmd) compare the control ownership change. This portfolio is design guidance, not evidence that a finding has been remediated.`, ''].join('\n')
+  return { context, structured, portfolio, proposal: { path: proposalPath, content: proposal }, diagrams: [{ path: `hardening/diagrams/${opportunityId}-before.mmd`, content: before }, { path: `hardening/diagrams/${opportunityId}-after.mmd`, content: after }] }
+}
+
+export async function generateDerivedHardening(record: ScanRecord): Promise<DerivedHardening | undefined> {
+  const derived = deriveHardening(record)
+  if (!derived) return undefined
+  const material = hardeningMaterial(record, derived)
+  await writeArtifact(record, 'hardening/context.md', material.context)
+  await writeArtifact(record, derived.portfolioPath, material.portfolio)
+  await writeArtifact(record, derived.structuredPath, json(material.structured))
+  if (material.proposal) await writeArtifact(record, material.proposal.path, material.proposal.content)
+  for (const diagram of material.diagrams) await writeArtifact(record, diagram.path, diagram.content)
+  return derived
 }
 
 function coverageDocument(scan: ScanRecord): Record<string, unknown> {
@@ -192,7 +239,9 @@ async function inventoryArtifacts(record: ScanRecord, exclude: Set<string> = new
       if (entry.isDirectory()) { await visit(absolute); continue }
       if (!entry.isFile()) continue
       const path = relative(root, absolute).replaceAll('\\', '/')
-      if (!exclude.has(path)) paths.push(path)
+      // Readable reports are deterministic projections of sealed JSON/evidence,
+      // never evidence inputs. They may be regenerated after finalization.
+      if (!exclude.has(path) && path !== 'report.md' && !path.startsWith('findings/') && !path.startsWith('hardening/')) paths.push(path)
     }
   }
   await visit(root)
@@ -203,8 +252,8 @@ async function inventoryArtifacts(record: ScanRecord, exclude: Set<string> = new
 
 export async function persistScanBundle(stateDir: string, record: ScanRecord): Promise<ScanRecord> {
   if (!record.artifacts.directory) record.artifacts.directory = scanArtifactDir(stateDir, record.target, record.id)
-  const root = resolve(record.artifacts.directory); await mkdir(root, { recursive: true }); await persistFindingWriteups(record)
-  const hardening = await generateDerivedHardening(record)
+  const root = resolve(record.artifacts.directory); await mkdir(root, { recursive: true }); assignFindingWriteupMetadata(record)
+  const hardening = deriveHardening(record)
   record.hardening = hardening && { ...hardening, generatedAt: new Date().toISOString() }
   await Promise.all(record.findings.map(async finding => {
     const base = `artifacts/05_findings/${finding.candidateId}`
@@ -226,9 +275,9 @@ export async function persistScanBundle(stateDir: string, record: ScanRecord): P
   const findingsRef = await writeArtifact(record, 'findings.json', json(findingsDocument(record)))
   record.artifacts = { directory: root, manifest: 'scan-manifest.json', findings: findingsRef, coverage: coverageRef, report: 'report.md' }
   record.seal = sealScan(record)
-  await writeArtifact(record, 'report.md', renderMarkdownReport(record))
   const artifacts = await inventoryArtifacts(record, new Set(['scan-manifest.json']))
   await writeArtifact(record, 'scan-manifest.json', json(manifestDocument(record, artifacts)))
+  await regenerateScanProjections(record)
   return record
 }
 
@@ -265,13 +314,10 @@ export async function finalizeAndSaveScan(stateDir: string, record: ScanRecord):
 export async function verifyScanBundle(record: ScanRecord): Promise<{ valid: boolean; errors: string[] }> {
   const errors: string[] = []
   if (!verifySeal(record)) errors.push('Scan state seal does not match.')
-  if (!record.artifacts.manifest || !record.artifacts.findings || !record.artifacts.coverage || !record.artifacts.report) errors.push('Scan bundle paths are incomplete.')
+  if (!record.artifacts.manifest || !record.artifacts.findings || !record.artifacts.coverage) errors.push('Canonical scan bundle paths are incomplete.')
   if (record.findings.some(finding => finding.disposition === 'reportable') && !record.hardening) errors.push('Reportable findings require a derived hardening portfolio.')
   if (record.hardening) {
     if (record.hardening.evidenceDigest !== hardeningEvidenceDigest(record.findings.filter(finding => finding.disposition === 'reportable'))) errors.push('Derived hardening portfolio evidence digest is stale.')
-    for (const path of [record.hardening.portfolioPath, record.hardening.structuredPath]) {
-      try { await readArtifact(record, path) } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
-    }
   }
   for (const candidate of record.findings) {
     const phases = new Set(candidate.ledger.map(item => item.phase))
@@ -280,16 +326,10 @@ export async function verifyScanBundle(record: ScanRecord): Promise<{ valid: boo
     if (candidate.disposition === 'reportable' && !phases.has('attack_path')) errors.push(`${candidate.candidateId} has no attack-path receipt.`)
     if (candidate.disposition === 'reportable') {
       if (!candidate.writeup) errors.push(`${candidate.candidateId} has no derived vulnerability report.`)
-      else {
-        try {
-          const content = await readArtifact(record, candidate.writeup.reportPath)
-          if (!content.includes(`Finding: \`${candidate.id}\``)) errors.push(`${candidate.candidateId} vulnerability report does not identify its finding.`)
-          if (candidate.writeup.evidenceDigest !== writeupEvidenceDigest(candidate)) errors.push(`${candidate.candidateId} vulnerability report evidence digest is stale.`)
-        } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
-      }
+      else if (candidate.writeup.evidenceDigest !== writeupEvidenceDigest(candidate)) errors.push(`${candidate.candidateId} vulnerability report metadata is stale.`)
     }
   }
-  for (const path of [record.artifacts.manifest, record.artifacts.findings, record.artifacts.coverage, record.artifacts.report].filter(Boolean) as string[]) {
+  for (const path of [record.artifacts.manifest, record.artifacts.findings, record.artifacts.coverage].filter(Boolean) as string[]) {
     try { await readArtifact(record, path) } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
   }
   if (record.artifacts.manifest) {
@@ -306,7 +346,7 @@ export async function verifyScanBundle(record: ScanRecord): Promise<{ valid: boo
           seen.add(item.path)
           try { if (sha256(await readArtifact(record, item.path)) !== item.sha256) errors.push(`Artifact digest mismatch: ${item.path}.`) } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
         }
-        for (const canonical of [record.artifacts.findings, record.artifacts.coverage, record.artifacts.report]) if (canonical && !seen.has(canonical)) errors.push(`Manifest does not seal canonical artifact ${canonical}.`)
+        for (const canonical of [record.artifacts.findings, record.artifacts.coverage]) if (canonical && !seen.has(canonical)) errors.push(`Manifest does not seal canonical artifact ${canonical}.`)
         try {
           const actual = await inventoryArtifacts(record, new Set([record.artifacts.manifest]))
           const actualPaths = new Set(actual.map(item => item.path))
@@ -316,6 +356,26 @@ export async function verifyScanBundle(record: ScanRecord): Promise<{ valid: boo
       }
     } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
   }
+  return { valid: errors.length === 0, errors }
+}
+
+/** Restore unsealed Markdown/JSON projections from immutable canonical scan data. */
+export async function regenerateScanProjections(record: ScanRecord): Promise<{ report: string; writeups: string[]; hardening?: string }> {
+  await persistFindingWriteups(record)
+  const hardening = await generateDerivedHardening(record)
+  await writeArtifact(record, record.artifacts.report ?? 'report.md', renderMarkdownReport(record))
+  return { report: record.artifacts.report ?? 'report.md', writeups: record.findings.filter(finding => finding.disposition === 'reportable').map(finding => finding.writeup?.reportPath ?? writeupPath(finding)), hardening: hardening?.portfolioPath }
+}
+
+/** Validate derived report projections without treating them as canonical evidence. */
+export async function verifyScanProjections(record: ScanRecord): Promise<{ valid: boolean; errors: string[] }> {
+  const errors: string[] = []
+  try { const report = await readArtifact(record, record.artifacts.report ?? 'report.md'); if (!report.includes(`# Security Review: DSH Security Suite`)) errors.push('Primary report has an unexpected format.') } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
+  for (const finding of record.findings.filter(item => item.disposition === 'reportable')) {
+    if (!finding.writeup) { errors.push(`${finding.candidateId} has no derived vulnerability report metadata.`); continue }
+    try { const content = await readArtifact(record, finding.writeup.reportPath); if (!content.includes(`Finding: \`${finding.id}\``)) errors.push(`${finding.candidateId} vulnerability report does not identify its finding.`) } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
+  }
+  if (record.hardening) for (const path of [record.hardening.portfolioPath, record.hardening.structuredPath]) try { await readArtifact(record, path) } catch (error) { errors.push(error instanceof Error ? error.message : String(error)) }
   return { valid: errors.length === 0, errors }
 }
 

@@ -6,7 +6,7 @@ import { join } from 'node:path'
 import { promisify } from 'node:util'
 import test from 'node:test'
 import { assessDirectory, resolveSafeTarget, runDiffScan, runScan } from '../src/scanner.ts'
-import { finalizeAndSaveScan, loadScan, renderCsv, saveScan, saveTriageAnnotation, toSarif, verifyScanBundle, verifySeal } from '../src/state.ts'
+import { finalizeAndSaveScan, loadScan, regenerateScanProjections, renderCsv, saveScan, saveTriageAnnotation, toSarif, verifyScanBundle, verifyScanProjections, verifySeal } from '../src/state.ts'
 import { claimAuditTask, completeScan, recordAttackPath, recordValidation } from '../src/workbench.ts'
 
 const execFileAsync = promisify(execFile)
@@ -1321,13 +1321,15 @@ test('completed scan persists canonical artifacts and candidate-ledger phase rec
     assert.match(await readFile(join(loaded.artifacts.directory, reportable.writeup.reportPath), 'utf8'), /No executable PoC is generated/)
     assert.match(await readFile(join(loaded.artifacts.directory, loaded.artifacts.report!), 'utf8'), new RegExp(reportable.writeup.reportPath.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
     await rm(join(loaded.artifacts.directory, loaded.hardening.portfolioPath))
-    const missingHardening = await verifyScanBundle(loaded)
-    assert.equal(missingHardening.valid, false)
-    assert.equal(missingHardening.errors.some(error => error.includes(loaded.hardening!.portfolioPath)), true)
     await rm(join(loaded.artifacts.directory, reportable.writeup.reportPath))
-    const afterDeletion = await verifyScanBundle(loaded)
-    assert.equal(afterDeletion.valid, false)
-    assert.equal(afterDeletion.errors.some(error => error.includes(reportable.writeup!.reportPath)), true)
+    await writeFile(join(loaded.artifacts.directory, loaded.artifacts.report!), 'tampered projection\n')
+    const canonicalAfterProjectionMutation = await verifyScanBundle(loaded)
+    assert.equal(canonicalAfterProjectionMutation.valid, true, canonicalAfterProjectionMutation.errors.join('\n'))
+    const staleProjections = await verifyScanProjections(loaded)
+    assert.equal(staleProjections.valid, false)
+    await regenerateScanProjections(loaded)
+    const restoredProjections = await verifyScanProjections(loaded)
+    assert.equal(restoredProjections.valid, true, restoredProjections.errors.join('\n'))
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

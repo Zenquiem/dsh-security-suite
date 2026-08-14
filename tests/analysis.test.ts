@@ -184,6 +184,13 @@ test('hardening portfolio records a structural recommendation from surviving sca
     const portfolio = await generateHardeningPortfolio({ ...limits, stateDir: state }, scan.id)
     assert.equal(portfolio.outcome, 'structural_hardening_recommended')
     assert.match(await readFile(portfolio.portfolio, 'utf8'), /centralize/i)
-    assert.match(await readFile(portfolio.structured, 'utf8'), /central-owned-boundary/)
+    const structured = await readFile(portfolio.structured, 'utf8')
+    assert.match(structured, /central-owned-boundary/)
+    assert.match(structured, /"memory"/)
+    const opportunityId = JSON.parse(structured).opportunities[0].id as string
+    assert.match(await readFile(join(portfolio.directory, 'context.md'), 'utf8'), /Hardening Evidence Context/)
+    assert.match(await readFile(join(portfolio.directory, 'proposals', `${opportunityId}.md`), 'utf8'), /Implementation Conditions/)
+    assert.match(await readFile(join(portfolio.directory, 'diagrams', `${opportunityId}-before.mmd`), 'utf8'), /flowchart LR/)
+    assert.match(await readFile(join(portfolio.directory, 'diagrams', `${opportunityId}-after.mmd`), 'utf8'), /Owned security boundary/)
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })

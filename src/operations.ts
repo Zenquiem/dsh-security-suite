@@ -28,6 +28,7 @@ export interface RemediationVerification { scanId: string; status: 'not_detected
 export interface RemediationVerificationRun { id: string; remediationId: string; sourceScanId: string; snapshotDigest: string; commands: Array<{ command: string; reason: string }>; receipts: CommandReceipt[]; outcome: 'passed' | 'failed'; executedAt: string; artifactRef: string; limitation: string }
 export interface RemediationProposal { id: string; findingId: string; file: string; line: number; patch: string; baseSnapshotDigest: string; baseFileSha256: string; baseFiles?: RemediationFileSnapshot[]; createdAt: string; status: 'proposed' | 'applied' | 'rolled_back' | 'stale' | 'superseded'; requiresApproval: true; requiresReview: true; safeToApply: boolean; rationale: string; testPlan?: string; replacement?: RemediationReplacement; replacements?: RemediationReplacement[]; appliedAt?: string; verificationScanId?: string; verification?: RemediationVerification; postApplyVerification?: RemediationVerificationRun; rollbackId?: string }
 export interface RemediationRollback { id: string; remediationId: string; scanId: string; file: string; beforeContent: string; beforeSha256: string; appliedSha256: string; files?: RemediationRollbackFile[]; appliedSnapshotDigest: string; createdAt: string; status: 'available' | 'rolled_back' | 'stale'; rolledBackAt?: string; verificationScanId?: string }
+export interface FixFindingResult { outcome: 'fixed' | 'no_change' | 'blocked'; scanId: string; findingId: string; remediationId?: string; verification?: RemediationVerificationRun; stages: Array<{ name: 'scope' | 'proposal' | 'apply' | 'verification'; status: 'passed' | 'failed' | 'unknown'; detail: string }>; limitation: string }
 
 export interface BulkResult { path: string; scanId?: string; findings?: number; error?: string }
 export interface BulkJob { id: string; createdAt: string; updatedAt: string; mode: 'standard' | 'deep'; threatModel: string; entries: Array<BulkResult & { status: 'pending' | 'completed' | 'failed'; attempts: number }> }
@@ -415,6 +416,35 @@ export async function runRemediationVerification(workspace: string, config: Conf
   await atomicWrite(artifactRef, `${JSON.stringify(run, null, 2)}\n`)
   proposal.postApplyVerification = run; await saveProposal(state, proposal)
   return run
+}
+
+/**
+ * Run the complete DSH-native fix workflow for one already reportable finding.
+ * Source edits remain exact-range, snapshot-bound, approval-gated, reversible,
+ * and are never described as resolved solely because a rescan passes.
+ */
+export async function fixFinding(workspace: string, config: Config, scanId: string, findingId: string, input: { changes: Array<{ file: string; startLine: number; endLine: number; expectedText: string; replacementText: string }>; rationale: string; testPlan: string }, approved: boolean, timeoutMs = 120_000, signal?: AbortSignal): Promise<FixFindingResult> {
+  const state = getStateDir(config.stateDir); const scan = await loadScan(state, scanId); const finding = scan.findings.find(item => item.id === findingId)
+  if (!finding) throw new Error('Finding was not found in this scan.')
+  if (finding.disposition !== 'reportable' || !finding.validationRecord || !finding.attackPathRecord) return { outcome: 'no_change', scanId, findingId, stages: [{ name: 'scope', status: 'failed', detail: 'The finding is not a formally reportable, validated finding; no source change was attempted.' }], limitation: 'Only a reportable finding with validation and attack-path receipts can enter the standalone fix workflow.' }
+  const stages: FixFindingResult['stages'] = [{ name: 'scope', status: 'passed', detail: `Validated ${finding.title} with source-bound validation and attack-path receipts.` }]
+  const proposal = await proposeReviewedRemediation(workspace, config, scanId, findingId, { changes: input.changes, rationale: input.rationale, testPlan: input.testPlan })
+  stages.push({ name: 'proposal', status: proposal.safeToApply ? 'passed' : 'failed', detail: proposal.safeToApply ? 'Exact replacement ranges and source snapshot are frozen.' : 'The supplied patch is not mechanically safe to apply.' })
+  if (!proposal.safeToApply) return { outcome: 'blocked', scanId, findingId, remediationId: proposal.id, stages, limitation: 'The patch proposal is not mechanically safe; no source file was changed.' }
+  if (!approved) return { outcome: 'blocked', scanId, findingId, remediationId: proposal.id, stages, limitation: 'Reviewed acknowledgement is required before the DSH approval gate can authorize source mutation.' }
+  signal?.throwIfAborted()
+  const applied = await applyRemediationProposal(workspace, config, scanId, proposal.id, true)
+  stages.push({ name: 'apply', status: applied.status === 'applied' ? 'passed' : 'failed', detail: `Applied exact patch with rollback record ${applied.rollbackId ?? 'unavailable'}.` })
+  if (applied.status !== 'applied') return { outcome: 'blocked', scanId, findingId, remediationId: proposal.id, stages, limitation: 'The patch did not reach applied state.' }
+  try {
+    const verification = await runRemediationVerification(workspace, config, scanId, proposal.id, true, timeoutMs, signal)
+    const verificationPassed = verification.outcome === 'passed' && applied.verification?.status === 'not_detected'
+    stages.push({ name: 'verification', status: verificationPassed ? 'passed' : 'failed', detail: verificationPassed ? 'Bounded project checks passed and the native rescan no longer detected the original rule family.' : 'Project checks or the native rescan did not establish closure.' })
+    return { outcome: verificationPassed ? 'fixed' : 'blocked', scanId, findingId, remediationId: proposal.id, verification, stages, limitation: 'Even a fixed result is limited to this source snapshot and bounded checks; independently revalidate deployment reachability and legitimate behavior before resolving the finding.' }
+  } catch (error) {
+    stages.push({ name: 'verification', status: 'unknown', detail: error instanceof Error ? error.message : String(error) })
+    return { outcome: 'blocked', scanId, findingId, remediationId: proposal.id, stages, limitation: 'The patch is applied and rollback remains available, but the required bounded verification could not complete.' }
+  }
 }
 
 /** Restore one proposal's exact pre-application content only when its applied state remains intact. */
