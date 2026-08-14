@@ -397,7 +397,7 @@ export function apply(ctx: Context, config: PluginConfig): void {
 
   ctx.tools.register(defineTool({
     name: 'security_review_diff',
-    description: 'Perform a read-only native Git diff candidate review. It analyzes added code and added JS/TS, Python, Go, Java, C#, PHP, Ruby, C, C++, or Rust call paths into local sink wrappers; detects GitHub Actions pull_request_target shell interpolation, broad permissions, mutable action references, and pull-request-head checkout before execution; detects deleted authorization or input-validation controls; saves a validation investigation; and never auto-confirms static candidates.',
+    description: 'Perform a read-only native Git diff candidate review across staged, unstaged, and eligible untracked source changes. It analyzes added code and added JS/TS, Python, Go, Java, C#, PHP, Ruby, C, C++, or Rust call paths into local sink wrappers; detects GitHub Actions pull_request_target shell interpolation, broad permissions, mutable action references, and pull-request-head checkout before execution; detects deleted authorization or input-validation controls; saves a validation investigation; and never auto-confirms static candidates.',
     parameters: {
       base: { type: 'string', description: 'Optional Git base ref. Defaults to the working tree diff.' },
     },

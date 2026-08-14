@@ -977,10 +977,34 @@ export async function runScan(directory: string, limits: ScanLimits, mode: 'stan
 
 export function resolveSafeTarget(workspace: string, requested: string | undefined): string { const root = resolve(workspace); const target = resolve(root, requested ?? '.'); if (!isContained(root, target)) throw new Error('Scan target must remain inside the current workspace.'); return target }
 
+async function boundedGitDiff(workspace: string, args: string[], allowDifferenceExit = false): Promise<{ output: string; truncated: boolean }> {
+  try {
+    const { stdout } = await execFileAsync('git', args, { cwd: resolve(workspace), encoding: 'utf8', maxBuffer: MAX_DIFF_BYTES + 1 })
+    return { output: stdout.slice(0, MAX_DIFF_BYTES), truncated: Buffer.byteLength(stdout, 'utf8') > MAX_DIFF_BYTES }
+  } catch (error) {
+    const output = (error as { stdout?: unknown }).stdout
+    if (typeof output === 'string' && (allowDifferenceExit || Buffer.byteLength(output, 'utf8') >= MAX_DIFF_BYTES)) return { output: output.slice(0, MAX_DIFF_BYTES), truncated: Buffer.byteLength(output, 'utf8') >= MAX_DIFF_BYTES }
+    throw error
+  }
+}
+
 export async function reviewGitDiff(workspace: string, base: string | undefined): Promise<{ mode: string; diff: string; truncated: boolean }> {
   if (base !== undefined && (!/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(base) || base.startsWith('-'))) throw new Error('Git base ref contains unsupported characters.')
-  const args = ['diff', '--no-ext-diff', '--unified=20']; const mode = base === undefined ? 'working-tree' : `base:${base}`; if (base !== undefined) args.push(`${base}...HEAD`)
-  const { stdout } = await execFileAsync('git', args, { cwd: resolve(workspace), encoding: 'utf8', maxBuffer: MAX_DIFF_BYTES + 1 }); return { mode, diff: stdout.slice(0, MAX_DIFF_BYTES), truncated: Buffer.byteLength(stdout, 'utf8') > MAX_DIFF_BYTES }
+  const args = ['diff', '--no-ext-diff', '--unified=20']; const mode = base === undefined ? 'working-tree' : `base:${base}`
+  // Comparing against HEAD includes both staged and unstaged worktree changes.
+  if (base === undefined) args.push('HEAD'); else args.push(`${base}...HEAD`)
+  const primary = await boundedGitDiff(workspace, args); let diff = primary.output; let truncated = primary.truncated
+  if (base !== undefined || truncated) return { mode, diff, truncated }
+  const { stdout: listed } = await execFileAsync('git', ['ls-files', '--others', '--exclude-standard', '-z'], { cwd: resolve(workspace), encoding: 'utf8', maxBuffer: MAX_DIFF_BYTES + 1 })
+  for (const path of listed.split('\0').filter(Boolean)) {
+    if (!TEXT_EXTENSIONS.has(extname(path).toLowerCase()) && !isGitHubWorkflow(path)) continue
+    const remaining = MAX_DIFF_BYTES - Buffer.byteLength(diff, 'utf8'); if (remaining <= 0) return { mode, diff, truncated: true }
+    const addition = await boundedGitDiff(workspace, ['diff', '--no-index', '--no-ext-diff', '--unified=20', '--', '/dev/null', path], true)
+    if (Buffer.byteLength(addition.output, 'utf8') > remaining) { diff += addition.output.slice(0, remaining); return { mode, diff, truncated: true } }
+    diff += addition.output; truncated ||= addition.truncated
+    if (truncated) return { mode, diff, truncated }
+  }
+  return { mode, diff, truncated }
 }
 
 export async function runDiffScan(workspace: string, base: string | undefined, threatModel: string, stateDirectory = '', _legacyAutomaticValidation?: false): Promise<ScanRecord> {

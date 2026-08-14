@@ -627,6 +627,28 @@ test('diff scan distinguishes added risks from deleted authorization and input c
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
+test('working-tree diff review includes staged and untracked source changes', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-worktree-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'safe.ts'), 'export const safe = true\n')
+    await execFileAsync('git', ['add', 'safe.ts'], { cwd: root })
+    await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'staged.ts'), 'export function staged(req) { return eval(req.query.code) }\n')
+    await execFileAsync('git', ['add', 'staged.ts'], { cwd: root })
+    await writeFile(join(root, 'untracked.ts'), 'export function untracked(req) { return eval(req.query.code) }\n')
+    const scan = await runDiffScan(root, undefined, '', state)
+    assert.equal(scan.coverage.mode, 'diff')
+    assert.equal(scan.coverage.surfaces[0]?.label, 'working-tree')
+    assert.equal(scan.findings.some(finding => finding.locations[0]?.file === 'staged.ts' && finding.ruleId === 'dangerous.dynamic.code'), true)
+    assert.equal(scan.findings.some(finding => finding.locations[0]?.file === 'untracked.ts' && finding.ruleId === 'dangerous.dynamic.code'), true)
+    assert.deepEqual(scan.coverage.receipts.map(receipt => receipt.path).sort(), ['staged.ts', 'untracked.ts'])
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
 test('open diff investigations retain candidates but require independent validation before reportability', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-open-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
