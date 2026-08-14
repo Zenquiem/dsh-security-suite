@@ -124,10 +124,15 @@ export async function resumeInvestigation(config: Config, scanId: string): Promi
   scan.lifecycle = 'validation'; scan.activity.push({ at: new Date().toISOString(), phase: 'validation', message: 'Investigation resumed; unfinished tasks were returned to the pending queue.' }); await persistInvestigationArtifacts(state, scan); await saveScan(state, scan); return scan
 }
 
+function requireTaskClaim(scan: ScanRecord, candidateId: string, phase: 'validation' | 'attack_path', token?: string): void {
+  const task = scan.tasks.find(item => item.candidateId === candidateId && item.phase === phase)
+  if (!task || task.status !== 'claimed' || !task.claim) throw new Error(`A ${phase} receipt requires an active claimed audit task.`)
+  if (!token || task.claim.token !== token) throw new Error('Task claim token does not own this audit task.')
+}
+
 function completeTask(scan: ScanRecord, candidateId: string, phase: 'validation' | 'attack_path', token?: string): void {
-  const task = scan.tasks.find(item => item.candidateId === candidateId && item.phase === phase && item.status === 'claimed')
-  if (!task) return
-  if (!token || task.claim?.token !== token) throw new Error('Task claim token does not own this audit task.')
+  requireTaskClaim(scan, candidateId, phase, token)
+  const task = scan.tasks.find(item => item.candidateId === candidateId && item.phase === phase && item.status === 'claimed')!
   task.status = 'completed'; task.completedAt = new Date().toISOString(); task.receipt = phase
 }
 
@@ -140,6 +145,7 @@ export async function recordValidation(config: Config, scanId: string, candidate
   return updateScan(config, scanId, scan => {
     if (scan.lifecycle === 'completed') throw new Error('Completed scans are immutable. Create a follow-up scan for new validation evidence.')
     const finding = candidate(scan, candidateId)
+    requireTaskClaim(scan, candidateId, 'validation', claimToken)
     for (const [label, value] of Object.entries(input)) if (label !== 'sourceReferences') required(String(value), label)
     if (!['reportable', 'suppressed', 'deferred', 'not_applicable'].includes(input.conclusion)) throw new Error('Validation conclusion is invalid.')
     const citedLocations = resolveSourceReferences(finding, input.sourceReferences)
@@ -159,6 +165,7 @@ export async function recordAttackPath(config: Config, scanId: string, candidate
   return updateScan(config, scanId, scan => {
     if (scan.lifecycle === 'completed') throw new Error('Completed scans are immutable. Create a follow-up scan for new attack-path evidence.')
     const finding = candidate(scan, candidateId); requireReportable(finding.disposition)
+    requireTaskClaim(scan, candidateId, 'attack_path', claimToken)
     for (const [label, value] of Object.entries(input)) if (label !== 'sourceReferences') required(value as string, label)
     const citedLocations = resolveSourceReferences(finding, input.sourceReferences); requireAttackPathEndpointReferences(finding, citedLocations)
     const record: AttackPathRecord = { ...input, recordedAt: new Date().toISOString() }; finding.attackPathRecord = record; finding.attackPath = `${input.dataflow}\n\nAttacker: ${input.attacker}\nOutcome: ${input.outcome}`; finding.ledger.push({ at: new Date().toISOString(), phase: 'attack_path', disposition: 'reportable', summary: input.dataflow }); finding.evidence.push(...citedLocations.map((location, index) => ({ kind: 'attack_path' as const, detail: `${input.dataflow} [receipt citation ${index + 1}/${citedLocations.length}]`, location }))); completeTask(scan, candidateId, 'attack_path', claimToken); scan.lifecycle = 'reporting'

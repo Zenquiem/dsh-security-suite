@@ -242,3 +242,22 @@ test('GitHub advisory creation is an approval-gated DSH write tool', async () =>
     assert.equal(approvalRequests, 1)
   } finally { await fiber.dispose() }
 })
+
+test('finding annotations cannot bypass formal DSH validation and attack-path receipts', async () => {
+  const workspace = await mkdtemp(join(tmpdir(), 'dsh-security-suite-annotation-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-annotation-state-'))
+  const previousDirectory = process.cwd()
+  const ctx = new Context(); new SystemPrompt(ctx, {}); new ToolRegistry(ctx, {})
+  const fiber = await ctx.plugin({ name, inject, apply }, { enabled: true, maxFiles: 10, maxFileBytes: 4096, stateDir: state })
+  try {
+    await writeFile(join(workspace, 'app.ts'), 'function route(req) { return eval(req.query.code) }\n')
+    process.chdir(workspace)
+    const started = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'annotation-start' as never, name: 'security_start_investigation', arguments: {}, agent: {} as never })
+    const scanId = (started.value as { scanId: string }).scanId
+    const scan = await (await import('../src/state.ts')).loadScan(state, scanId)
+    const findingId = scan.findings[0]!.id
+    const bypass = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'annotation-bypass' as never, name: 'security_update_finding', arguments: { scan_id: scanId, finding_id: findingId, status: 'false_positive', validation: 'Looks safe.' }, agent: {} as never })
+    assert.equal(bypass.isError, true)
+    assert.match(bypass.isError ? bypass.error.message : '', /formal structured validation receipt/)
+  } finally { process.chdir(previousDirectory); await fiber.dispose(); await rm(workspace, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})

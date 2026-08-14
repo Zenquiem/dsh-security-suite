@@ -57,6 +57,22 @@ test('workbench rejects attack-path evidence for a suppressed candidate', async 
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 
+test('workbench rejects unclaimed and duplicate validation receipts', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const config = { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function h(req) { return eval(req.query.code) }\n')
+    const scan = await runScan(root, config, 'standard', '', false, state, false); await saveScan(state, scan)
+    const candidate = scan.findings[0]!
+    const input = { conclusion: 'suppressed' as const, method: 'static' as const, attacker: 'none', entryPoint: 'fixture', trustBoundary: 'none', rootControl: 'eval', sink: 'eval', impact: 'none', directEvidence: 'The path is a local fixture.', counterevidence: 'No reachable product surface.', limitations: 'No runtime evidence.', confidence: 'high' as const, sourceReferences: references(candidate) }
+    await assert.rejects(() => recordValidation(config, scan.id, candidate.candidateId, input), /active claimed audit task/)
+    const claim = await claimAuditTask(config, scan.id, 'worker-a', 'validation'); assert.ok(claim)
+    await recordValidation(config, scan.id, candidate.candidateId, input, claim.claimToken)
+    await assert.rejects(() => recordValidation(config, scan.id, candidate.candidateId, input, claim.claimToken), /active claimed audit task/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
 test('workbench rejects unretained citations and endpoint-free reportable flow receipts', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
