@@ -25,6 +25,8 @@ export interface ValidationRecord {
   limitations: string
   confidence: Confidence
   sourceReferences: ReceiptSourceReference[]
+  /** Runtime evidence receipts bound to this candidate validation, when used. */
+  runtimeReceiptRefs?: string[]
   recordedAt: string
 }
 

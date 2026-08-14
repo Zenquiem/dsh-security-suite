@@ -5,7 +5,7 @@ import { join } from 'node:path'
 import test from 'node:test'
 import { applyRemediationProposal, installPreCommitHook, loadRemediationRollback, planCandidateValidation, proposeReviewedRemediation, remediationPlan, resumeBulkJob, rollbackRemediationProposal, runCandidateRuntimeValidation, runCandidateValidation, runCandidateValidationPlan, runIsolatedValidation, runRemediationVerification, startBulkCsvJob } from '../src/operations.ts'
 import { runScan } from '../src/scanner.ts'
-import { finalizeAndSaveScan, loadScan, saveScan, verifyScanBundle } from '../src/state.ts'
+import { finalizeAndSaveScan, loadScan, renderFindingWriteup, saveScan, verifyScanBundle } from '../src/state.ts'
 import { claimAuditTask, recordValidation } from '../src/workbench.ts'
 
 const config = { enabled: true, maxFiles: 20, maxFileBytes: 4096, stateDir: '' }
@@ -131,6 +131,27 @@ test('runtime validation rejects unsafe remote, interactive-debugger, and non-sa
     await assert.rejects(() => run('realistic_interface_reproduction', 'node http://example.com'), /loopback URLs/)
     await assert.rejects(() => run('debugger_trace', 'gdb app'), /non-interactive/)
     await assert.rejects(() => run('sanitizer_or_memory_checker', 'node repro.js'), /sanitizer or memory checker/)
+  } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
+})
+
+test('runtime conclusions require their exact candidate runtime receipts and render them in the finding report', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  const state = await mkdtemp(join(tmpdir(), 'dsh-security-suite-state-'))
+  const local = { ...config, stateDir: state }
+  try {
+    await writeFile(join(root, 'app.ts'), 'function route(req) { return eval(req.query.code) }\n')
+    await writeFile(join(root, 'repro.js'), 'console.log("ok")\n')
+    const scan = await runScan(root, local, 'standard', '', false, state, false); await saveScan(state, scan)
+    const candidate = scan.findings[0]; const claim = await claimAuditTask(local, scan.id, 'runtime-validator', 'validation'); assert.ok(claim)
+    const fields = { conclusion: 'reportable' as const, method: 'runtime' as const, attacker: 'Remote request sender.', entryPoint: 'Request query input.', trustBoundary: 'HTTP request boundary.', rootControl: 'Dynamic evaluation.', sink: 'eval invocation.', impact: 'Attacker-controlled execution.', directEvidence: 'The local runtime receipt exercises the selected disposable harness.', counterevidence: 'No compensating local control was identified.', limitations: 'The receipt does not establish production deployment reachability.', confidence: 'medium' as const, sourceReferences: references(candidate) }
+    await assert.rejects(() => recordValidation(local, scan.id, candidate.candidateId, fields, claim.claimToken), /requires at least one candidate-bound runtime receipt/)
+    const receipt = await runCandidateRuntimeValidation(root, local, scan.id, candidate.candidateId, claim.claimToken, 'realistic_interface_reproduction', 'node repro.js', ['repro.js'], 'Run a receipt-bound local harness in a disposable copy.', true)
+    await assert.rejects(() => recordValidation(local, scan.id, candidate.candidateId, { ...fields, runtimeReceiptRefs: ['artifacts/05_findings/other/runtime.json'] }, claim.claimToken), /not retained runtime evidence/)
+    const recorded = await recordValidation(local, scan.id, candidate.candidateId, { ...fields, runtimeReceiptRefs: [receipt.artifactRef!] }, claim.claimToken)
+    const finding = recorded.findings.find(item => item.candidateId === candidate.candidateId); assert.ok(finding)
+    assert.deepEqual(finding.validationRecord?.runtimeReceiptRefs, [receipt.artifactRef])
+    assert.match(renderFindingWriteup(recorded, finding), /Runtime receipts:/)
+    assert.match(renderFindingWriteup(recorded, finding), new RegExp(receipt.artifactRef!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')))
   } finally { await rm(root, { recursive: true, force: true }); await rm(state, { recursive: true, force: true }) }
 })
 

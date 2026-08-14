@@ -111,9 +111,16 @@ test('the DSH tool pipeline records reviewed runtime evidence without auto-confi
     assert.equal(run.isError, false, run.isError ? run.error.message : '')
     assert.equal((run.value as { method: string }).method, 'realistic_interface_reproduction')
     assert.equal(approvalRequests, 1)
+    const validation = { scan_id: scanId, candidate_id: task.candidateId, claim_token: task.claimToken, conclusion: 'reportable', method: 'runtime', attacker: 'Remote request sender.', entry_point: 'Request query input.', trust_boundary: 'HTTP request boundary.', root_control: 'Dynamic evaluation.', sink: 'eval invocation.', impact: 'Attacker-controlled execution.', direct_evidence: 'The reviewed local runtime receipt records the disposable harness execution.', counterevidence: 'No compensating local control was found.', limitations: 'The local receipt does not establish production reachability.', confidence: 'medium', source_references: [{ file: 'app.ts', line: 1, role: 'entrypoint' }, { file: 'app.ts', line: 1, role: 'sink' }] }
+    const missingReceipt = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'runtime-record-missing' as never, name: 'security_record_validation', arguments: validation, agent: {} as never })
+    assert.equal(missingReceipt.isError, true)
+    assert.match(missingReceipt.isError ? missingReceipt.error.message : '', /requires at least one candidate-bound runtime receipt/)
+    const recorded = await ctx.tools.execute({ signal: new AbortController().signal, callId: 'runtime-record' as never, name: 'security_record_validation', arguments: { ...validation, runtime_receipt_refs: [(run.value as { artifactRef: string }).artifactRef] }, agent: {} as never })
+    assert.equal(recorded.isError, false, recorded.isError ? recorded.error.message : '')
     const scan = await (await import('../src/state.ts')).loadScan(state, scanId)
-    assert.equal(scan.findings[0]?.disposition, 'discovered')
+    assert.equal(scan.findings[0]?.disposition, 'reportable')
     assert.equal(scan.findings[0]?.evidence.some(item => item.kind === 'runtime'), true)
+    assert.deepEqual(scan.findings[0]?.validationRecord?.runtimeReceiptRefs, [(run.value as { artifactRef: string }).artifactRef])
   } finally {
     process.chdir(previousDirectory)
     await fiber.dispose()

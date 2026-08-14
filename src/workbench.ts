@@ -17,6 +17,7 @@ export interface ValidationInput {
   limitations: string
   confidence: 'high' | 'medium' | 'low'
   sourceReferences: ReceiptSourceReference[]
+  runtimeReceiptRefs?: string[]
 }
 
 export interface AttackPathInput {
@@ -63,6 +64,19 @@ function requireAttackPathEndpointReferences(finding: Finding, references: Locat
   }
 }
 
+function resolveRuntimeReceiptRefs(finding: Finding, method: ValidationInput['method'], references: string[] | undefined): string[] | undefined {
+  const values = [...new Set((references ?? []).map(value => value.trim()))]
+  if (values.some(value => !value || value.length > 1_000)) throw new Error('Each runtime receipt reference must be a bounded artifact path.')
+  if (method !== 'runtime' && method !== 'hybrid') {
+    if (values.length) throw new Error('Runtime receipt references are only valid for runtime or hybrid validation.')
+    return undefined
+  }
+  if (!values.length) throw new Error('Runtime or hybrid validation requires at least one candidate-bound runtime receipt reference.')
+  const available = new Set(finding.evidence.filter(item => item.kind === 'runtime' && item.artifactRef).map(item => item.artifactRef!))
+  if (values.some(value => !available.has(value))) throw new Error('Runtime receipt reference is not retained runtime evidence for this candidate.')
+  return values.sort()
+}
+
 function releaseExpiredClaims(scan: ScanRecord): number { const now = Date.now(); let released = 0; for (const task of scan.tasks) if (task.status === 'claimed' && task.claim && Date.parse(task.claim.expiresAt) <= now) { task.status = 'pending'; task.claim = undefined; released++ } return released }
 
 export async function claimAuditTask(config: Config, scanId: string, owner: string, phase?: 'validation' | 'attack_path', leaseMs = 30 * 60_000): Promise<{ taskId: string; candidateId: string; phase: 'validation' | 'attack_path'; focus: string; claimToken: string; artifactRef: string } | null> {
@@ -105,7 +119,8 @@ export async function recordValidation(config: Config, scanId: string, candidate
   if (!['reportable', 'suppressed', 'deferred', 'not_applicable'].includes(input.conclusion)) throw new Error('Validation conclusion is invalid.')
   const citedLocations = resolveSourceReferences(finding, input.sourceReferences)
   if (input.conclusion === 'reportable') requireReportableValidationReferences(citedLocations)
-  const record: ValidationRecord = { ...input, conclusion: input.conclusion as ValidationRecord['conclusion'], recordedAt: new Date().toISOString() }
+  const runtimeReceiptRefs = resolveRuntimeReceiptRefs(finding, input.method, input.runtimeReceiptRefs)
+  const record: ValidationRecord = { ...input, ...(runtimeReceiptRefs ? { runtimeReceiptRefs } : {}), conclusion: input.conclusion as ValidationRecord['conclusion'], recordedAt: new Date().toISOString() }
   const evidenceKind: EvidenceKind = input.method === 'runtime' ? 'runtime' : input.method === 'test' ? 'test' : 'validation'
   finding.validationRecord = record; finding.disposition = input.conclusion; finding.confidence = input.confidence; finding.validation = `${input.method} validation: ${input.directEvidence}`; finding.impact = input.impact; finding.counterevidence = input.counterevidence; finding.evidence.push(...citedLocations.map((location, index) => ({ kind: evidenceKind, detail: `${input.directEvidence} [receipt citation ${index + 1}/${citedLocations.length}]`, location }))); finding.ledger.push({ at: new Date().toISOString(), phase: 'validation', disposition: input.conclusion, summary: finding.validation })
   completeTask(scan, candidateId, 'validation', claimToken)
