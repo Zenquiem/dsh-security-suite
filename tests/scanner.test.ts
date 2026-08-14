@@ -101,6 +101,17 @@ test('directory assessment ties Go TLS disablement to a constructed client that 
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
+test('directory assessment ties PHP cURL TLS disablement to an initialized handle that is executed', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
+  try {
+    await writeFile(join(root, 'client.php'), '<?php\nfunction used() {\n  $curl = curl_init("https://api.example.test");\n  curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, false);\n  curl_exec($curl);\n}\nfunction unused() {\n  $curl = curl_init();\n  curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, 0);\n}\nfunction otherHandle() {\n  $curl = curl_init();\n  $other = curl_init();\n  curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, false);\n  curl_exec($other);\n}\n')
+    const result = await assessDirectory(root, { maxFiles: 10, maxFileBytes: 4096 })
+    const candidates = result.candidates.filter(item => item.rule === 'tls-verification-disabled')
+    assert.deepEqual(candidates.map(item => item.line), [4])
+    assert.equal(candidates[0]?.evidence.some(item => item.location?.role === 'sink' && item.location.line === 5), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
 test('directory assessment recognizes only non-placeholder embedded credential assignments outside JavaScript', async () => {
   const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-'))
   try {
@@ -914,6 +925,23 @@ test('diff scan retains an added Go client request that activates an existing di
     assert.ok(finding)
     assert.equal(finding.locations[0]?.line, 3)
     assert.equal(finding.evidence.some(item => item.location?.role === 'sink' && item.location.line === 6), true)
+  } finally { await rm(root, { recursive: true, force: true }) }
+})
+
+test('diff scan retains an added PHP cURL execution that activates an existing disabled setting', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-security-suite-diff-'))
+  try {
+    await execFileAsync('git', ['init'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.invalid'], { cwd: root })
+    await execFileAsync('git', ['config', 'user.name', 'DSH Security Suite Test'], { cwd: root })
+    await writeFile(join(root, 'client.php'), '<?php\nfunction request() {\n  $curl = curl_init("https://api.example.test");\n  curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, false);\n}\n')
+    await execFileAsync('git', ['add', 'client.php'], { cwd: root }); await execFileAsync('git', ['commit', '-m', 'baseline'], { cwd: root })
+    await writeFile(join(root, 'client.php'), '<?php\nfunction request() {\n  $curl = curl_init("https://api.example.test");\n  curl_setopt($curl, CURLOPT_SSL_VERIFYPEER, false);\n  curl_exec($curl);\n}\n')
+    const scan = await runDiffScan(root, undefined, '', '', false)
+    const finding = scan.findings.find(item => item.ruleId === 'tls.verification.disabled')
+    assert.ok(finding)
+    assert.equal(finding.locations[0]?.line, 4)
+    assert.equal(finding.evidence.some(item => item.location?.role === 'sink' && item.location.line === 5), true)
   } finally { await rm(root, { recursive: true, force: true }) }
 })
 
