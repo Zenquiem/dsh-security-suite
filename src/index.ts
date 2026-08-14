@@ -15,6 +15,8 @@ import { createDeepInvestigationJob, runDeepInvestigation } from './deep-workflo
 import { createDisclosureCampaign, getDisclosureAssignment, readDisclosureExperimentArtifact, readDisclosureSource, runDisclosureCampaign, submitDisclosureReport } from './disclosure.js'
 import { createLlmDiscoveryJob, getLlmScope, llmDiscoveryCapability, readLlmSource, reportLlmCandidates, reportLlmWorker, runLlmDiscovery, runLlmScan, searchLlmSource } from './llm/discovery.js'
 import { createDiffDiscoveryJob, diffDiscoveryCapability, getDiffReviewItems, readDiffSource, reportDiffCandidates, reportDiffWorker, runDiffDiscovery, runDiffLlmReview } from './llm/diff.js'
+import { buildValidationRubric, proofTupleFor } from './llm/validation.js'
+import { COUNTEREVIDENCE_CHECKLIST } from './llm/attack-path.js'
 
 export const name = 'dsh-security-suite'
 export const inject = ['tools', 'systemPrompt']
@@ -404,9 +406,32 @@ export function apply(ctx: Context, config: PluginConfig): void {
   }))
 
   ctx.tools.register(defineTool({
+    name: 'security_validation_guidance', description: 'Read-only validation guidance for one candidate: its class-specific proof tuple (the minimal attacker-input, control, sink, and impact evidence validation must establish) and a bounded validation rubric, adapted from codex-security validation-guidance.md. Use it to structure security_record_validation evidence; it performs no scan and records nothing.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' }, candidate_id: { type: 'string', required: true, description: 'Candidate identifier.' } },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) {
+      const scan = await loadScan(getStateDir(config.stateDir), args.scan_id)
+      const finding = scan.findings.find(item => item.candidateId === args.candidate_id)
+      if (!finding) throw new Error('Candidate was not found in this scan.')
+      const tuple = proofTupleFor(finding.ruleId, finding.cwe)
+      return JSON.parse(JSON.stringify({ candidateId: finding.candidateId, ruleId: finding.ruleId, cwe: finding.cwe, proofTuple: tuple, rubric: buildValidationRubric({ ruleId: finding.ruleId, cwe: finding.cwe, title: finding.title, sourceLocations: finding.locations.length }) })) as Record<string, JsonValue>
+    },
+  }))
+
+  ctx.tools.register(defineTool({
     name: 'security_record_validation', description: 'Record structured source, test, runtime, or hybrid validation evidence for one claimed candidate task. Source references must exactly match retained locations in the immutable scan snapshot; reportable conclusions cite a root control or sensitive sink. Runtime and hybrid conclusions must bind one or more receipts returned by security_run_candidate_runtime_validation for this exact candidate.', parameters: { scan_id: { type: 'string', required: true, description: 'Investigation scan identifier.' }, candidate_id: { type: 'string', required: true, description: 'Candidate identifier.' }, claim_token: { type: 'string', required: true, description: 'Token returned by security_claim_audit_task.' }, conclusion: { type: 'string', required: true, enum: ['reportable', 'suppressed', 'deferred', 'not_applicable'], description: 'Validation conclusion.' }, method: { type: 'string', required: true, enum: ['static', 'test', 'runtime', 'hybrid'], description: 'Validation method.' }, attacker: { type: 'string', required: true, description: 'Realistic attacker capability.' }, entry_point: { type: 'string', required: true, description: 'Entrypoint evidence.' }, trust_boundary: { type: 'string', required: true, description: 'Boundary crossed.' }, root_control: { type: 'string', required: true, description: 'Broken control or sink.' }, sink: { type: 'string', required: true, description: 'Sensitive operation.' }, impact: { type: 'string', required: true, description: 'Concrete impact.' }, direct_evidence: { type: 'string', required: true, description: 'Source/test/runtime proof.' }, counterevidence: { type: 'string', required: true, description: 'Controls considered and why they do or do not prevent impact.' }, limitations: { type: 'string', required: true, description: 'Remaining evidence gap.' }, confidence: { type: 'string', required: true, enum: ['high', 'medium', 'low'], description: 'Calibrated confidence.' }, source_references: { type: 'array', required: true, items: { type: 'object', properties: { file: { type: 'string', required: true }, line: { type: 'number', required: true }, role: { type: 'string', required: true, enum: ['entrypoint', 'wrapper', 'propagation', 'root_control', 'sink', 'outcome', 'expected_control'] } }, additionalProperties: false }, description: 'One or more exact locations returned for this candidate by security_get_scan.' }, runtime_receipt_refs: { type: 'array', items: { type: 'string' }, description: 'Required for runtime or hybrid methods: exact candidate-local artifactRef values returned by security_run_candidate_runtime_validation.' } },
     output: { schema: { type: 'object', properties: { scanId: { type: 'string' }, candidateId: { type: 'string' }, lifecycle: { type: 'string' } }, required: ['scanId', 'candidateId', 'lifecycle'], additionalProperties: false }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
     async execute(args) { const scan = await recordValidation(config, args.scan_id, args.candidate_id, { conclusion: args.conclusion as 'reportable' | 'suppressed' | 'deferred' | 'not_applicable', method: args.method as 'static' | 'test' | 'runtime' | 'hybrid', attacker: args.attacker, entryPoint: args.entry_point, trustBoundary: args.trust_boundary, rootControl: args.root_control, sink: args.sink, impact: args.impact, directEvidence: args.direct_evidence, counterevidence: args.counterevidence, limitations: args.limitations, confidence: args.confidence as 'high' | 'medium' | 'low', sourceReferences: args.source_references as never, runtimeReceiptRefs: args.runtime_receipt_refs }, args.claim_token); return { scanId: scan.id, candidateId: args.candidate_id, lifecycle: scan.lifecycle } },
+  }))
+
+  ctx.tools.register(defineTool({
+    name: 'security_attack_path_guidance', description: 'Read-only attack-path guidance for one candidate: the seven-dimension counterevidence checklist and the structured facts model (assumptions, context, in-scope status, exposure, identity, cross-boundary behavior, vector, preconditions, attacker input control, auth scope, impact surface, target reach, secrets, counterevidence, blindspots), adapted from codex-security attack-path-facts.md. Use it to structure security_record_attack_path evidence; it performs no scan and records nothing.', parameters: { scan_id: { type: 'string', required: true, description: 'Saved scan identifier.' }, finding_id: { type: 'string', required: true, description: 'Reportable finding identifier.' } },
+    output: { schema: { type: 'object', additionalProperties: true }, render: (_args, value) => [{ type: 'text', text: JSON.stringify(value) }] },
+    async execute(args) {
+      const scan = await loadScan(getStateDir(config.stateDir), args.scan_id)
+      const finding = scan.findings.find(item => item.id === args.finding_id)
+      if (!finding) throw new Error('Finding was not found in this scan.')
+      return { findingId: finding.id, ruleId: finding.ruleId, severity: finding.severity, counterevidenceChecklist: COUNTEREVIDENCE_CHECKLIST, factsFields: ['assumptions', 'context', 'inScope', 'exposure', 'identity', 'crossBoundaryBehavior', 'vector', 'preconditions', 'attackerInputControl', 'category', 'mitigationsAlreadyPresent', 'authScope', 'impactSurface', 'targetReach', 'secretsReferences', 'counterevidence', 'blindspots', 'controls', 'confidence', 'numberedAttackerSteps', 'impact', 'likelihood', 'impactRationale', 'likelihoodRationale', 'finalPolicyDecision'] }
+    },
   }))
 
   ctx.tools.register(defineTool({
