@@ -39,7 +39,7 @@ function commandExecutable(command: string): string { return splitCommand(comman
 function isLoopbackUrl(value: string): boolean { try { const url = new URL(value); return ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname) } catch { return false } }
 function safeRuntimeCommand(method: RuntimeValidationMethod, command: string): string {
   const value = safeCommand(command); const args = splitCommand(value); const executable = commandExecutable(value)
-  if (args.some(argument => /^(?:https?|ftp|ssh):\/\//i.test(argument) && !isLoopbackUrl(argument))) throw new Error('Runtime validation may only address loopback URLs from its disposable copy.')
+  if (args.some(argument => /^(?:https?|ftp|ssh):\/\//i.test(argument) && !isLoopbackUrl(argument))) throw new Error('Runtime validation only accepts loopback URLs as direct command arguments; the disposable copy is not a network sandbox.')
   if (method === 'debugger_trace') {
     if (executable === 'gdb' && (args.includes('-batch') || args.includes('--batch')) && args.filter(argument => argument === '-ex' || argument === '--ex').length >= 2) return value
     if (executable === 'lldb' && args.includes('-b') && args.filter(argument => argument === '-o' || argument === '--one-line').length >= 2) return value
@@ -144,7 +144,7 @@ export async function runCandidateRuntimeValidation(workspace: string, config: C
   const reloaded = await loadScan(state, scanId); const currentFinding = reloaded.findings.find(item => item.candidateId === candidateId); const currentTask = reloaded.tasks.find(item => item.id === task.id)
   if (!currentFinding || !currentTask || currentTask.status !== 'claimed' || currentTask.claim?.token !== claimToken) throw new Error('Candidate validation task changed while runtime validation was running; the receipt was retained externally but was not attached.')
   const artifactRef = `artifacts/05_findings/${candidateId}/validation_artifacts/runtime_${commandReceipt.id}.json`
-  const receipt: RuntimeValidationReceipt = { ...commandReceipt, method, fixturePaths: fixtures.sort(), setupSummary: setup, limitation: 'This controlled, disposable-copy execution is runtime evidence only. It does not establish production reachability, prove all attacker paths, or automatically decide the candidate disposition.', artifactRef }
+  const receipt: RuntimeValidationReceipt = { ...commandReceipt, method, fixturePaths: fixtures.sort(), setupSummary: setup, limitation: 'This controlled, disposable-copy execution is runtime evidence only. It does not establish production reachability, prove all attacker paths, or automatically decide the candidate disposition. The copy prevents source-tree writes but is not a network sandbox; review the local environment and invoked fixture before approval.', artifactRef }
   await writeArtifact(reloaded, artifactRef, `${JSON.stringify(receipt, null, 2)}\n`)
   const outcome = receipt.timedOut ? 'timed out' : receipt.exitCode === 0 ? 'completed successfully' : `exited with ${receipt.exitCode ?? 'an unknown status'}`
   currentFinding.evidence.push({ kind: 'runtime', detail: `${method} command \`${receipt.command}\` ${outcome}; fixture paths: ${receipt.fixturePaths.join(', ')}. Interpret this receipt with source and runtime context.`, artifactRef })
